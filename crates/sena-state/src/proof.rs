@@ -186,6 +186,88 @@ impl MerkleProof {
         }
     }
 
+    /// Computes the root that results from writing `new_value_hash` at `key`,
+    /// given a proof of that key's current state.
+    ///
+    /// This is what lets Aptos L1 adjudicate a disputed step without holding the
+    /// state. The L1 contract has a pre-state root and a proof of the slot the
+    /// step touches; from those alone it can derive the post-state root the step
+    /// should have produced, and compare it against what the sequencer claimed.
+    ///
+    /// Three cases arise, and the third is the subtle one:
+    ///
+    /// - the slot is empty, so the new leaf takes the terminal position;
+    /// - the slot holds this key, so the leaf's value is replaced;
+    /// - the slot holds a *different* key, which means the tree has to grow. The
+    ///   two keys share a prefix down to the terminal depth, so a chain of
+    ///   internal nodes with empty siblings is built until they diverge, and
+    ///   both leaves are placed there.
+    ///
+    /// Note that this only covers writes and insertions, never removals. That is
+    /// not an oversight: removing a key can require collapsing a branch, which
+    /// depends on the shape of a subtree the proof does not describe. The state
+    /// transition function is therefore structurally append-only — releasing a
+    /// social binding writes a vacant marker rather than deleting the entry — so
+    /// this function is sufficient for every step the L1 verifier must check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError`] if the proof is malformed or the terminal leaf does
+    /// not lie on the queried key's path. The caller is responsible for first
+    /// checking that the proof reconstructs to the expected pre-state root.
+    pub fn compute_updated_root(
+        &self,
+        key: &Hash256,
+        new_value_hash: &Hash256,
+    ) -> Result<Hash256, ProofError> {
+        let depth = self.siblings.len();
+        if depth > MAX_DEPTH {
+            return Err(ProofError::TooDeep(depth));
+        }
+
+        let mut running = match &self.terminal {
+            Terminal::Empty => Node::Leaf {
+                key: *key,
+                value_hash: *new_value_hash,
+            }
+            .hash(),
+            Terminal::Leaf { key: existing, .. } if existing == key => Node::Leaf {
+                key: *key,
+                value_hash: *new_value_hash,
+            }
+            .hash(),
+            Terminal::Leaf {
+                key: existing,
+                value_hash: existing_value,
+            } => {
+                for i in 0..depth {
+                    if existing.bit(i) != key.bit(i) {
+                        return Err(ProofError::LeafOffPath(i));
+                    }
+                }
+                split_hash(depth, key, new_value_hash, existing, existing_value)?
+            }
+        };
+
+        for level in (0..depth).rev() {
+            let sibling = self.siblings[level];
+            running = if key.bit(level) {
+                Node::Internal {
+                    left: sibling,
+                    right: running,
+                }
+            } else {
+                Node::Internal {
+                    left: running,
+                    right: sibling,
+                }
+            }
+            .hash();
+        }
+
+        Ok(running)
+    }
+
     /// Verifies that `key` is absent under `root`.
     ///
     /// Absence is provable two ways: the path runs into an empty subtree, or it
@@ -209,5 +291,64 @@ impl MerkleProof {
             Terminal::Leaf { key: leaf_key, .. } if leaf_key != key => Ok(()),
             Terminal::Leaf { .. } => Err(ProofError::KeyPresent),
         }
+    }
+}
+
+/// Builds the subtree separating two distinct keys that share a prefix down to
+/// `depth`, returning its hash.
+///
+/// Pure by design: the L1 verifier has no node store, so the whole subtree has
+/// to be derivable from the two leaves alone.
+fn split_hash(
+    depth: usize,
+    key_a: &Hash256,
+    value_a: &Hash256,
+    key_b: &Hash256,
+    value_b: &Hash256,
+) -> Result<Hash256, ProofError> {
+    if depth >= MAX_DEPTH {
+        // Unreachable for distinct 256-bit keys, but the recursion is bounded
+        // explicitly rather than by argument.
+        return Err(ProofError::TooDeep(depth));
+    }
+
+    let bit_a = key_a.bit(depth);
+    if bit_a == key_b.bit(depth) {
+        let child = split_hash(depth + 1, key_a, value_a, key_b, value_b)?;
+        let node = if bit_a {
+            Node::Internal {
+                left: Hash256::ZERO,
+                right: child,
+            }
+        } else {
+            Node::Internal {
+                left: child,
+                right: Hash256::ZERO,
+            }
+        };
+        Ok(node.hash())
+    } else {
+        let leaf_a = Node::Leaf {
+            key: *key_a,
+            value_hash: *value_a,
+        }
+        .hash();
+        let leaf_b = Node::Leaf {
+            key: *key_b,
+            value_hash: *value_b,
+        }
+        .hash();
+        let node = if bit_a {
+            Node::Internal {
+                left: leaf_b,
+                right: leaf_a,
+            }
+        } else {
+            Node::Internal {
+                left: leaf_a,
+                right: leaf_b,
+            }
+        };
+        Ok(node.hash())
     }
 }

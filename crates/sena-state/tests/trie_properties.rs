@@ -284,3 +284,90 @@ proptest! {
         prop_assert_eq!(trie.len(), model.len());
     }
 }
+
+// --- Proof-based root update -------------------------------------------------
+//
+// These cover the operation Aptos L1 performs during dispute resolution: derive
+// the post-state root of a single write from the pre-state root and a proof,
+// holding no state of its own.
+
+#[test]
+fn updating_through_a_proof_matches_updating_the_trie() {
+    let mut trie = MerkleTrie::new();
+    for i in 0..32 {
+        trie.insert(key(i), b"old");
+    }
+    let target = key(7);
+    let proof = trie.prove(&target);
+    let derived = proof
+        .compute_updated_root(&target, &sena_state::hash_value(b"new"))
+        .expect("update should derive");
+
+    trie.insert(target, b"new");
+    assert_eq!(
+        derived,
+        trie.root(),
+        "L1 must derive the same root the node computes"
+    );
+}
+
+#[test]
+fn inserting_a_new_key_through_a_proof_matches_the_trie() {
+    let mut trie = MerkleTrie::new();
+    for i in 0..32 {
+        trie.insert(key(i), b"v");
+    }
+    let fresh = key(9_999);
+    let proof = trie.prove(&fresh);
+    let derived = proof
+        .compute_updated_root(&fresh, &sena_state::hash_value(b"new"))
+        .expect("insert should derive");
+
+    trie.insert(fresh, b"new");
+    assert_eq!(
+        derived,
+        trie.root(),
+        "insertion must handle growing the tree"
+    );
+}
+
+#[test]
+fn inserting_into_an_empty_trie_through_a_proof() {
+    let trie = MerkleTrie::new();
+    let k = key(1);
+    let derived = trie
+        .prove(&k)
+        .compute_updated_root(&k, &sena_state::hash_value(b"v"))
+        .unwrap();
+
+    let mut applied = MerkleTrie::new();
+    applied.insert(k, b"v");
+    assert_eq!(derived, applied.root());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// For any populated trie and any key, present or absent, deriving the
+    /// post-state root from a proof agrees with applying the write directly.
+    /// This equivalence is what makes the one-step verifier sound.
+    #[test]
+    fn proof_update_agrees_with_direct_update(
+        populate in prop::collection::btree_set(0u64..300, 1..50),
+        target in 0u64..400,
+        value in prop::collection::vec(any::<u8>(), 0..16),
+    ) {
+        let mut trie = MerkleTrie::new();
+        for k in &populate {
+            trie.insert(key(*k), k.to_be_bytes().to_vec());
+        }
+
+        let k = key(target);
+        let derived = trie
+            .prove(&k)
+            .compute_updated_root(&k, &sena_state::hash_value(&value))?;
+
+        trie.insert(k, value);
+        prop_assert_eq!(derived, trie.root());
+    }
+}
