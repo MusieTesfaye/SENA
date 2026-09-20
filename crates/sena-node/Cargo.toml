@@ -1,0 +1,31 @@
+[package]
+name = "sena-node"
+description = "The SENA node: mempool, block production, assertion posting, verifier mode, and the RPC surface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sena-primitives.workspace = true
+sena-state.workspace = true
+sena-stf.workspace = true
+sena-fraudproof.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[bin]]
+name = "sena-demo"
+path = "src/bin/sena_demo.rs"
+
+[lints]
+workspace = true

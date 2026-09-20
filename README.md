@@ -57,10 +57,25 @@ Each phase lands as a reviewable commit with tests that pass in CI.
 | 3 | `sena-stf` — accounts, transactions, execution | ✅ done |
 | 4 | Social Connect, Gas Paymaster, Governance modules | ✅ done |
 | 5 | `sena-fraudproof` — assertions, bisection, one-step proofs | ✅ done |
-| 6 | `sena-node` — mempool, block production, RPC, verifier mode | ⬜ |
+| 6 | `sena-node` — mempool, block production, RPC, verifier mode | ✅ done |
 | 7 | Move L1 contracts, end-to-end adversarial dispute tests | ⬜ |
 
-## Building
+## Try it
+
+```sh
+cargo run --bin sena-demo
+```
+
+Runs three scenarios against the real implementation — no mocks:
+
+1. An honest sequencer produces a block; an independent verifier, rebuilding
+   from published batch data alone, reaches the same state root.
+2. A sequencer executes a debit of 1 where the batch says 1,000 and asserts the
+   result. The verifier detects it, challenges, and bisection narrows 48 steps
+   down to the falsified one in two rounds — then Aptos L1 executes that single
+   step and rejects the assertion.
+3. A withdrawal is refused against a pending root and honoured once the
+   challenge window has elapsed.
 
 ```sh
 cargo test --workspace      # run everything

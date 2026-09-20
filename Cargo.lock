@@ -469,6 +469,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sena-node"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "proptest",
+ "rand 0.8.8",
+ "sena-fraudproof",
+ "sena-primitives",
+ "sena-state",
+ "sena-stf",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "sena-primitives"
 version = "0.1.0"
 dependencies = [
