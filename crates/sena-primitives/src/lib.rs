@@ -41,12 +41,14 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod address;
+pub mod codec;
 pub mod encoding;
 pub mod hash;
 pub mod identity;
 pub mod serde_hex;
 
 pub use address::{AssetId, L2Address};
+pub use codec::{DecodeError, Reader, Writer};
 pub use encoding::{domain, CanonicalEncoder};
 pub use hash::{Hash256, HashParseError};
 pub use identity::{Channel, HashedIdentifier, NetworkSalt};

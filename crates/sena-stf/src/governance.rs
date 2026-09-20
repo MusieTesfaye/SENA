@@ -23,7 +23,7 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sena_primitives::serde_hex::bytes_64;
-use sena_primitives::{CanonicalEncoder, Hash256};
+use sena_primitives::{CanonicalEncoder, DecodeError, Hash256, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::gas::WhitelistedAsset;
@@ -55,21 +55,44 @@ pub struct Council {
 impl Council {
     /// Encodes the council for storage.
     ///
+    /// Canonical binary, so `sena::osp` can decode the roster when adjudicating
+    /// a disputed `VerifyCouncil` step.
+    ///
     /// # Panics
     ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// Panics if the council has more than `u32::MAX` members, which no council
+    /// can reach.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("council serialisation cannot fail")
+        let mut w = Writer::new();
+        w.u32(u32::try_from(self.members.len()).expect("a council cannot have 2^32 members"));
+        for member in &self.members {
+            w.bytes32(member);
+        }
+        w.u32(self.threshold);
+        w.finish()
     }
 
     /// Decodes a stored council.
     ///
     /// # Errors
     ///
-    /// Returns [`GovernanceError::MalformedCouncil`] if the bytes are invalid.
+    /// Returns [`GovernanceError::MalformedCouncil`] if the bytes are not a
+    /// canonical council record.
     pub fn decode(bytes: &[u8]) -> Result<Self, GovernanceError> {
-        serde_json::from_slice(bytes).map_err(|_| GovernanceError::MalformedCouncil)
+        Self::decode_inner(bytes).map_err(|_| GovernanceError::MalformedCouncil)
+    }
+
+    fn decode_inner(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let count = r.u32()?;
+        let mut members = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            members.push(r.bytes32()?);
+        }
+        let threshold = r.u32()?;
+        r.finish()?;
+        Ok(Self { members, threshold })
     }
 }
 

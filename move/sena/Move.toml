@@ -1,0 +1,13 @@
+[package]
+name = "sena"
+version = "0.1.0"
+authors = ["SENA Network contributors"]
+license = "Apache-2.0"
+
+[addresses]
+sena = "_"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-core.git"
+rev = "mainnet"
+subdir = "aptos-move/framework/aptos-framework"

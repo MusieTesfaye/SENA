@@ -1,7 +1,12 @@
 //! The Social Connect identity index (REQ-SOCIAL-001).
 
-use sena_primitives::L2Address;
+use sena_primitives::{DecodeError, L2Address, Reader, Writer};
 use serde::{Deserialize, Serialize};
+
+/// Discriminant for a bound identifier.
+const TAG_BOUND: u8 = 0;
+/// Discriminant for a released identifier.
+const TAG_VACANT: u8 = 1;
 
 /// What a hashed identifier currently resolves to.
 ///
@@ -32,22 +37,43 @@ impl SocialBinding {
 
     /// Encodes the binding for storage.
     ///
-    /// # Panics
-    ///
-    /// Panics only if serialising an enum of one address fails, which cannot
-    /// occur.
+    /// A one-byte discriminant followed by the address, if any. Canonical
+    /// binary rather than JSON so that `sena::osp` can decode it in Move.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("binding serialisation cannot fail")
+        let mut w = Writer::new();
+        match self {
+            Self::Bound { address } => {
+                w.u8(TAG_BOUND);
+                w.bytes32(address.as_bytes());
+            }
+            Self::Vacant => {
+                w.u8(TAG_VACANT);
+            }
+        }
+        w.finish()
     }
 
     /// Decodes a stored binding.
     ///
     /// # Errors
     ///
-    /// Returns [`MalformedBinding`] if the bytes are not a valid binding.
+    /// Returns [`MalformedBinding`] if the bytes are not a canonical binding.
     pub fn decode(bytes: &[u8]) -> Result<Self, MalformedBinding> {
-        serde_json::from_slice(bytes).map_err(|_| MalformedBinding)
+        Self::decode_inner(bytes).map_err(|_| MalformedBinding)
+    }
+
+    fn decode_inner(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let binding = match r.u8()? {
+            TAG_BOUND => Self::Bound {
+                address: L2Address::from_bytes(r.bytes32()?),
+            },
+            TAG_VACANT => Self::Vacant,
+            other => return Err(DecodeError::UnknownVariant(other)),
+        };
+        r.finish()?;
+        Ok(binding)
     }
 }
 

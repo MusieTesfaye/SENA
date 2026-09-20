@@ -26,7 +26,7 @@
 //!
 //! [`Instruction::VerifyGasAsset`]: crate::Instruction::VerifyGasAsset
 
-use sena_primitives::AssetId;
+use sena_primitives::{AssetId, DecodeError, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
 /// Fixed-point scale for exchange rates: rates are expressed in millionths.
@@ -63,21 +63,37 @@ pub struct WhitelistedAsset {
 impl WhitelistedAsset {
     /// Encodes the record for storage.
     ///
-    /// # Panics
-    ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// Canonical binary rather than JSON, so `sena::osp` can decode it in Move
+    /// when adjudicating a disputed `VerifyGasAsset` step.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("asset record serialisation cannot fail")
+        let mut w = Writer::new();
+        w.u32(self.asset.get());
+        w.string(&self.symbol);
+        w.u128(self.rate);
+        w.bool(self.enabled);
+        w.finish()
     }
 
     /// Decodes a stored record.
     ///
     /// # Errors
     ///
-    /// Returns [`MalformedAsset`] if the bytes are not a valid record.
+    /// Returns [`MalformedAsset`] if the bytes are not a canonical record.
     pub fn decode(bytes: &[u8]) -> Result<Self, MalformedAsset> {
-        serde_json::from_slice(bytes).map_err(|_| MalformedAsset)
+        Self::decode_inner(bytes).map_err(|_| MalformedAsset)
+    }
+
+    fn decode_inner(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let record = Self {
+            asset: AssetId(r.u32()?),
+            symbol: r.string()?,
+            rate: r.u128()?,
+            enabled: r.bool()?,
+        };
+        r.finish()?;
+        Ok(record)
     }
 }
 

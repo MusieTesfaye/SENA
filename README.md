@@ -58,7 +58,7 @@ Each phase lands as a reviewable commit with tests that pass in CI.
 | 4 | Social Connect, Gas Paymaster, Governance modules | ✅ done |
 | 5 | `sena-fraudproof` — assertions, bisection, one-step proofs | ✅ done |
 | 6 | `sena-node` — mempool, block production, RPC, verifier mode | ✅ done |
-| 7 | Move L1 contracts, end-to-end adversarial dispute tests | ⬜ |
+| 7 | Move L1 contracts, end-to-end adversarial dispute tests | ⚠️ partial |
 
 ## Try it
 
@@ -94,6 +94,18 @@ This is enforced mechanically rather than by convention: `HashMap` and `HashSet`
 denied workspace-wide in [`clippy.toml`](clippy.toml), float arithmetic is a deny-level
 lint, and CI executes the state-root tests twice in separate processes and diffs the
 results.
+
+## The Aptos L1 contracts
+
+The Move modules in [`move/sena/`](move/sena/) are the settlement layer:
+assertions, disputes, the one-step verifier, and the bridge.
+
+**They have not been compiled or tested** — the Aptos CLI would not run in the
+development environment (it requires AVX2). They are written against the Rust
+reference and share conformance vectors with it, and `cargo test` checks that
+every constant embedded in the Move sources still matches what Rust computes.
+That catches drift; it does not substitute for compiling them. See
+[`move/README.md`](move/README.md).
 
 ## Documentation
 
