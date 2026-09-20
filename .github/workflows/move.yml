@@ -1,0 +1,125 @@
+name: Move
+
+# Compiles and tests the Aptos L1 contracts.
+#
+# These contracts have never been compiled: the development machine is an Intel
+# Celeron N4120, an Atom-lineage chip that lacks AVX entirely, and the prebuilt
+# Aptos CLI aborts with an illegal instruction on it. GitHub's runners have
+# AVX2, so this workflow is how the Move package gets built at all.
+#
+# Expect the first runs to fail. That is the point: the failure output is the
+# list of what needs fixing, and it is the item blocking Gates B through G in
+# docs/beta/BETA_EXECUTION_CHECKLIST.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'move/**'
+      - '.github/workflows/move.yml'
+  pull_request:
+    paths:
+      - 'move/**'
+      - '.github/workflows/move.yml'
+  workflow_dispatch:
+
+env:
+  # Pinned rather than "latest": BETA_BUILD_PLAN.md W-02 requires the Aptos CLI
+  # to be a recorded input, because a toolchain that moves underneath the
+  # contracts makes a build unreproducible.
+  APTOS_CLI_VERSION: "9.5.1"
+  # A throwaway address for compilation. The package declares `sena = "_"`, so
+  # a value must be supplied; deployment uses a real account.
+  SENA_DEV_ADDRESS: "0xCAFE"
+
+jobs:
+  compile:
+    name: compile and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the runner has AVX2
+        # The whole reason this job exists. If a future runner image lacks it,
+        # the failure should say so rather than surfacing as a crash.
+        run: |
+          if grep -qm1 ' avx2' /proc/cpuinfo; then
+            echo "avx2: present"
+          else
+            echo "::error::this runner lacks AVX2; the prebuilt Aptos CLI will not run"
+            exit 1
+          fi
+
+      - name: Install Aptos CLI ${{ env.APTOS_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v${APTOS_CLI_VERSION}/aptos-cli-${APTOS_CLI_VERSION}-Linux-x86_64.zip"
+          echo "fetching $url"
+          curl -sSL -o aptos-cli.zip "$url"
+          unzip -q aptos-cli.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Record toolchain inputs
+        # W-01 item 5 and W-02 item 2: the exact inputs a build used are part of
+        # the release identity, not incidental detail.
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "aptos_cli_version: ${APTOS_CLI_VERSION}"
+            echo "aptos_cli_reported: $(aptos --version 2>&1 | head -1)"
+            echo "runner_os: $(lsb_release -ds 2>/dev/null || uname -a)"
+            echo "commit: ${GITHUB_SHA}"
+          } | tee artifacts/toolchain.txt
+
+      - name: Resolve the Aptos framework revision
+        # Move.toml pins `rev = "mainnet"`, which is a branch and therefore a
+        # moving target. Recording what it resolved to is the first step toward
+        # pinning it to a commit, which W-02 requires.
+        run: |
+          set -euo pipefail
+          resolved=$(git ls-remote https://github.com/aptos-labs/aptos-core.git mainnet | cut -f1)
+          echo "aptos_framework_rev_resolved: ${resolved}" | tee -a artifacts/toolchain.txt
+          echo "::notice::AptosFramework 'mainnet' currently resolves to ${resolved} -- pin Move.toml to this commit for reproducible builds"
+
+      - name: Compile
+        id: compile
+        run: |
+          aptos move compile \
+            --package-dir move/sena \
+            --named-addresses sena=${SENA_DEV_ADDRESS} \
+            2>&1 | tee artifacts/compile.log
+
+      - name: Test
+        # Runs even if compilation failed, so one run reports everything rather
+        # than making you fix errors one round-trip at a time.
+        if: always() && steps.compile.outcome != 'skipped'
+        run: |
+          aptos move test \
+            --package-dir move/sena \
+            --named-addresses sena=${SENA_DEV_ADDRESS} \
+            2>&1 | tee artifacts/test.log
+
+      - name: Record the package hash
+        # W-01 item 5. A deployed package must be identifiable by hash, or
+        # "which code is on chain" has no answer.
+        if: success()
+        run: |
+          set -euo pipefail
+          if [ -d move/sena/build ]; then
+            find move/sena/build -type f -name '*.mv' -print0 \
+              | sort -z | xargs -0 sha256sum > artifacts/module-hashes.txt
+            package_hash=$(sha256sum artifacts/module-hashes.txt | cut -d' ' -f1)
+            echo "move_package_hash: ${package_hash}" | tee -a artifacts/toolchain.txt
+            echo "::notice::Move package hash ${package_hash}"
+          fi
+
+      - name: Upload build evidence
+        # docs/beta/evidence/ is where the checklist expects this to land.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: move-build-evidence
+          path: artifacts/
+          retention-days: 90

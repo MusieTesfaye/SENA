@@ -27,9 +27,9 @@ finding.
 ## 2. Build reproducibility and conformance
 
 - [x] `Complete` — Pin the Rust toolchain and build image. → [`rust-toolchain.toml`](../../rust-toolchain.toml)
-- [ ] `Blocked` — Pin Aptos CLI and Aptos framework inputs. → `Move.toml` pins `rev = "mainnet"`, which is a moving target and must be pinned to a commit
+- [ ] `In progress` — Pin Aptos CLI and Aptos framework inputs. → CLI pinned to `9.5.1` in [`move.yml`](../../.github/workflows/move.yml); the workflow resolves and reports the framework revision so `Move.toml` can be pinned to a commit. **`rev = "mainnet"` is still a moving target.**
 - [ ] `Not started` — Make clean builds reproducible.
-- [ ] `Blocked` — Record and verify the STF binary hash. → depends on D-01 sign-off and the execution target
+- [ ] `Blocked` — Record and verify the STF binary hash. → depends on D-01 sign-off and the execution target. The Move **package** hash is recorded by [`move.yml`](../../.github/workflows/move.yml) once compilation succeeds.
 - [x] `Complete` — Add Rust-to-Move conformance tests for state roots and proof encodings. → [`move_conformance.rs`](../../crates/sena-stf/tests/move_conformance.rs) — checks constants agree; does **not** compile Move
 - [x] `Complete` — Cover malformed, truncated, duplicate, reordered, and non-canonical inputs. → [`account.rs`](../../crates/sena-stf/src/account.rs) tests; [`codec.rs`](../../crates/sena-primitives/src/codec.rs) tests
 - [x] `Complete` — Test empty batches, single-transaction batches, large batches, deletion, overwrite, and boundary values. → [`trie_properties.rs`](../../crates/sena-state/tests/trie_properties.rs), [`execution.rs`](../../crates/sena-stf/tests/execution.rs)
@@ -89,9 +89,9 @@ finding.
 
 ## 6. Move contract lifecycle and authorization
 
-- [ ] `Blocked` — Compile the full Move package in clean CI. → **the Aptos CLI requires AVX2; the development machine does not have it.** Needs different hardware or a source build. This blocks Gates B through G.
-- [ ] `Blocked` — Run Move unit tests in clean CI. → tests are written ([`move/sena/sources/`](../../move/sena/sources)) and have never executed
-- [ ] `Blocked` — Add coverage and publish the coverage artifact.
+- [ ] `In progress` — Compile the full Move package in clean CI. → [`move.yml`](../../.github/workflows/move.yml) added; GitHub runners have AVX2. **The workflow has never run — the contracts have still never compiled.** Its first run produces the error list. Until it passes, Gates B through G stay blocked.
+- [ ] `In progress` — Run Move unit tests in clean CI. → wired into [`move.yml`](../../.github/workflows/move.yml); tests are written ([`move/sena/sources/`](../../move/sena/sources)) and have still never executed
+- [ ] `Blocked` — Add coverage and publish the coverage artifact. → blocked until compilation passes
 - [ ] `Not started` — Verify all public functions enforce valid lifecycle stages.
 - [ ] `Not started` — Add signer or capability checks for privileged transitions.
 - [ ] `Not started` — Prevent unauthorized dispute resolution.
@@ -205,7 +205,10 @@ but entirely within Rust. Nothing has touched Aptos.
 
 ## 14. Evidence index
 
-Not yet created. `docs/beta/evidence/` should be populated as gates are met.
+Not yet created as a directory. The Move workflow uploads build evidence —
+toolchain inputs, resolved framework revision, compile and test logs, module
+hashes — as a CI artifact with 90-day retention. Those should be committed to
+`docs/beta/evidence/02-local-aptos/` once the build is green.
 
 ## 15. First implementation sprint
 
@@ -230,7 +233,7 @@ Not yet created. `docs/beta/evidence/` should be populated as gates are met.
 | 3. Durable node | Mostly complete — no RocksDB, no auth |
 | 4. Data availability | **Weakest area** — no independent publication |
 | 5. Aptos settlement | Not started |
-| 6. Move contracts | **Blocked on hardware** — blocks Gates B–G |
+| 6. Move contracts | CI workflow added; **has never run** — blocks Gates B–G |
 | 7. Fraud proofs and verifier | Complete in Rust, untested on Aptos |
 | 8. Bridge | Not started |
 | 9. User access | Complete for what exists |
