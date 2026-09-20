@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: build, test, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  determinism:
+    name: determinism check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # REQ-FRAUD-031 / NFR-PORT-003: identical execution results across runs.
+      # Running the state-root tests twice in separate processes catches
+      # accidental dependence on address layout or hash seeding.
+      - name: Execute twice, compare roots
+        run: |
+          cargo test --workspace determinism -- --nocapture | tee run1.txt
+          cargo test --workspace determinism -- --nocapture | tee run2.txt
+          diff <(grep -o 'root=[0-9a-f]*' run1.txt) <(grep -o 'root=[0-9a-f]*' run2.txt)

@@ -1,0 +1,7 @@
+# REQ-FRAUD-031: the state transition function must be bit-for-bit deterministic.
+# HashMap/HashSet iteration order is not specified, so ordered collections are
+# mandatory anywhere state or a trace can be derived from iteration.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is nondeterministic; use BTreeMap (REQ-FRAUD-031)" },
+    { path = "std::collections::HashSet", reason = "iteration order is nondeterministic; use BTreeSet (REQ-FRAUD-031)" },
+]

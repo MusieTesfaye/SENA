@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/MusieTesfaye/SENA"
+authors = ["SENA Network contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+sena-primitives = { path = "crates/sena-primitives" }
+sena-state      = { path = "crates/sena-state" }
+sena-stf        = { path = "crates/sena-stf" }
+sena-fraudproof = { path = "crates/sena-fraudproof" }
+
+sha2        = { version = "0.10", default-features = false }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+hex         = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand        = "0.8"
+proptest    = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# Determinism is a security property in this codebase (SRS REQ-FRAUD-031):
+# floats and ambient time must never influence the state transition function.
+float_arithmetic = "deny"
+disallowed_types = "deny"
+
+[profile.release]
+panic = "abort"
+overflow-checks = true

@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+/docs/src/*.html
+.DS_Store
+*.swp
+/move/**/build/
