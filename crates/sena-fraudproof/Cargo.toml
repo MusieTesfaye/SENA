@@ -18,6 +18,8 @@ thiserror.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+sena-params.workspace = true
+sena-stf.workspace = true
 proptest.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true

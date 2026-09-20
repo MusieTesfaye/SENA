@@ -1,6 +1,11 @@
 # Status
 
-**Version 0.2.0-beta** · 232 tests passing · not audited · not deployed
+**Version 0.2.0-beta** · 248 tests passing · not audited · not deployed
+
+**Beta planning:** [`docs/beta/BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) ·
+[`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) ·
+[`BETA_EXECUTION_CHECKLIST.md`](docs/beta/BETA_EXECUTION_CHECKLIST.md) ·
+[`TRACEABILITY.md`](docs/beta/TRACEABILITY.md)
 
 This document exists so that nobody has to guess which parts of SENA are real.
 It is written to be read by someone evaluating the project, and it errs toward
@@ -47,6 +52,9 @@ too: a groundless challenge loses.
 Listed in the order they block a real network.
 
 ### 1. Keyless sign-in is incomplete — the flagship feature
+
+**Formally deferred for beta** (decision D-03), matching the build plan's own
+recommendation.
 
 **What works:** JWT claim parsing, issuer allowlisting, expiry, `aud` scoping
 that makes one user unlinkable across applications, deterministic address
@@ -159,20 +167,40 @@ to resolve within. The budget is now derived from the window.
 
 ---
 
+## Where this sits against the beta gates
+
+Against the seven release gates in
+[`BETA_BUILD_PLAN.md`](docs/beta/BETA_BUILD_PLAN.md), the project is at
+**Gate A, in progress**. The scope freeze, parameter freeze and traceability
+matrix are done; the SRS/SDD amendment for the execution target is outstanding.
+
+Gate B — local end-to-end integration against an Aptos node — cannot begin until
+the Move package compiles. That one item blocks Gates B through G, and it is
+blocked on hardware rather than on any design question.
+
+[`BETA_EXECUTION_CHECKLIST.md`](docs/beta/BETA_EXECUTION_CHECKLIST.md) carries a
+status for every item.
+
 ## Roadmap
 
-In dependency order.
+In dependency order, following the build plan's critical path.
 
 1. **Compile and test the Move contracts.** Nothing L1-related is real until this
-   is done.
-2. **Implement keyless proof verification.** Groth16 over BN254 against Aptos's
-   verification key, replacing `NoVerifier`.
-3. **Aptos testnet deployment.** Real assertions, real bonds, real withdrawals.
-4. **Independent audit** of the dispute contracts and the one-step verifier.
-5. **Public verifier programme** — the security model is only as good as the
+   is done. Needs a machine with AVX2, or a source build of the Aptos CLI.
+2. **Local Aptos integration.** The honest and adversarial assertion lifecycles
+   against a local node — Gate B.
+3. **Aptos settlement adapter.** Real signed transactions, real assertions.
+4. **Independent data availability.** Batch data currently comes from the same
+   node that produced the assertion, which is the weakest link in the security
+   claim.
+5. **Bridge with one test asset.** Deposits, withdrawals against finalized roots,
+   custody reconciliation.
+6. **Independent audit** of the dispute contracts and the one-step verifier.
+7. **Keyless proof verification** — Groth16 over BN254 against Aptos's
+   verification key, replacing `NoVerifier`. Deliberately after the settlement
+   path is real, per D-03.
+8. **Public verifier programme** — the security model is only as good as the
    number of independent parties actually watching.
-6. **Per-instruction gas metering** and RocksDB/NOMT storage.
-7. **Forced inclusion** wired end to end, then decentralised sequencing.
 
 ---
 

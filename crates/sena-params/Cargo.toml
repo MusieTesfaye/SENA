@@ -1,0 +1,16 @@
+[package]
+name = "sena-params"
+description = "The frozen SENA beta protocol parameter set: one source of truth for code, contracts, and documentation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

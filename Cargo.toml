@@ -11,6 +11,7 @@ authors = ["SENA Network contributors"]
 rust-version = "1.85"
 
 [workspace.dependencies]
+sena-params     = { path = "crates/sena-params" }
 sena-primitives = { path = "crates/sena-primitives" }
 sena-state      = { path = "crates/sena-state" }
 sena-stf        = { path = "crates/sena-stf" }

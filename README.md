@@ -7,7 +7,7 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="tests" src="https://img.shields.io/badge/tests-232%20passing-brightgreen">
+<img alt="tests" src="https://img.shields.io/badge/tests-248%20passing-brightgreen">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
@@ -192,7 +192,7 @@ processes and diffs the results.
 ## Development
 
 ```sh
-cargo test --workspace                                    # 232 tests
+cargo test --workspace                                    # 248 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -202,6 +202,23 @@ The Move contracts need the [Aptos CLI](https://aptos.dev/tools/aptos-cli/):
 ```sh
 aptos move test --package-dir move/sena                   # expect failures; see move/README.md
 ```
+
+## Beta planning
+
+The closed-beta scope, decisions and status live in [`docs/beta/`](docs/beta/):
+
+- [`BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) — what the beta includes, what is
+  deferred, and why
+- [`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) — decisions with alternatives
+  and reasoning
+- [`BETA_EXECUTION_CHECKLIST.md`](docs/beta/BETA_EXECUTION_CHECKLIST.md) — a
+  status for every item, including the ones that are blocked
+- [`TRACEABILITY.md`](docs/beta/TRACEABILITY.md) — every SRS requirement mapped
+  to the code and tests that cite it, generated from source
+
+Protocol parameters are frozen in [`crates/sena-params`](crates/sena-params) as
+a single source of truth, with the relationships between them checked by test
+rather than asserted in prose.
 
 ## Documentation
 

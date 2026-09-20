@@ -19,6 +19,7 @@ ed25519-dalek.workspace = true
 base64 = "0.22"
 
 [dev-dependencies]
+sena-params.workspace = true
 proptest.workspace = true
 rand.workspace = true
 

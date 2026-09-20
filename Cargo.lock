@@ -850,6 +850,7 @@ dependencies = [
  "hex",
  "proptest",
  "rand 0.8.8",
+ "sena-params",
  "sena-primitives",
  "sena-state",
  "sena-stf",
@@ -869,6 +870,7 @@ dependencies = [
  "proptest",
  "rand 0.8.8",
  "sena-fraudproof",
+ "sena-params",
  "sena-primitives",
  "sena-state",
  "sena-stf",
@@ -877,6 +879,14 @@ dependencies = [
  "thiserror",
  "tiny_http",
  "ureq",
+]
+
+[[package]]
+name = "sena-params"
+version = "0.2.0-beta"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -911,6 +921,7 @@ dependencies = [
  "hex",
  "proptest",
  "rand 0.8.8",
+ "sena-params",
  "sena-primitives",
  "sena-state",
  "serde",

@@ -3,6 +3,35 @@
 Notable changes to SENA. Versions follow [semantic versioning](https://semver.org);
 while below 1.0 the protocol may change in breaking ways between releases.
 
+## [Unreleased]
+
+Beta planning baseline. No protocol behaviour changed; the parameters were
+already what `sena-params` now freezes, and the binding tests prove it.
+
+### Added
+
+- **`sena-params`** — the frozen beta parameter set as a single source of truth,
+  version `sena-beta-params-1`. Relationships between parameters are checked by
+  `validate()` rather than asserted in prose: notably that both parties' dispute
+  budgets fit inside the challenge window at *every* window the chain accepts,
+  including the floor.
+- **Parameter binding tests** so that a constant changed in the implementation
+  without changing `sena-params`, or the reverse, fails the build and names the
+  parameter.
+- **`docs/beta/`** — the closed-beta scope freeze, decision log (D-01 to D-06),
+  execution checklist with a real status for every item, and a generated
+  requirements traceability matrix covering 51 of 101 SRS requirements.
+
+### Decisions
+
+- **D-01: higher-level instruction trace** adopted as the beta execution target
+  rather than RV32IM. The security argument does not depend on the step being a
+  RISC-V instruction, and RV32IM sits directly in front of the thing the beta
+  exists to prove. Requires an SRS/SDD amendment, which is outstanding.
+- **D-03: keyless sign-in formally deferred.** The binding logic — the check
+  these systems most often get wrong — stays implemented and enforced. Proof
+  verification does not ship, and keyless transactions remain refused.
+
 ## [0.2.0-beta] — 2026-09-20
 
 First release you can actually run. A node serves JSON-RPC over HTTP, seals
