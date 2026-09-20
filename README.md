@@ -52,7 +52,7 @@ Each phase lands as a reviewable commit with tests that pass in CI.
 | Phase | Crate / area | Status |
 |---|---|---|
 | 0 | Workspace, CI, determinism lints | ✅ done |
-| 1 | `sena-primitives` — hashes, addresses, OIDC derivation | ⬜ |
+| 1 | `sena-primitives` — hashes, addresses, OIDC derivation | ✅ done |
 | 2 | `sena-state` — sparse Merkle trie, inclusion proofs | ⬜ |
 | 3 | `sena-stf` — accounts, transactions, execution | ⬜ |
 | 4 | Social Connect, Gas Paymaster, Governance modules | ⬜ |
