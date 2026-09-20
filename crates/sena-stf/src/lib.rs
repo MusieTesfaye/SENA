@@ -40,6 +40,7 @@ pub mod execute;
 pub mod gas;
 pub mod governance;
 pub mod instruction;
+pub mod keyless;
 pub mod keys;
 pub mod social;
 pub mod transaction;
@@ -52,5 +53,6 @@ pub use execute::{
 pub use gas::{GasError, WhitelistedAsset, RATE_SCALE};
 pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
 pub use instruction::{Instruction, MachineState};
+pub use keyless::{KeylessAuth, KeylessError, KeylessPolicy, KeylessVerifier, NoVerifier};
 pub use social::{MalformedBinding, SocialBinding};
 pub use transaction::{AuthError, Authenticator, Payload, Transaction};

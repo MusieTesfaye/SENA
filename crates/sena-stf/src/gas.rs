@@ -26,6 +26,7 @@
 //!
 //! [`Instruction::VerifyGasAsset`]: crate::Instruction::VerifyGasAsset
 
+use sena_primitives::serde_hex::u128_string;
 use sena_primitives::{AssetId, DecodeError, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,7 @@ pub struct WhitelistedAsset {
     /// Human-readable symbol, for tooling.
     pub symbol: String,
     /// Units of this asset per [`RATE_SCALE`] native units.
+    #[serde(with = "u128_string")]
     pub rate: u128,
     /// Whether the asset may currently be used for fees.
     ///

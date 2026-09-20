@@ -371,3 +371,59 @@ proptest! {
         prop_assert_eq!(derived, trie.root());
     }
 }
+
+// --- Persistence -------------------------------------------------------------
+
+#[test]
+fn a_snapshot_round_trips() {
+    let mut trie = MerkleTrie::new();
+    for i in 0..128 {
+        trie.insert(key(i), format!("value-{i}").into_bytes());
+    }
+
+    let restored = MerkleTrie::from_bytes(&trie.to_bytes()).expect("snapshot should load");
+    assert_eq!(restored.root(), trie.root());
+    assert_eq!(restored.len(), trie.len());
+    for i in 0..128 {
+        assert_eq!(restored.get(&key(i)), Some(format!("value-{i}").as_bytes()));
+    }
+}
+
+#[test]
+fn an_empty_trie_round_trips() {
+    let restored = MerkleTrie::from_bytes(&MerkleTrie::new().to_bytes()).unwrap();
+    assert_eq!(restored.root(), Hash256::ZERO);
+    assert!(restored.is_empty());
+}
+
+#[test]
+fn a_corrupted_snapshot_is_rejected_rather_than_served() {
+    // The point of recording the root is that a node which cannot reproduce it
+    // must refuse to start, rather than quietly serving state nobody else
+    // agrees with.
+    let mut trie = MerkleTrie::new();
+    trie.insert(key(1), b"original");
+    let mut bytes = trie.to_bytes();
+
+    // Corrupt a value byte, leaving the recorded root untouched.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+
+    assert!(matches!(
+        MerkleTrie::from_bytes(&bytes),
+        Err(sena_state::LoadError::RootMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_truncated_snapshot_is_rejected() {
+    let mut trie = MerkleTrie::new();
+    trie.insert(key(1), b"v");
+    let bytes = trie.to_bytes();
+    for cut in 0..bytes.len() {
+        assert!(
+            MerkleTrie::from_bytes(&bytes[..cut]).is_err(),
+            "prefix of {cut} must not load"
+        );
+    }
+}

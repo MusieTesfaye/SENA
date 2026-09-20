@@ -46,6 +46,20 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// The discriminant used in canonical binary encodings.
+    ///
+    /// Fixed and explicit rather than derived from declaration order, because
+    /// the Move implementation hardcodes these values and reordering the enum
+    /// would silently change what a stored slot means.
+    #[must_use]
+    pub const fn discriminant(self) -> u8 {
+        match self {
+            Self::Email => 0,
+            Self::Phone => 1,
+            Self::Handle => 2,
+        }
+    }
+
     /// The tag committed to in the identifier hash.
     const fn tag(self) -> &'static [u8] {
         match self {

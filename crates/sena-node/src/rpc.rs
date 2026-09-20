@@ -13,6 +13,7 @@
 //! (REQ-FRAUD-027, REQ-CORE-005). An integrator should not have to go looking
 //! for whether a payment can still be reverted.
 
+use sena_primitives::serde_hex::balances;
 use sena_primitives::{Hash256, HashedIdentifier, L2Address};
 use sena_stf::{keys, Account, SocialBinding, Transaction};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,19 @@ pub enum Request {
     /// Report the current L2 state root.
     #[serde(rename = "sena_getStateRoot")]
     GetStateRoot,
+    /// Fetch a block's published batch data (REQ-FRAUD-007).
+    ///
+    /// This is what makes independent verification possible: without it a
+    /// verifier could not re-execute the chain, and an assertion could not be
+    /// checked by anyone but the party that made it.
+    #[serde(rename = "sena_getBlock")]
+    GetBlock {
+        /// Block height, counting from one.
+        height: u64,
+    },
+    /// Report chain-level status.
+    #[serde(rename = "sena_getChainInfo")]
+    GetChainInfo,
 }
 
 /// A response from the node.
@@ -76,7 +90,9 @@ pub enum Response {
     Account {
         /// The account's nonce.
         nonce: u64,
-        /// Balances, as `(asset id, amount)` pairs in asset order.
+        /// Balances in asset order, with amounts as decimal strings so that
+        /// clients whose JSON numbers are doubles do not silently round them.
+        #[serde(with = "balances")]
         balances: Vec<(u32, u128)>,
     },
     /// An identifier resolution.
@@ -108,6 +124,36 @@ pub enum Response {
         /// until its assertion finalizes.
         withdrawable: bool,
     },
+    /// A block's published batch data.
+    Block {
+        /// Its height.
+        height: u64,
+        /// State root before the block.
+        pre_state_root: Hash256,
+        /// State root after it.
+        post_state_root: Hash256,
+        /// The transactions, in execution order.
+        transactions: Vec<Transaction>,
+        /// The assertion covering it, if one has been posted.
+        assertion: Option<AssertionId>,
+        /// Number of execution steps, which bisection searches over.
+        trace_length: u64,
+    },
+    /// Chain-level status.
+    ChainInfo {
+        /// The chain this node belongs to.
+        chain_id: String,
+        /// Highest block produced.
+        height: u64,
+        /// Highest block whose assertion has finalized.
+        finalized_height: u64,
+        /// The configured challenge window, in seconds.
+        challenge_window_secs: u64,
+        /// Current L2 state root.
+        state_root: Hash256,
+        /// How many transactions are waiting.
+        mempool_size: usize,
+    },
     /// The request could not be served.
     Error {
         /// A human-readable explanation.
@@ -116,7 +162,10 @@ pub enum Response {
 }
 
 /// Serves one request against the node.
-pub fn handle(sequencer: &mut Sequencer, request: Request) -> Response {
+///
+/// `chain_id` is reported back so a client can tell at a glance whether it is
+/// talking to the network it thinks it is.
+pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Response {
     match request {
         Request::SubmitTransaction(transaction) => {
             match sequencer.mempool.submit(&sequencer.state, *transaction) {
@@ -186,5 +235,33 @@ pub fn handle(sequencer: &mut Sequencer, request: Request) -> Response {
                 withdrawable: sequencer.chain.is_withdrawable(&root),
             }
         }
+
+        Request::GetBlock { height } => {
+            match usize::try_from(height.saturating_sub(1))
+                .ok()
+                .and_then(|i| sequencer.blocks.get(i))
+            {
+                None => Response::Error {
+                    message: format!("no block at height {height}"),
+                },
+                Some(block) => Response::Block {
+                    height: block.height,
+                    pre_state_root: block.pre_state_root,
+                    post_state_root: block.post_state_root,
+                    transactions: block.transactions.clone(),
+                    assertion: sequencer.assertion_for(block.height),
+                    trace_length: block.trace.len() as u64,
+                },
+            }
+        }
+
+        Request::GetChainInfo => Response::ChainInfo {
+            chain_id: chain_id.to_owned(),
+            height: sequencer.blocks.len() as u64,
+            finalized_height: sequencer.finalized_height(),
+            challenge_window_secs: sequencer.chain.challenge_window(),
+            state_root: sequencer.state.root(),
+            mempool_size: sequencer.mempool.len(),
+        },
     }
 }

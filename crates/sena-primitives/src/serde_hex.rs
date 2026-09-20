@@ -54,3 +54,81 @@ pub mod bytes_64 {
             .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
     }
 }
+
+/// Serialises a `u128` as a decimal string.
+///
+/// JSON numbers are IEEE-754 doubles in most clients, JavaScript included, so a
+/// `u128` balance sent as a JSON number is silently rounded above 2^53 — an
+/// integrator would read a wrong balance with no error raised anywhere.
+/// `serde_json` refuses to encode `u128` at all, for related reasons.
+///
+/// Amounts therefore travel as decimal strings on the wire. This affects only
+/// the JSON representation: consensus hashing uses the canonical binary codec,
+/// where a `u128` is sixteen big-endian bytes.
+pub mod u128_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the value as a decimal string.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the serializer's error.
+    pub fn serialize<S: Serializer>(value: &u128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&value.to_string())
+    }
+
+    /// Reads a decimal string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not a decimal `u128`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Serialises `Vec<(u32, u128)>` with the amounts as decimal strings.
+pub mod balances {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        asset: u32,
+        amount: String,
+    }
+
+    /// Writes balances with string amounts.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the serializer's error.
+    pub fn serialize<S: Serializer>(value: &[(u32, u128)], s: S) -> Result<S::Ok, S::Error> {
+        let entries: Vec<Entry> = value
+            .iter()
+            .map(|(asset, amount)| Entry {
+                asset: *asset,
+                amount: amount.to_string(),
+            })
+            .collect();
+        entries.serialize(s)
+    }
+
+    /// Reads balances with string amounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an amount is not a decimal `u128`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(u32, u128)>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(d)?;
+        entries
+            .into_iter()
+            .map(|e| {
+                e.amount
+                    .parse()
+                    .map(|amount| (e.asset, amount))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}

@@ -37,7 +37,7 @@ pub mod osp;
 pub mod verifier;
 
 pub use assertion::{
-    Assertion, AssertionChain, AssertionId, ChainError, PartyId, Record, Status,
+    Assertion, AssertionChain, AssertionId, ChainError, ChainSnapshot, PartyId, Record, Status,
     CHALLENGE_WINDOW_FLOOR, DEFAULT_CHALLENGE_WINDOW,
 };
 pub use bisection::{

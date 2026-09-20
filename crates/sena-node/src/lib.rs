@@ -29,12 +29,18 @@
 #![warn(missing_docs, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod genesis;
 pub mod mempool;
 pub mod rpc;
 pub mod sequencer;
+pub mod server;
+pub mod store;
 pub mod verifier_node;
 
+pub use genesis::{Allocation, GenesisConfig, GenesisError};
 pub use mempool::{Mempool, RejectReason};
 pub use rpc::{handle, Request, Response};
 pub use sequencer::{Block, Confirmation, ProduceError, Sequencer};
+pub use server::{ServerConfig, ServerError};
+pub use store::{Store, StoreError};
 pub use verifier_node::{Outcome, VerifierNode};

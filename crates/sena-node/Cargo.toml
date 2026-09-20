@@ -19,6 +19,10 @@ thiserror.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+tiny_http = "0.12"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 proptest.workspace = true
@@ -26,6 +30,10 @@ proptest.workspace = true
 [[bin]]
 name = "sena-demo"
 path = "src/bin/sena_demo.rs"
+
+[[bin]]
+name = "sena-node"
+path = "src/bin/sena_node.rs"
 
 [lints]
 workspace = true

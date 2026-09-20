@@ -40,4 +40,4 @@ pub mod trie;
 
 pub use node::{hash_value, Node};
 pub use proof::{MerkleProof, ProofError, Terminal, MAX_DEPTH};
-pub use trie::MerkleTrie;
+pub use trie::{LoadError, MerkleTrie};

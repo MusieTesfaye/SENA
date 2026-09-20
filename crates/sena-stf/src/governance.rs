@@ -22,7 +22,7 @@
 //! to run different code.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sena_primitives::serde_hex::bytes_64;
+use sena_primitives::serde_hex::{bytes_64, u128_string};
 use sena_primitives::{CanonicalEncoder, DecodeError, Hash256, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
@@ -120,11 +120,41 @@ pub enum GovernanceUpdate {
         /// Parameter name, which must appear in [`GOVERNABLE_PARAMETERS`].
         name: String,
         /// New value.
+        #[serde(with = "u128_string")]
         value: u128,
     },
 }
 
+/// Discriminants for the canonical update encoding, fixed explicitly because
+/// the council's signature commits to them.
+mod update_tag {
+    pub const SET_GAS_ASSET: u8 = 0;
+    pub const SET_PARAMETER: u8 = 1;
+}
+
 impl GovernanceUpdate {
+    /// Encodes the update canonically.
+    ///
+    /// Binary rather than JSON, for the same reason the transaction signing
+    /// digest is: what the council signs must be reproducible by anything that
+    /// verifies the signature, including a Move contract.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self {
+            Self::SetGasAsset { record } => {
+                w.u8(update_tag::SET_GAS_ASSET);
+                w.bytes(&record.encode());
+            }
+            Self::SetParameter { name, value } => {
+                w.u8(update_tag::SET_PARAMETER);
+                w.string(name);
+                w.u128(*value);
+            }
+        }
+        w.finish()
+    }
+
     /// Returns the digest the council signs.
     ///
     /// `epoch` is included so that a signed payload cannot be replayed once it

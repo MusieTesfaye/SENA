@@ -83,7 +83,7 @@ pub enum Status {
 }
 
 /// An assertion together with the chain's bookkeeping for it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Record {
     /// The claim itself.
     pub assertion: Assertion,
@@ -421,5 +421,55 @@ impl AssertionChain {
         self.records
             .values()
             .any(|r| r.status == Status::Finalized && r.assertion.post_state_root == *root)
+    }
+}
+
+/// A serialisable view of the whole chain, for persistence across restarts.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct ChainSnapshot {
+    /// Every assertion the chain knows, with its bookkeeping.
+    pub records: Vec<Record>,
+    /// The most recent finalized assertion, if any.
+    pub latest_finalized: Option<AssertionId>,
+    /// The configured challenge window.
+    pub challenge_window: u64,
+    /// The minimum bond.
+    pub minimum_bond: u128,
+    /// The chain's clock at the time of the snapshot.
+    pub now: u64,
+}
+
+impl AssertionChain {
+    /// Captures the chain's state.
+    #[must_use]
+    pub fn snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            records: self.records.values().cloned().collect(),
+            latest_finalized: self.latest_finalized,
+            challenge_window: self.challenge_window,
+            minimum_bond: self.minimum_bond,
+            now: self.now,
+        }
+    }
+
+    /// Rebuilds a chain from a snapshot.
+    ///
+    /// The window is re-clamped to [`CHALLENGE_WINDOW_FLOOR`] on the way in. A
+    /// snapshot is a file on disk, so it is exactly the sort of thing that could
+    /// be edited to shorten the window; re-applying the floor means a tampered
+    /// file cannot produce a chain that finalizes early.
+    #[must_use]
+    pub fn restore(snapshot: ChainSnapshot) -> Self {
+        let mut records = BTreeMap::new();
+        for record in snapshot.records {
+            records.insert(record.assertion.id(), record);
+        }
+        Self {
+            records,
+            latest_finalized: snapshot.latest_finalized,
+            challenge_window: snapshot.challenge_window.max(CHALLENGE_WINDOW_FLOOR),
+            minimum_bond: snapshot.minimum_bond,
+            now: snapshot.now,
+        }
     }
 }

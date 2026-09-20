@@ -297,3 +297,88 @@ impl MerkleTrie {
         matches!(self.nodes.get(&candidate), Some(Node::Leaf { .. })).then_some(candidate)
     }
 }
+
+// --- Persistence -------------------------------------------------------------
+
+/// Why a stored trie could not be loaded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum LoadError {
+    /// The bytes are not a valid trie snapshot.
+    #[error("trie snapshot is malformed: {0}")]
+    Malformed(#[from] sena_primitives::DecodeError),
+    /// The rebuilt trie does not have the root the snapshot recorded.
+    #[error("snapshot root {recorded} does not match the rebuilt root {rebuilt}")]
+    RootMismatch {
+        /// The root the snapshot claimed.
+        recorded: Hash256,
+        /// The root that rebuilding actually produced.
+        rebuilt: Hash256,
+    },
+}
+
+impl MerkleTrie {
+    /// Serialises the trie's contents.
+    ///
+    /// Only the key/value pairs and the root are written, not the node store.
+    /// The tree is rebuilt on load, which costs `O(n log n)` but makes the
+    /// snapshot self-checking: if the rebuilt root does not match the recorded
+    /// one, the snapshot is corrupt and is rejected rather than silently
+    /// serving wrong state. For a node whose entire job is to agree with
+    /// everyone else, detecting that at startup is worth the rebuild.
+    ///
+    /// ```
+    /// use sena_state::MerkleTrie;
+    /// use sena_primitives::Hash256;
+    ///
+    /// let mut trie = MerkleTrie::new();
+    /// trie.insert(Hash256::digest(b"k"), b"v");
+    ///
+    /// let restored = MerkleTrie::from_bytes(&trie.to_bytes()).unwrap();
+    /// assert_eq!(restored.root(), trie.root());
+    /// assert_eq!(restored.get(&Hash256::digest(b"k")), Some(b"v".as_slice()));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the trie holds more than `u32::MAX` keys.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = sena_primitives::Writer::new();
+        w.hash(&self.root);
+        w.u32(u32::try_from(self.values.len()).expect("a trie cannot hold 2^32 keys"));
+        for (key, value) in &self.values {
+            w.hash(key);
+            w.bytes(value);
+        }
+        w.finish()
+    }
+
+    /// Rebuilds a trie from [`Self::to_bytes`], verifying the recorded root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError`] if the bytes are malformed, or if rebuilding does
+    /// not reproduce the recorded root.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LoadError> {
+        let mut r = sena_primitives::Reader::new(bytes);
+        let recorded = r.hash()?;
+        let count = r.u32()?;
+
+        let mut trie = Self::new();
+        for _ in 0..count {
+            let key = r.hash()?;
+            let value = r.bytes()?;
+            trie.insert(key, value);
+        }
+        r.finish()?;
+
+        if trie.root() == recorded {
+            Ok(trie)
+        } else {
+            Err(LoadError::RootMismatch {
+                recorded,
+                rebuilt: trie.root(),
+            })
+        }
+    }
+}

@@ -451,6 +451,7 @@ fn rpc_reports_account_state() {
     let mut seq = node(genesis(&[(address_of(&alice), 4_242)]));
     let response = handle(
         &mut seq,
+        "sena-test-1",
         Request::GetAccount {
             address: address_of(&alice),
         },
@@ -469,6 +470,7 @@ fn rpc_reports_an_unknown_account_as_empty_rather_than_failing() {
     let mut seq = node(genesis(&[]));
     let response = handle(
         &mut seq,
+        "sena-test-1",
         Request::GetAccount {
             address: L2Address::from_bytes([9; 32]),
         },
@@ -497,7 +499,11 @@ fn rpc_resolves_a_social_identifier() {
         .unwrap();
     seq.produce(100).unwrap().unwrap();
 
-    match handle(&mut seq, Request::ResolveIdentifier { identifier: id }) {
+    match handle(
+        &mut seq,
+        "sena-test-1",
+        Request::ResolveIdentifier { identifier: id },
+    ) {
         Response::Resolved { address } => assert_eq!(address, Some(address_of(&alice))),
         other => panic!("unexpected response: {other:?}"),
     }
@@ -508,7 +514,11 @@ fn rpc_resolves_an_unknown_identifier_to_nothing() {
     let mut seq = node(genesis(&[]));
     let id = HashedIdentifier::new(Channel::Handle, "@nobody", &NetworkSalt::new(*b"test-salt"));
     assert_eq!(
-        handle(&mut seq, Request::ResolveIdentifier { identifier: id }),
+        handle(
+            &mut seq,
+            "sena-test-1",
+            Request::ResolveIdentifier { identifier: id }
+        ),
         Response::Resolved { address: None }
     );
 }
@@ -529,7 +539,11 @@ fn rpc_submission_reports_pending_rather_than_confirmed() {
         },
     );
 
-    match handle(&mut seq, Request::SubmitTransaction(Box::new(tx))) {
+    match handle(
+        &mut seq,
+        "sena-test-1",
+        Request::SubmitTransaction(Box::new(tx)),
+    ) {
         Response::Submitted { confirmation, .. } => {
             assert_eq!(confirmation, Confirmation::Pending);
         }
@@ -559,7 +573,7 @@ fn rpc_reports_an_assertions_remaining_window() {
         .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
-    match handle(&mut seq, Request::GetAssertion { id }) {
+    match handle(&mut seq, "sena-test-1", Request::GetAssertion { id }) {
         Response::AssertionStatus {
             status,
             window_remaining,
@@ -575,7 +589,7 @@ fn rpc_reports_an_assertions_remaining_window() {
     seq.chain.advance_to(DEFAULT_CHALLENGE_WINDOW).unwrap();
     seq.chain.finalize(&id).unwrap();
 
-    match handle(&mut seq, Request::GetAssertion { id }) {
+    match handle(&mut seq, "sena-test-1", Request::GetAssertion { id }) {
         Response::AssertionStatus {
             status,
             window_remaining,
@@ -609,7 +623,7 @@ fn rpc_reports_whether_the_current_root_is_withdrawable() {
         .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
-    match handle(&mut seq, Request::GetStateRoot) {
+    match handle(&mut seq, "sena-test-1", Request::GetStateRoot) {
         Response::StateRoot { withdrawable, .. } => {
             assert!(!withdrawable, "a pending root is not withdrawable against");
         }
@@ -619,7 +633,7 @@ fn rpc_reports_whether_the_current_root_is_withdrawable() {
     seq.chain.advance_to(DEFAULT_CHALLENGE_WINDOW).unwrap();
     seq.chain.finalize(&id).unwrap();
 
-    match handle(&mut seq, Request::GetStateRoot) {
+    match handle(&mut seq, "sena-test-1", Request::GetStateRoot) {
         Response::StateRoot { withdrawable, .. } => assert!(withdrawable),
         other => panic!("unexpected response: {other:?}"),
     }
@@ -642,9 +656,104 @@ fn rpc_reports_an_unknown_assertion_as_an_error() {
     let mut seq = node(genesis(&[]));
     let response = handle(
         &mut seq,
+        "sena-test-1",
         Request::GetAssertion {
             id: sena_fraudproof::AssertionId::GENESIS,
         },
     );
     assert!(matches!(response, Response::Error { .. }));
+}
+
+// --- Wire format -------------------------------------------------------------
+
+#[test]
+fn amounts_travel_as_strings_not_json_numbers() {
+    // Found in beta testing: serde_json cannot encode u128 at all, and any
+    // client whose JSON numbers are IEEE-754 doubles -- JavaScript included --
+    // would silently round a balance above 2^53. An integrator would read a
+    // wrong balance with no error raised anywhere.
+    let alice = signer(1);
+    let huge = u128::from(u64::MAX) * 1_000;
+    let mut seq = node(genesis(&[(address_of(&alice), huge)]));
+
+    let response = handle(
+        &mut seq,
+        "sena-test-1",
+        Request::GetAccount {
+            address: address_of(&alice),
+        },
+    );
+    let json = serde_json::to_string(&response).expect("account must serialise");
+
+    assert!(
+        json.contains(&format!("\"{huge}\"")),
+        "amount must be a string: {json}"
+    );
+    assert!(
+        !json.contains(&format!(":{huge}")),
+        "amount must not be a bare number: {json}"
+    );
+
+    // And it must survive the round trip exactly.
+    let parsed: Response = serde_json::from_str(&json).expect("must round-trip");
+    match parsed {
+        Response::Account { balances, .. } => assert_eq!(balances, vec![(USDC.get(), huge)]),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn a_transaction_round_trips_through_json() {
+    // The exact path a client takes: build, serialise, send, parse, execute.
+    let alice = signer(1);
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: u128::MAX / 2,
+        },
+    );
+
+    let request = Request::SubmitTransaction(Box::new(tx.clone()));
+    let json = serde_json::to_string(&request).expect("request must serialise");
+    let parsed: Request = serde_json::from_str(&json).expect("request must parse");
+
+    match parsed {
+        Request::SubmitTransaction(received) => {
+            assert_eq!(*received, tx);
+            assert_eq!(
+                received.signing_digest(),
+                tx.signing_digest(),
+                "the signature must still verify after a JSON round trip"
+            );
+        }
+        other => panic!("unexpected request: {other:?}"),
+    }
+}
+
+#[test]
+fn the_signing_digest_does_not_depend_on_json() {
+    // What a user signs has to be reproducible by anything verifying the
+    // signature, including a Move contract on Aptos L1. Hashing serde_json
+    // output would make that a bet on two JSON encoders agreeing forever.
+    let alice = signer(1);
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 7,
+        },
+    );
+
+    let payload_bytes = tx.payload.encode();
+    assert!(!payload_bytes.is_empty());
+    // Binary, not text: a JSON encoding would start with '{'.
+    assert_ne!(
+        payload_bytes[0], b'{',
+        "the payload encoding must be binary"
+    );
 }

@@ -1,7 +1,8 @@
 //! Transactions and how they are authenticated.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sena_primitives::serde_hex::{bytes_32, bytes_64};
+use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
+use sena_primitives::Writer;
 use sena_primitives::{
     domain, AssetId, CanonicalEncoder, Channel, Hash256, HashedIdentifier, L2Address,
 };
@@ -20,6 +21,7 @@ pub enum Payload {
         /// Asset to move.
         asset: AssetId,
         /// Amount to move.
+        #[serde(with = "u128_string")]
         amount: u128,
     },
     /// Bind a human-readable identifier to the sender's address (REQ-SOCIAL-001).
@@ -101,6 +103,7 @@ pub struct Transaction {
     /// The asset the fee is paid in (REQ-GAS-001).
     pub fee_asset: AssetId,
     /// The maximum fee the sender will pay, in units of `fee_asset`.
+    #[serde(with = "u128_string")]
     pub max_fee: u128,
     /// The exchange rate the sender believes applies to `fee_asset`, in units
     /// per [`RATE_SCALE`](crate::gas::RATE_SCALE) native units.
@@ -109,11 +112,80 @@ pub struct Transaction {
     /// compilation stays a pure function of the transaction. The claim is
     /// checked against the on-chain whitelist by an in-trace instruction; see
     /// [`crate::gas`].
+    #[serde(with = "u128_string")]
     pub fee_rate: u128,
     /// What to do.
     pub payload: Payload,
     /// Proof of authorisation.
     pub authenticator: Authenticator,
+}
+
+/// Discriminants for the canonical payload encoding.
+///
+/// Fixed explicitly rather than derived from declaration order: the signing
+/// digest depends on them, so reordering the enum would invalidate every
+/// signature ever produced.
+mod payload_tag {
+    pub const TRANSFER: u8 = 0;
+    pub const BIND_IDENTIFIER: u8 = 1;
+    pub const UNBIND_IDENTIFIER: u8 = 2;
+    pub const GOVERNANCE: u8 = 3;
+}
+
+impl Payload {
+    /// Encodes the payload canonically, for the signing digest.
+    ///
+    /// Binary rather than JSON. What a user signs has to be reproducible by
+    /// anything that verifies the signature -- including, for keyless accounts,
+    /// a Move contract on Aptos L1 -- and reimplementing `serde_json` in Move
+    /// well enough to agree byte for byte is not a reasonable thing to depend
+    /// on. It is the same reason state values moved off JSON in Phase 7.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a governance payload carries more than `u32::MAX` signatures.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self {
+            Self::Transfer { to, asset, amount } => {
+                w.u8(payload_tag::TRANSFER);
+                w.bytes32(to.as_bytes());
+                w.u32(asset.get());
+                w.u128(*amount);
+            }
+            Self::BindIdentifier {
+                channel,
+                identifier,
+            } => {
+                w.u8(payload_tag::BIND_IDENTIFIER);
+                w.u8(channel.discriminant());
+                w.bytes32(identifier.as_hash().as_bytes());
+            }
+            Self::UnbindIdentifier { identifier } => {
+                w.u8(payload_tag::UNBIND_IDENTIFIER);
+                w.bytes32(identifier.as_hash().as_bytes());
+            }
+            Self::Governance {
+                epoch,
+                update,
+                signatures,
+            } => {
+                w.u8(payload_tag::GOVERNANCE);
+                w.u64(*epoch);
+                w.bytes(&update.encode());
+                w.u32(
+                    u32::try_from(signatures.len())
+                        .expect("a payload cannot carry 2^32 signatures"),
+                );
+                for signature in signatures {
+                    w.u32(signature.index);
+                    w.bytes(&signature.signature);
+                }
+            }
+        }
+        w.finish()
+    }
 }
 
 impl Transaction {
@@ -126,10 +198,10 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// Panics only if serialising the payload fails, which cannot occur.
+    /// Does not panic.
     #[must_use]
     pub fn signing_digest(&self) -> Hash256 {
-        let payload = serde_json::to_vec(&self.payload).expect("payload serialisation cannot fail");
+        let payload = self.payload.encode();
         Hash256::commit(
             CanonicalEncoder::new(domain::TRANSACTION)
                 .field(self.sender.as_bytes())
