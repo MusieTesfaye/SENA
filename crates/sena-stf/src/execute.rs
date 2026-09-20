@@ -17,6 +17,8 @@ use sena_state::{hash_value, MerkleProof, MerkleTrie, ProofError};
 use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, BalanceError};
+use crate::gas::{self, GasError, WhitelistedAsset};
+use crate::governance::{self, Council, GovernanceError, GovernanceUpdate};
 use crate::instruction::{Instruction, MachineState};
 use crate::social::SocialBinding;
 use crate::transaction::{AuthError, Payload, Transaction};
@@ -28,13 +30,12 @@ use crate::transaction::{AuthError, Payload, Transaction};
 /// by a protocol rule, never by whoever holds a private key.
 pub const FEE_VAULT: L2Address = L2Address::from_bytes([0xFE; 32]);
 
-/// The flat fee charged per transaction, pending the gas paymaster.
+/// The base cost of a transaction, in native units.
 ///
-/// Phase 4 replaces this with the multi-asset paymaster (REQ-GAS-004 through
-/// REQ-GAS-006), which prices a transaction by the work it does and converts
-/// through the whitelisted asset's rate. A flat fee is used until then so that
-/// fee handling is present in the trace from the start rather than bolted on.
-pub const FLAT_FEE: u128 = 1_000;
+/// Re-exported from [`crate::gas`], where the conversion into a whitelisted
+/// asset is defined. Pricing by the work a transaction actually performs needs
+/// per-instruction metering and is tracked as follow-up work.
+pub use crate::gas::BASE_GAS_NATIVE;
 
 /// Why a single step failed.
 ///
@@ -74,6 +75,26 @@ pub enum StepError {
     /// A Merkle proof in the witness did not verify.
     #[error("witness proof invalid: {0}")]
     BadWitnessProof(#[from] ProofError),
+    /// The fee asset is not on the whitelist.
+    #[error("asset is not whitelisted for fees")]
+    AssetNotWhitelisted,
+    /// The fee asset is whitelisted but currently disabled.
+    #[error("asset is whitelisted but disabled for fees")]
+    AssetDisabled,
+    /// The transaction declared a rate the whitelist does not hold.
+    #[error("declared gas rate {declared} does not match the on-chain rate {on_chain}")]
+    GasRateMismatch {
+        /// The rate the transaction claimed.
+        declared: u128,
+        /// The rate actually recorded.
+        on_chain: u128,
+    },
+    /// A gas computation failed.
+    #[error("gas error: {0}")]
+    Gas(#[from] GasError),
+    /// A governance check failed.
+    #[error("governance error: {0}")]
+    Governance(#[from] GovernanceError),
 }
 
 /// The complete semantics of the instruction set.
@@ -137,6 +158,47 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
                 Some(holder) if holder == *expected_owner => Ok(SocialBinding::Vacant.encode()),
                 _ => Err(StepError::IdentifierNotHeld),
             }
+        }
+        Instruction::VerifyGasAsset { rate, .. } => {
+            let bytes = current.ok_or(StepError::AssetNotWhitelisted)?;
+            let record = WhitelistedAsset::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+            if !record.enabled {
+                return Err(StepError::AssetDisabled);
+            }
+            if record.rate != *rate {
+                return Err(StepError::GasRateMismatch {
+                    declared: *rate,
+                    on_chain: record.rate,
+                });
+            }
+            // A read-only step: the slot is written back byte-identical, so the
+            // state root is unchanged and the step is still a single-slot write
+            // like every other.
+            Ok(bytes.to_vec())
+        }
+        Instruction::VerifyCouncil { digest, signatures } => {
+            let bytes = current.ok_or(GovernanceError::MalformedCouncil)?;
+            let council = Council::decode(bytes)?;
+            governance::verify_council_signatures(&council, digest, signatures)?;
+            Ok(bytes.to_vec())
+        }
+        Instruction::SetGasAsset { record } => {
+            GovernanceUpdate::SetGasAsset {
+                record: record.clone(),
+            }
+            .check_permitted()?;
+            Ok(record.encode())
+        }
+        Instruction::SetParameter { name, value } => {
+            // Re-checked here and not only at compile time: the L1 verifier
+            // adjudicates this instruction from the batch data alone, so the
+            // allowlist has to be enforced by the step itself (REQ-GOV-007).
+            GovernanceUpdate::SetParameter {
+                name: name.clone(),
+                value: *value,
+            }
+            .check_permitted()?;
+            Ok(value.to_be_bytes().to_vec())
         }
     }
 }
@@ -253,9 +315,31 @@ pub enum CompileError {
     /// is no use for the operation, so it is excluded.
     #[error("a transfer cannot name its sender as the recipient")]
     SelfTransfer,
+    /// The declared gas rate is unusable.
+    #[error("gas error: {0}")]
+    Gas(#[from] GasError),
+    /// The governance update is not one the council may make.
+    #[error("governance error: {0}")]
+    Governance(#[from] GovernanceError),
 }
 
 /// Turns an authorised transaction into the instructions that execute it.
+///
+/// # This function must stay a pure function of the transaction
+///
+/// It reads no state, and it must not begin to. The reason is structural rather
+/// than stylistic: when a dispute bisects down to step `n`, Aptos L1 has to know
+/// which instruction sits at that index, and it derives that by compiling the
+/// published batch data itself. If compilation consulted state, L1 would need a
+/// witness for every slot the compiler touched, at every step — and the two
+/// parties could disagree about the instruction list itself, which bisection
+/// over a shared list has no way to resolve.
+///
+/// So anything that must be checked against state becomes an instruction in the
+/// trace instead of a lookup here. That is why a transaction declares the gas
+/// rate it believes applies and [`Instruction::VerifyGasAsset`] validates it,
+/// and why council signatures are checked by [`Instruction::VerifyCouncil`]
+/// rather than during compilation.
 ///
 /// # Errors
 ///
@@ -263,10 +347,11 @@ pub enum CompileError {
 pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileError> {
     transaction.authenticate()?;
 
-    if transaction.max_fee < FLAT_FEE {
+    let fee = gas::fee_for(transaction.fee_rate)?;
+    if transaction.max_fee < fee {
         return Err(CompileError::FeeTooLow {
             offered: transaction.max_fee,
-            required: FLAT_FEE,
+            required: fee,
         });
     }
 
@@ -276,15 +361,21 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
             account: sender,
             expected: transaction.nonce,
         },
+        // Validate the declared rate against the whitelist before charging on
+        // the strength of it.
+        Instruction::VerifyGasAsset {
+            asset: transaction.fee_asset,
+            rate: transaction.fee_rate,
+        },
         Instruction::Debit {
             account: sender,
             asset: transaction.fee_asset,
-            amount: FLAT_FEE,
+            amount: fee,
         },
         Instruction::Credit {
             account: FEE_VAULT,
             asset: transaction.fee_asset,
-            amount: FLAT_FEE,
+            amount: fee,
         },
     ];
 
@@ -314,6 +405,26 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
             instructions.push(Instruction::UnbindIdentifier {
                 identifier: *identifier,
                 expected_owner: sender,
+            });
+        }
+        Payload::Governance {
+            epoch,
+            update,
+            signatures,
+        } => {
+            update.check_permitted()?;
+            instructions.push(Instruction::VerifyCouncil {
+                digest: update.signing_digest(*epoch),
+                signatures: signatures.clone(),
+            });
+            instructions.push(match update {
+                GovernanceUpdate::SetGasAsset { record } => Instruction::SetGasAsset {
+                    record: record.clone(),
+                },
+                GovernanceUpdate::SetParameter { name, value } => Instruction::SetParameter {
+                    name: name.clone(),
+                    value: *value,
+                },
             });
         }
     }

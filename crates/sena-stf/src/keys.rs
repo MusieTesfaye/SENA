@@ -18,6 +18,7 @@ mod region {
     pub const SOCIAL_BY_ADDRESS: &[u8] = b"SENA:v1:state:social-by-address";
     pub const ASSET: &[u8] = b"SENA:v1:state:asset";
     pub const PARAMETER: &[u8] = b"SENA:v1:state:parameter";
+    pub const COUNCIL: &[u8] = b"SENA:v1:state:council";
 }
 
 /// Key of an account's state.
@@ -50,6 +51,18 @@ pub fn asset(asset_id: u32) -> Hash256 {
 #[must_use]
 pub fn parameter(name: &str) -> Hash256 {
     Hash256::commit(CanonicalEncoder::new(region::PARAMETER).field(name.as_bytes()))
+}
+
+/// Key of the governance council record (REQ-GOV-002).
+///
+/// Held in its own slot rather than among the numeric parameters, because
+/// [`Instruction::VerifyCouncil`] reads it as its single slot and single-slot
+/// access is what keeps one-step verification simple.
+///
+/// [`Instruction::VerifyCouncil`]: crate::Instruction::VerifyCouncil
+#[must_use]
+pub fn council() -> Hash256 {
+    Hash256::commit(CanonicalEncoder::new(region::COUNCIL))
 }
 
 #[cfg(test)]

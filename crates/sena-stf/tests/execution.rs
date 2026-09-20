@@ -14,13 +14,22 @@ use rand::SeedableRng;
 use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use sena_stf::execute::{genesis_credit, StepWitness};
+use sena_stf::gas::fee_for;
 use sena_stf::{
     apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchError,
-    CompileError, Instruction, MachineState, Payload, SocialBinding, StepError, Transaction,
-    FEE_VAULT, FLAT_FEE,
+    CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction, MachineState, Payload,
+    SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT, RATE_SCALE,
 };
 
 const USDC: AssetId = AssetId(1);
+
+/// The rate USDC is whitelisted at in these tests: one-to-one with native units.
+const USDC_RATE: u128 = RATE_SCALE;
+
+/// The fee a transaction costs at [`USDC_RATE`].
+fn fee() -> u128 {
+    fee_for(USDC_RATE).unwrap()
+}
 
 /// A deterministic test signer. The seed is fixed so failures reproduce.
 fn signer(seed: u8) -> SigningKey {
@@ -38,7 +47,8 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: FLAT_FEE,
+        max_fee: fee(),
+        fee_rate: USDC_RATE,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
@@ -53,12 +63,59 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
     tx
 }
 
+/// A trie with USDC whitelisted for fees and the listed accounts funded.
+/// Re-signs a transaction after its fields have been altered.
+fn resign(key: &SigningKey, mut tx: Transaction) -> Transaction {
+    let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
+    tx.authenticator = Authenticator::Ed25519 {
+        public_key: key.verifying_key().to_bytes(),
+        signature,
+    };
+    tx
+}
+
 fn funded_trie(accounts: &[(L2Address, u128)]) -> MerkleTrie {
     let mut trie = MerkleTrie::new();
+    whitelist(&mut trie, USDC, "USDC", USDC_RATE, true);
     for (address, amount) in accounts {
         genesis_credit(&mut trie, *address, USDC, *amount);
     }
     trie
+}
+
+/// Writes a gas asset record directly, as genesis would.
+fn whitelist(trie: &mut MerkleTrie, asset: AssetId, symbol: &str, rate: u128, enabled: bool) {
+    let record = WhitelistedAsset {
+        asset,
+        symbol: symbol.to_owned(),
+        rate,
+        enabled,
+    };
+    apply(trie, &Instruction::SetGasAsset { record }).unwrap();
+}
+
+/// Installs a council with the given members and threshold.
+fn install_council(trie: &mut MerkleTrie, keys: &[SigningKey], threshold: u32) {
+    let council = Council {
+        members: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+        threshold,
+    };
+    trie.insert(keys::council(), council.encode());
+}
+
+/// Signs a governance update with the given council members.
+fn council_sign(
+    keys: &[(u32, &SigningKey)],
+    update: &GovernanceUpdate,
+    epoch: u64,
+) -> Vec<CouncilSignature> {
+    let digest = update.signing_digest(epoch);
+    keys.iter()
+        .map(|(index, key)| CouncilSignature {
+            index: *index,
+            signature: key.sign(digest.as_bytes()).to_bytes(),
+        })
+        .collect()
 }
 
 fn account_in(trie: &MerkleTrie, address: &L2Address) -> Account {
@@ -88,9 +145,9 @@ fn a_transfer_moves_value_and_charges_a_fee() {
     assert_eq!(account_in(&trie, &bob).balance(USDC), 2_500);
     assert_eq!(
         account_in(&trie, &address_of(&alice)).balance(USDC),
-        10_000 - 2_500 - FLAT_FEE
+        10_000 - 2_500 - fee()
     );
-    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), FLAT_FEE);
+    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee());
     assert_eq!(account_in(&trie, &address_of(&alice)).nonce, 1);
 }
 
@@ -435,8 +492,8 @@ fn the_trace_records_a_state_for_every_step_boundary() {
     assert_eq!(trace.states.len(), trace.instructions.len() + 1);
     assert_eq!(trace.initial().state_root, pre_root);
     assert_eq!(trace.final_state().state_root, trie.root());
-    // nonce, fee debit, fee credit, transfer debit, transfer credit
-    assert_eq!(trace.len(), 5);
+    // nonce, gas-asset check, fee debit, fee credit, transfer debit, transfer credit
+    assert_eq!(trace.len(), 6);
 }
 
 #[test]
@@ -656,5 +713,345 @@ proptest! {
             prop_assert_eq!(derived, trace.states[index + 1]);
             apply(&mut replay, instruction).unwrap();
         }
+    }
+}
+
+// --- Multi-asset gas --------------------------------------------------------
+
+#[test]
+fn a_fee_is_charged_in_the_declared_stablecoin() {
+    let alice = signer(1);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 10,
+        },
+    );
+    execute_batch(&mut trie, &[tx]).unwrap();
+
+    // No native token was needed at any point (REQ-GAS-002).
+    assert_eq!(
+        account_in(&trie, &address_of(&alice)).balance(AssetId::NATIVE),
+        0
+    );
+    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee());
+}
+
+#[test]
+fn an_unlisted_asset_cannot_pay_fees() {
+    let alice = signer(1);
+    let mut trie = MerkleTrie::new();
+    genesis_credit(&mut trie, address_of(&alice), AssetId(77), 100_000);
+
+    let mut tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: AssetId(77),
+            amount: 1,
+        },
+    );
+    tx.fee_asset = AssetId(77);
+    let tx = resign(&alice, tx);
+
+    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::AssetNotWhitelisted,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_disabled_asset_cannot_pay_fees() {
+    let alice = signer(1);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    whitelist(&mut trie, USDC, "USDC", USDC_RATE, false);
+
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::AssetDisabled,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_transaction_cannot_declare_a_cheaper_rate_than_the_chain_holds() {
+    // The fraud this in-trace check exists to catch: a sender (or a colluding
+    // sequencer) claiming a rate that makes execution nearly free.
+    let alice = signer(1);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+
+    let mut tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    tx.fee_rate = 1;
+    tx.max_fee = 1;
+    let tx = resign(&alice, tx);
+
+    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::GasRateMismatch { .. },
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_max_fee_below_the_real_cost_is_refused_at_compile_time() {
+    let alice = signer(1);
+    let mut tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    tx.max_fee = fee() - 1;
+    let tx = resign(&alice, tx);
+    assert!(matches!(
+        compile(&tx).unwrap_err(),
+        CompileError::FeeTooLow { .. }
+    ));
+}
+
+#[test]
+fn a_cheaper_asset_costs_proportionally_more_units() {
+    // An asset worth half a native unit should cost twice as many units.
+    let half_value = RATE_SCALE * 2;
+    assert_eq!(
+        fee_for(half_value).unwrap(),
+        2 * fee_for(RATE_SCALE).unwrap()
+    );
+}
+
+// --- Governance --------------------------------------------------------------
+
+#[test]
+fn the_council_can_whitelist_a_new_gas_asset() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let m2 = signer(11);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, &[m1.clone(), m2.clone()], 2);
+
+    let update = GovernanceUpdate::SetGasAsset {
+        record: WhitelistedAsset {
+            asset: AssetId(2),
+            symbol: "EURC".to_owned(),
+            rate: RATE_SCALE,
+            enabled: true,
+        },
+    };
+    let signatures = council_sign(&[(0, &m1), (1, &m2)], &update, 1);
+
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 1,
+            update,
+            signatures,
+        },
+    );
+    execute_batch(&mut trie, &[tx]).expect("a quorum-signed update should apply");
+
+    let stored = trie.get(&keys::asset(2)).expect("record should exist");
+    assert_eq!(WhitelistedAsset::decode(stored).unwrap().symbol, "EURC");
+}
+
+#[test]
+fn an_update_without_a_quorum_is_refused() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let m2 = signer(11);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, &[m1.clone(), m2], 2);
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "gas.base_native".to_owned(),
+        value: 5,
+    };
+    let signatures = council_sign(&[(0, &m1)], &update, 1); // one of two
+
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 1,
+            update,
+            signatures,
+        },
+    );
+    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::Governance(_),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_forged_council_signature_is_refused() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let impostor = signer(99);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "gas.base_native".to_owned(),
+        value: 5,
+    };
+    let signatures = council_sign(&[(0, &impostor)], &update, 1);
+
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 1,
+            update,
+            signatures,
+        },
+    );
+    assert!(execute_batch(&mut trie, &[tx]).is_err());
+}
+
+#[test]
+fn a_governance_payload_cannot_be_replayed_in_a_later_epoch() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "gas.base_native".to_owned(),
+        value: 5,
+    };
+    let signatures = council_sign(&[(0, &m1)], &update, 1);
+
+    // Same signatures, different epoch.
+    let replayed = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 2,
+            update,
+            signatures,
+        },
+    );
+    assert!(execute_batch(&mut trie, &[replayed]).is_err());
+}
+
+#[test]
+fn the_council_cannot_reach_the_dispute_system() {
+    // REQ-GOV-007. Even a unanimous, correctly signed council must not be able
+    // to touch the challenge window or anything else outside the allowlist --
+    // a council that could rescue a fraudulent assertion would nullify the
+    // entire fraud proof system.
+    let alice = signer(1);
+    let m1 = signer(10);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+
+    for name in ["challenge_window", "assertion.finalize", "dispute.outcome"] {
+        let update = GovernanceUpdate::SetParameter {
+            name: name.to_owned(),
+            value: 0,
+        };
+        let signatures = council_sign(&[(0, &m1)], &update, 1);
+        let tx = signed(
+            &alice,
+            0,
+            Payload::Governance {
+                epoch: 1,
+                update,
+                signatures,
+            },
+        );
+
+        assert!(
+            execute_batch(&mut trie.clone(), &[tx]).is_err(),
+            "'{name}' must be unreachable by governance"
+        );
+    }
+}
+
+#[test]
+fn governance_changes_are_covered_by_the_execution_trace() {
+    // REQ-GOV-006: a governance update is an ordinary batch step, so it is
+    // disputable exactly like sequencer fraud. Verify the L1 path agrees.
+    let alice = signer(1);
+    let m1 = signer(10);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+    let mut replay = trie.clone();
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "batch.max_transactions".to_owned(),
+        value: 512,
+    };
+    let signatures = council_sign(&[(0, &m1)], &update, 7);
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 7,
+            update,
+            signatures,
+        },
+    );
+
+    let trace = execute_batch(&mut trie, &[tx]).unwrap();
+    for (index, instruction) in trace.instructions.iter().enumerate() {
+        let witness = witness_for(&replay, instruction);
+        let derived = verify_step(&trace.states[index], instruction, &witness)
+            .unwrap_or_else(|e| panic!("governance step {index} failed on L1: {e}"));
+        assert_eq!(derived, trace.states[index + 1]);
+        apply(&mut replay, instruction).unwrap();
     }
 }

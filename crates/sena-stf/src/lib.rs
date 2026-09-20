@@ -37,6 +37,8 @@
 
 pub mod account;
 pub mod execute;
+pub mod gas;
+pub mod governance;
 pub mod instruction;
 pub mod keys;
 pub mod social;
@@ -45,8 +47,10 @@ pub mod transaction;
 pub use account::{Account, BalanceError};
 pub use execute::{
     apply, compile, execute_batch, transition, verify_step, BatchError, CompileError,
-    ExecutionTrace, StepError, StepWitness, FEE_VAULT, FLAT_FEE,
+    ExecutionTrace, StepError, StepWitness, BASE_GAS_NATIVE, FEE_VAULT,
 };
+pub use gas::{GasError, WhitelistedAsset, RATE_SCALE};
+pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
 pub use instruction::{Instruction, MachineState};
 pub use social::{MalformedBinding, SocialBinding};
 pub use transaction::{AuthError, Authenticator, Payload, Transaction};

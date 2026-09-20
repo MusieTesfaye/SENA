@@ -44,6 +44,7 @@ pub mod address;
 pub mod encoding;
 pub mod hash;
 pub mod identity;
+pub mod serde_hex;
 
 pub use address::{AssetId, L2Address};
 pub use encoding::{domain, CanonicalEncoder};

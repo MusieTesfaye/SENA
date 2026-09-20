@@ -27,6 +27,9 @@
 //! exists.
 
 use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address};
+
+use crate::gas::WhitelistedAsset;
+use crate::governance::CouncilSignature;
 use serde::{Deserialize, Serialize};
 
 /// One indivisible operation on the state.
@@ -80,6 +83,40 @@ pub enum Instruction {
         identifier: HashedIdentifier,
         /// The address that must currently hold it.
         expected_owner: L2Address,
+    },
+    /// Check that `asset` is whitelisted for fees at exactly `rate` (REQ-GAS-005).
+    ///
+    /// Writes its slot back unchanged. The step exists so that the rate a
+    /// transaction declared is validated against state *inside the trace*,
+    /// where it is disputable, rather than during compilation, which must stay
+    /// state-independent. See [`crate::gas`].
+    VerifyGasAsset {
+        /// The asset the fee is paid in.
+        asset: AssetId,
+        /// The rate the transaction claimed applies.
+        rate: u128,
+    },
+    /// Check that the council authorised `digest` (REQ-GOV-004).
+    ///
+    /// Also a read-only step, for the same reason: the council roster lives in
+    /// state, so the check belongs in the trace.
+    VerifyCouncil {
+        /// The governance update digest that was signed.
+        digest: Hash256,
+        /// The signatures offered.
+        signatures: Vec<CouncilSignature>,
+    },
+    /// Write a gas asset's whitelist record (REQ-GAS-003).
+    SetGasAsset {
+        /// The record to store.
+        record: WhitelistedAsset,
+    },
+    /// Write an allowlisted network parameter (REQ-GOV-005).
+    SetParameter {
+        /// The parameter's name.
+        name: String,
+        /// Its new value.
+        value: u128,
     },
 }
 
@@ -142,6 +179,10 @@ impl Instruction {
             Self::BindIdentifier { identifier, .. } | Self::UnbindIdentifier { identifier, .. } => {
                 keys::social_by_identifier(identifier)
             }
+            Self::VerifyGasAsset { asset, .. } => keys::asset(asset.get()),
+            Self::SetGasAsset { record } => keys::asset(record.asset.get()),
+            Self::VerifyCouncil { .. } => keys::council(),
+            Self::SetParameter { name, .. } => keys::parameter(name),
         }
     }
 }

@@ -1,10 +1,13 @@
 //! Transactions and how they are authenticated.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sena_primitives::serde_hex::{bytes_32, bytes_64};
 use sena_primitives::{
     domain, AssetId, CanonicalEncoder, Channel, Hash256, HashedIdentifier, L2Address,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::governance::{CouncilSignature, GovernanceUpdate};
 
 /// What a transaction asks the chain to do.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -32,6 +35,21 @@ pub enum Payload {
         /// The identifier to release.
         identifier: HashedIdentifier,
     },
+    /// Apply a council-authorised governance change (REQ-GOV-003).
+    ///
+    /// Carried as an ordinary transaction so that it is executed inside a batch
+    /// and covered by the same fraud proof guarantees as anything else
+    /// (REQ-GOV-006). A council signature authorising an invalid state change
+    /// produces an invalid assertion, challengeable like sequencer fraud.
+    Governance {
+        /// Monotonic epoch, signed over, so an approved change cannot be
+        /// replayed once applied.
+        epoch: u64,
+        /// The change the council authorised.
+        update: GovernanceUpdate,
+        /// Council signatures over the update digest.
+        signatures: Vec<CouncilSignature>,
+    },
 }
 
 /// How a transaction proves it was authorised.
@@ -41,10 +59,10 @@ pub enum Authenticator {
     /// A plain Ed25519 signature by a key the account controls directly.
     Ed25519 {
         /// The signing key, as 32 raw bytes.
-        #[serde(with = "hex_bytes_32")]
+        #[serde(with = "bytes_32")]
         public_key: [u8; 32],
         /// The signature, as 64 raw bytes.
-        #[serde(with = "hex_bytes_64")]
+        #[serde(with = "bytes_64")]
         signature: [u8; 64],
     },
     /// An OIDC keyless authorisation (REQ-AUTH-003, REQ-AUTH-004).
@@ -63,10 +81,10 @@ pub enum Authenticator {
     /// landing. It is deliberately inert until then.
     Keyless {
         /// The ephemeral public key that signed this transaction.
-        #[serde(with = "hex_bytes_32")]
+        #[serde(with = "bytes_32")]
         ephemeral_public_key: [u8; 32],
         /// The ephemeral key's signature over the transaction.
-        #[serde(with = "hex_bytes_64")]
+        #[serde(with = "bytes_64")]
         signature: [u8; 64],
         /// The proof binding the ephemeral key to a JWT. Not yet verified.
         zk_proof: Vec<u8>,
@@ -84,6 +102,14 @@ pub struct Transaction {
     pub fee_asset: AssetId,
     /// The maximum fee the sender will pay, in units of `fee_asset`.
     pub max_fee: u128,
+    /// The exchange rate the sender believes applies to `fee_asset`, in units
+    /// per [`RATE_SCALE`](crate::gas::RATE_SCALE) native units.
+    ///
+    /// Declared by the sender rather than looked up during execution, so that
+    /// compilation stays a pure function of the transaction. The claim is
+    /// checked against the on-chain whitelist by an in-trace instruction; see
+    /// [`crate::gas`].
+    pub fee_rate: u128,
     /// What to do.
     pub payload: Payload,
     /// Proof of authorisation.
@@ -110,6 +136,7 @@ impl Transaction {
                 .u64(self.nonce)
                 .u64(u64::from(self.fee_asset.get()))
                 .u128(self.max_fee)
+                .u128(self.fee_rate)
                 .field(&payload),
         )
     }
@@ -164,36 +191,4 @@ pub enum AuthError {
              rather than accepted unchecked"
     )]
     KeylessNotImplemented,
-}
-
-/// Hex serialisation for fixed 32-byte arrays, which serde cannot derive.
-mod hex_bytes_32 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let s = String::deserialize(d)?;
-        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        v.try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
-    }
-}
-
-/// Hex serialisation for fixed 64-byte arrays.
-mod hex_bytes_64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let s = String::deserialize(d)?;
-        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        v.try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
-    }
 }
