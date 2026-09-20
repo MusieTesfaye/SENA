@@ -56,7 +56,7 @@ Each phase lands as a reviewable commit with tests that pass in CI.
 | 2 | `sena-state` — sparse Merkle trie, inclusion proofs | ✅ done |
 | 3 | `sena-stf` — accounts, transactions, execution | ✅ done |
 | 4 | Social Connect, Gas Paymaster, Governance modules | ✅ done |
-| 5 | `sena-fraudproof` — assertions, bisection, one-step proofs | ⬜ |
+| 5 | `sena-fraudproof` — assertions, bisection, one-step proofs | ✅ done |
 | 6 | `sena-node` — mempool, block production, RPC, verifier mode | ⬜ |
 | 7 | Move L1 contracts, end-to-end adversarial dispute tests | ⬜ |
 
