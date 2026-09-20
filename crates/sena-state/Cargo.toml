@@ -1,0 +1,21 @@
+[package]
+name = "sena-state"
+description = "Merklized state for the SENA Network: a sparse binary trie with inclusion and non-inclusion proofs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sena-primitives.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
