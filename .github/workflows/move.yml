@@ -2,14 +2,20 @@ name: Move
 
 # Compiles and tests the Aptos L1 contracts.
 #
-# These contracts have never been compiled: the development machine is an Intel
-# Celeron N4120, an Atom-lineage chip that lacks AVX entirely, and the prebuilt
-# Aptos CLI aborts with an illegal instruction on it. GitHub's runners have
-# AVX2, so this workflow is how the Move package gets built at all.
+# The CLI version here is pinned to 7.9.0 for two reasons, both load-bearing.
 #
-# Expect the first runs to fail. That is the point: the failure output is the
-# list of what needs fixing, and it is the item blocking Gates B through G in
-# docs/beta/BETA_EXECUTION_CHECKLIST.md.
+# Reproducibility: BETA_BUILD_PLAN.md W-02 requires the toolchain to be a
+# recorded input, because a compiler that moves underneath the contracts makes a
+# build -- and therefore a deployed package hash -- unreproducible.
+#
+# Portability: prebuilt Aptos CLI releases from 7.14.2 onward abort with SIGILL
+# on CPUs without AVX2, which includes every Intel Atom-lineage chip. 7.9.0 and
+# earlier run on baseline x86-64. Pinning here keeps CI and a developer laptop
+# building the same package with the same compiler.
+#
+# The framework is pinned to the commit tagged aptos-cli-v7.9.0, so framework
+# and compiler come from one revision. Later framework revisions use Move 2
+# syntax that 7.9.0 cannot parse.
 
 on:
   push:
@@ -27,7 +33,7 @@ env:
   # Pinned rather than "latest": BETA_BUILD_PLAN.md W-02 requires the Aptos CLI
   # to be a recorded input, because a toolchain that moves underneath the
   # contracts makes a build unreproducible.
-  APTOS_CLI_VERSION: "9.5.1"
+  APTOS_CLI_VERSION: "7.9.0"
   # A throwaway address for compilation. The package declares `sena = "_"`, so
   # a value must be supplied; deployment uses a real account.
   SENA_DEV_ADDRESS: "0xCAFE"
@@ -38,17 +44,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Confirm the runner has AVX2
-        # The whole reason this job exists. If a future runner image lacks it,
-        # the failure should say so rather than surfacing as a crash.
-        run: |
-          if grep -qm1 ' avx2' /proc/cpuinfo; then
-            echo "avx2: present"
-          else
-            echo "::error::this runner lacks AVX2; the prebuilt Aptos CLI will not run"
-            exit 1
-          fi
 
       - name: Install Aptos CLI ${{ env.APTOS_CLI_VERSION }}
         run: |
@@ -73,15 +68,15 @@ jobs:
             echo "commit: ${GITHUB_SHA}"
           } | tee artifacts/toolchain.txt
 
-      - name: Resolve the Aptos framework revision
-        # Move.toml pins `rev = "mainnet"`, which is a branch and therefore a
-        # moving target. Recording what it resolved to is the first step toward
-        # pinning it to a commit, which W-02 requires.
+      - name: Record the pinned framework revision
         run: |
           set -euo pipefail
-          resolved=$(git ls-remote https://github.com/aptos-labs/aptos-core.git mainnet | cut -f1)
-          echo "aptos_framework_rev_resolved: ${resolved}" | tee -a artifacts/toolchain.txt
-          echo "::notice::AptosFramework 'mainnet' currently resolves to ${resolved} -- pin Move.toml to this commit for reproducible builds"
+          rev=$(grep -oE '^rev = "[0-9a-f]{40}"' move/sena/Move.toml | cut -d'"' -f2)
+          if [ -z "$rev" ]; then
+            echo "::error::Move.toml must pin the framework to a 40-character commit, not a branch"
+            exit 1
+          fi
+          echo "aptos_framework_rev: ${rev}" | tee -a artifacts/toolchain.txt
 
       - name: Compile
         id: compile

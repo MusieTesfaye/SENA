@@ -1,6 +1,6 @@
 # Status
 
-**Version 0.2.0-beta** · 248 tests passing · not audited · not deployed
+**Version 0.2.0-beta** · 248 Rust tests + 36 Move tests passing · not audited · not deployed
 
 **Beta planning:** [`docs/beta/BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) ·
 [`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) ·
@@ -37,6 +37,7 @@ These are exercised by the test suite on every run, and by
 | Independent verification from published data | `sena-node` | `published_batch_data_reproduces_the_asserted_root` |
 | Persistence across restart, verified on load | `sena-node` | Corrupt state and cross-chain data both refused |
 | Keyless claim validation and ephemeral-key binding | `sena-stf` | Stolen-JWT and expiry-extension attacks rejected |
+| Move contracts compile and self-test | `move/sena` | 36/36 Move tests, including Rust conformance |
 
 ### The claim that matters
 
@@ -72,18 +73,25 @@ the strength of the checks that *are* implemented would let anyone spend from an
 keyless account by presenting claims they invented. Refusing is the only safe
 behaviour, and the code does refuse.
 
-### 2. The Aptos L1 contracts have not been compiled
+### 2. The Aptos L1 contracts compile but are not deployed
 
-1,789 lines of Move across six modules, written against the Rust reference. The
-Aptos CLI could not run in the development environment (the prebuilt binary
-requires AVX2; the machine does not have it), so **none of it has been
-compiled, tested, or deployed.** Expect compilation errors.
+**Resolved since the last revision.** All six modules compile and 36 of 36 Move
+unit tests pass, including cross-language conformance tests that compute digests
+in Move and compare them against the Rust reference.
 
-Drift between the two implementations *is* checked: each Move module embeds
-conformance constants produced by Rust, and `cargo test` fails if any no longer
-matches. That catches silent divergence. It does not substitute for compiling.
+What remains open:
 
-See [`move/README.md`](move/README.md).
+- **Nothing is deployed.** No SENA transaction has ever been submitted to Aptos.
+- **Bond escrow is bookkeeping, not custody.** No coin moves.
+- **Four instructions are not adjudicable.** `VerifyGasAsset`, `VerifyCouncil`,
+  `SetGasAsset` and `SetParameter` abort, so a dispute over a gas-rate or
+  governance step cannot be settled on L1. That is a beta blocker.
+- **Nothing is audited.**
+
+The toolchain is narrow and deliberately pinned: CLI `7.9.0` with the framework
+at commit `46d871fa…`. Newer CLI releases abort on CPUs without AVX2, and newer
+framework revisions use syntax `7.9.0` cannot parse. See
+[`move/README.md`](move/README.md).
 
 ### 3. Nothing has been audited
 
@@ -174,9 +182,10 @@ Against the seven release gates in
 **Gate A, in progress**. The scope freeze, parameter freeze and traceability
 matrix are done; the SRS/SDD amendment for the execution target is outstanding.
 
-Gate B — local end-to-end integration against an Aptos node — cannot begin until
-the Move package compiles. That one item blocks Gates B through G, and it is
-blocked on hardware rather than on any design question.
+Gate B — local end-to-end integration against an Aptos node — is now reachable:
+the Move package compiles and its tests pass, which was the item blocking it.
+What Gate B still needs is a local Aptos deployment and an assertion lifecycle
+run against it. Nothing has been deployed yet.
 
 [`BETA_EXECUTION_CHECKLIST.md`](docs/beta/BETA_EXECUTION_CHECKLIST.md) carries a
 status for every item.
@@ -185,10 +194,12 @@ status for every item.
 
 In dependency order, following the build plan's critical path.
 
-1. **Compile and test the Move contracts.** Nothing L1-related is real until this
-   is done. Needs a machine with AVX2, or a source build of the Aptos CLI.
-2. **Local Aptos integration.** The honest and adversarial assertion lifecycles
-   against a local node — Gate B.
+1. **Local Aptos integration.** The honest and adversarial assertion lifecycles
+   against a local node — Gate B. The contracts compile, so this is the next
+   real step.
+2. **Adjudicate the remaining four instructions.** Until `VerifyGasAsset` and
+   `VerifyCouncil` can be settled on L1, disputes over gas and governance steps
+   have no resolution path.
 3. **Aptos settlement adapter.** Real signed transactions, real assertions.
 4. **Independent data availability.** Batch data currently comes from the same
    node that produced the assertion, which is the weakest link in the security

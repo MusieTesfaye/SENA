@@ -6,7 +6,6 @@
 /// user's funds rather than being a number in a document.
 module sena::bridge {
     use std::signer;
-    use std::vector;
     use aptos_std::table::{Self, Table};
     use aptos_framework::timestamp;
     use sena::assertions;
@@ -110,11 +109,11 @@ module sena::bridge {
         });
     }
 
+    #[view]
     /// Returns whether a forced entry has passed its inclusion deadline.
     ///
     /// Once it has, anyone may include it and the sequencer's bond becomes
     /// slashable for censorship (REQ-FRAUD-029).
-    #[view]
     public fun is_overdue(bridge_addr: address, entry_id: vector<u8>): bool acquires Bridge {
         let bridge = borrow_global<Bridge>(bridge_addr);
         assert!(table::contains(&bridge.forced, entry_id), E_NO_SUCH_ENTRY);
@@ -140,6 +139,5 @@ module sena::bridge {
     #[test]
     fun timeout_is_a_day() {
         assert!(FORCED_INCLUSION_TIMEOUT == 86400, 0);
-        let _ = vector::empty<u8>();
     }
 }

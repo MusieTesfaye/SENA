@@ -4,23 +4,38 @@ The settlement layer. These Move modules are what makes SENA's optimism safe:
 they record bonded assertions, run the dispute game, execute the disputed step,
 and gate withdrawals on finality.
 
-> ## Status: written, not yet compiled
+> ## Status: compiles and tests pass — not deployed, not audited
 >
-> **These contracts have not been compiled, tested, deployed, or audited.** They
-> were written against the Rust reference implementation in [`../crates/`](../crates/),
-> but the Aptos CLI could not be run in the environment they were developed in —
-> the prebuilt binary requires AVX2, which that machine's CPU does not provide.
+> All six modules compile and **36 of 36 Move unit tests pass**, including the
+> cross-language conformance tests that check this implementation computes the
+> same digests and encodings as the Rust reference.
 >
-> Treat every module here as an unverified draft. The first thing anyone picking
-> this up should do is:
+> **Nothing here has been deployed to any network, and nothing has been
+> audited.** Bond escrow is still bookkeeping rather than coin custody, and four
+> instructions are not yet adjudicable (see *Not yet implemented* below).
 >
 > ```sh
-> aptos move test --package-dir move/sena
+> aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 > ```
->
-> Expect to fix compilation errors. Nothing below should be deployed to any
-> network until it compiles, its tests pass, and it has been independently
-> audited — `sena::osp` most of all.
+
+## Toolchain — read this before building
+
+The CLI version matters, in both directions:
+
+- **Prebuilt releases from `7.14.2` onward abort with SIGILL on CPUs without
+  AVX2**, which includes every Intel Atom-lineage chip (Celeron N-series, Pentium
+  Silver). `7.9.0` and earlier run on baseline x86-64.
+- **The framework must match the compiler.** `Move.toml` pins the framework to
+  commit `46d871fa…`, the tree tagged `aptos-cli-v7.9.0`. Later framework
+  revisions use Move 2 syntax (`proof { }`, inline `spec { }`) that `7.9.0`
+  cannot parse.
+
+So: use CLI `7.9.0` with the pinned framework. [`.github/workflows/move.yml`](../.github/workflows/move.yml)
+does exactly that and fails the build if `Move.toml` ever points at a branch
+instead of a commit.
+
+Moving to a newer CLI means moving the framework pin with it, and gives up the
+ability to build on machines without AVX2.
 
 ## Modules
 
@@ -43,11 +58,9 @@ Nothing else in the system can catch that, because nothing else is appealed to.
 The SRS makes this a named requirement (NFR-SEC-012): independent audit before
 mainnet, and top-tier bug bounty coverage.
 
-## How drift is caught today
+## How drift is caught
 
-The two implementations share conformance vectors. Each Move module embeds
-constants — digests, encodings, discriminants, parameter values — produced by the
-Rust reference, and two Rust test suites check them:
+The two implementations share conformance vectors, and both sides now execute:
 
 - [`crates/sena-stf/tests/conformance.rs`](../crates/sena-stf/tests/conformance.rs)
   produces the vectors and pins them against independently recomputed values.
@@ -55,16 +68,22 @@ Rust reference, and two Rust test suites check them:
   reads these `.move` files as text and fails if any embedded constant no longer
   matches what Rust computes.
 
-The second runs in ordinary `cargo test`, with no Move toolchain. It is a weaker
-check than running the Move tests — it proves the constants agree, not that the
-code producing them is right — but it catches silent drift, which is the failure
-mode that would otherwise go unnoticed until it mattered.
+The second runs in ordinary `cargo test` with no Move toolchain, so drift is
+caught even by contributors who cannot build Move.
+
+The Move side now runs too, which is the stronger check: tests like
+`codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust` and
+`osp::machine_commitment_matches_rust` compute values in Move and compare them
+against what Rust produced. That is agreement on execution, not merely on
+constants sitting in two files.
 
 ## Not yet implemented
 
 - `osp` adjudicates account and identifier instructions. `VerifyGasAsset` and
   `VerifyCouncil` abort with `E_UNSUPPORTED_INSTRUCTION` rather than being
-  approximated: a verifier that guesses is worse than one that declines.
+  approximated: a verifier that guesses is worse than one that declines. The
+  consequence is concrete — **a dispute over a gas-rate or governance step
+  cannot currently be settled on L1.**
 - Bond custody and slashing are modelled as bookkeeping, not as real coin
   movement.
 - `bridge::withdraw` verifies the proof and marks the withdrawal spent; it does

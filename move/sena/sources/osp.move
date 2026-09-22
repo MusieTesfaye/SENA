@@ -364,7 +364,9 @@ module sena::osp {
     }
 
     #[test]
-    #[expected_failure(abort_code = 4, location = sena::codec)]
+    // The abort originates where the `assert!` is, which is this module --
+    // borrowing the error code from `codec` does not move the abort there.
+    #[expected_failure(abort_code = 4, location = Self)]
     fun out_of_order_balances_are_rejected() {
         // asset 9 before asset 1: a second encoding of one account state.
         decode_account(x"00000000000000000000000200000009000000000000000000000000000000010000000100000000000000000000000000000001");
