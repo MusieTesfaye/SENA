@@ -15,9 +15,11 @@ The build plan's own principle governs every line below:
 > Aptos Move path, verifier replay path, failure behavior, observability, and
 > acceptance evidence all agree.
 
-By that standard most of what exists today is **not** beta-ready, because the
-Move path has never been compiled. That is the gating fact, and it shapes the
-whole of this document.
+By that standard the Move path has cleared its first bar: the package compiles
+and 36 of 36 unit tests pass, including conformance tests that check it agrees
+with the Rust reference on computed values. What it has not cleared is
+deployment — nothing has been published to any Aptos network, so no capability
+below can yet claim its Aptos path *works*, only that it builds.
 
 ## 1. What the beta must prove
 
@@ -36,10 +38,10 @@ demonstrated a database. The security property is the product.
 |---|---|---|
 | Deterministic STF and execution traces | Every verifier result depends on it | Implemented, 232 tests |
 | Sparse Merkle state with proofs | Withdrawals and one-step proofs both need it | Implemented |
-| Bonded assertions and challenge windows | The security anchor | Implemented in Rust; **Move uncompiled** |
+| Bonded assertions and challenge windows | The security anchor | Implemented in Rust and Move; **not deployed** |
 | Batch data publication | A verifier cannot challenge data it cannot get | Served over RPC; **not published to L1** |
 | Independent verifier mode | Tests the 1-of-N assumption | Implemented; follows via RPC |
-| Interactive bisection and one-step proofs | The differentiator | Implemented in Rust; **Move uncompiled** |
+| Interactive bisection and one-step proofs | The differentiator | Implemented in Rust and Move; **not deployed** |
 | Durable node with verified restart | A beta is not an in-memory demo | Implemented |
 | Live JSON-RPC and CLI | Testers need a usable system | Implemented |
 | Social Connect handles | Core PRD feature, low integration risk | Implemented |
@@ -158,11 +160,11 @@ beta set is therefore closed, and adding to it is a protocol change:
 
 | Instruction | Slot touched | Move adjudication |
 |---|---|---|
-| `ConsumeNonce` | account | Implemented (uncompiled) |
-| `Debit` | account | Implemented (uncompiled) |
-| `Credit` | account | Implemented (uncompiled) |
-| `BindIdentifier` | social index | Implemented (uncompiled) |
-| `UnbindIdentifier` | social index | Implemented (uncompiled) |
+| `ConsumeNonce` | account | Implemented, tested |
+| `Debit` | account | Implemented, tested |
+| `Credit` | account | Implemented, tested |
+| `BindIdentifier` | social index | Implemented, tested |
+| `UnbindIdentifier` | social index | Implemented, tested |
 | `VerifyGasAsset` | asset record | **Not implemented — aborts** |
 | `VerifyCouncil` | council record | **Not implemented — aborts** |
 | `SetGasAsset` | asset record | **Not implemented** |
@@ -220,10 +222,9 @@ Against the build plan's Gate A through Gate G, the project is at **Gate A, in
 progress.** This document and the parameter freeze are most of Gate A; the SRS
 and SDD amendment for the execution target is outstanding.
 
-Gate B — local end-to-end integration against a local Aptos node — cannot begin
-until the Move package compiles. That is the single item blocking the most
-downstream work, and it is blocked on a machine with AVX2 support rather than on
-any design question.
+Gate B — local end-to-end integration against a local Aptos node — is now
+reachable. The Move package compiles and self-tests; what it needs next is a
+local Aptos deployment and the assertion lifecycle run against it.
 
 What is genuinely done is the layer beneath all of it: a deterministic state
 machine, a Merklized state with proofs, a working dispute protocol with

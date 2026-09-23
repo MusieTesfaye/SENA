@@ -17,9 +17,8 @@ proofs**.
 > verifier can rebuild the chain from published data and catch a lying sequencer.
 > That part is real and tested.
 >
-> **It has not been audited. The Aptos L1 contracts have not been compiled.
-> Keyless sign-in is not finished. Nothing has been deployed to any network.**
-> Do not put real funds anywhere near it.
+> **It has not been audited. Nothing has been deployed to any network. Keyless
+> sign-in is not finished.** Do not put real funds anywhere near it.
 >
 > [`STATUS.md`](STATUS.md) is the honest, line-by-line account of what works
 > today and what does not. Read it before forming a view.
@@ -174,7 +173,7 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 | [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless, execution traces |
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
 | [`sena-node`](crates/sena-node) | Mempool, block production, RPC, verifier mode, CLI |
-| [`move/sena`](move/sena) | Aptos L1 contracts — **not yet compiled**, see [`move/README.md`](move/README.md) |
+| [`move/sena`](move/sena) | Aptos L1 contracts — compiles, 36/36 tests, **not deployed**, see [`move/README.md`](move/README.md) |
 
 ## Determinism is a security property
 
@@ -197,11 +196,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The Move contracts need the [Aptos CLI](https://aptos.dev/tools/aptos-cli/):
+The Move contracts need the [Aptos CLI](https://aptos.dev/tools/aptos-cli/),
+**version 7.9.0 specifically**:
 
 ```sh
-aptos move test --package-dir move/sena                   # expect failures; see move/README.md
+aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 ```
+
+The version is pinned in both directions and it matters. Prebuilt releases from
+`7.14.2` onward abort with SIGILL on CPUs without AVX2 — every Intel
+Atom-lineage chip. And `Move.toml` pins the framework to the commit tagged
+`aptos-cli-v7.9.0`, because later framework revisions use Move 2 syntax that
+`7.9.0` cannot parse. See [`move/README.md`](move/README.md).
 
 ## Beta planning
 

@@ -5,7 +5,45 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
-Beta planning baseline. No protocol behaviour changed; the parameters were
+### The Move contracts compile
+
+All six Aptos L1 modules compile and **36 of 36 Move unit tests pass**. This was
+the item blocking Gates B through G, and the earlier claim that it was blocked on
+hardware was wrong: prebuilt Aptos CLI releases only lose baseline x86-64
+support from `7.14.2` onward, and `7.9.0` runs fine without AVX2.
+
+Two things had to line up:
+
+- **CLI pinned to 7.9.0.** Later releases abort with SIGILL on CPUs without
+  AVX2, which is every Intel Atom-lineage chip.
+- **Framework pinned to `46d871fa`**, the tree tagged `aptos-cli-v7.9.0`. Later
+  framework revisions use Move 2 syntax (`proof { }`, inline `spec { }`) that
+  `7.9.0` cannot parse. `Move.toml` previously tracked the `mainnet` branch,
+  which is a moving target and made the build unreproducible.
+
+Three real fixes came out of the first compile:
+
+- `osp::out_of_order_balances_are_rejected` expected its abort to originate in
+  `sena::codec`. An abort originates where the `assert!` is; borrowing an error
+  code from another module does not move it. The annotation was wrong, not the
+  logic.
+- A doc comment sat above a `#[view]` attribute in `bridge.move`, where the
+  compiler could not attach it to anything.
+- An unused `vector` import.
+
+The cross-language conformance tests now execute on both sides, which is the
+stronger check: `codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust` and
+`osp::machine_commitment_matches_rust` compute values in Move and compare them
+against what Rust produced. Previously only the Rust side ran, comparing
+constants in two files.
+
+Still true: nothing is deployed to any network, nothing is audited, bond escrow
+is bookkeeping rather than custody, and four instructions
+(`VerifyGasAsset`, `VerifyCouncil`, `SetGasAsset`, `SetParameter`) abort rather
+than being adjudicated — so a dispute over a gas-rate or governance step has no
+L1 resolution path.
+
+### Beta planning baseline No protocol behaviour changed; the parameters were
 already what `sena-params` now freezes, and the binding tests prove it.
 
 ### Added
@@ -22,7 +60,7 @@ already what `sena-params` now freezes, and the binding tests prove it.
   execution checklist with a real status for every item, and a generated
   requirements traceability matrix covering 51 of 101 SRS requirements.
 
-### Decisions
+#### Decisions
 
 - **D-01: higher-level instruction trace** adopted as the beta execution target
   rather than RV32IM. The security argument does not depend on the step being a

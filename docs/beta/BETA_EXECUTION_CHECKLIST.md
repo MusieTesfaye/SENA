@@ -10,8 +10,10 @@ finding.
 > repository rather than left blank. Where an item is `Complete`, the evidence
 > column names what to check. Where it is `Blocked`, the blocker is named.
 >
-> The single item blocking the most downstream work is **§6 Move compilation** —
-> blocked on hardware, not on a design question.
+> **Update: the Move package now compiles and 36 of 36 Move tests pass.** That
+> was the item blocking the most downstream work. Gate B is now reachable; what
+> it still needs is a local Aptos deployment and an assertion lifecycle run
+> against it. Nothing has been deployed.
 
 ## 1. Release identity and scope
 
@@ -27,7 +29,7 @@ finding.
 ## 2. Build reproducibility and conformance
 
 - [x] `Complete` — Pin the Rust toolchain and build image. → [`rust-toolchain.toml`](../../rust-toolchain.toml)
-- [ ] `In progress` — Pin Aptos CLI and Aptos framework inputs. → CLI pinned to `9.5.1` in [`move.yml`](../../.github/workflows/move.yml); the workflow resolves and reports the framework revision so `Move.toml` can be pinned to a commit. **`rev = "mainnet"` is still a moving target.**
+- [x] `Complete` — Pin Aptos CLI and Aptos framework inputs. → CLI pinned to `7.9.0`; framework pinned to commit `46d871fa1feb61ffafb73353a0755e8cc3aaed9d` in [`Move.toml`](../../move/sena/Move.toml). CI fails if the pin is ever a branch.
 - [ ] `Not started` — Make clean builds reproducible.
 - [ ] `Blocked` — Record and verify the STF binary hash. → depends on D-01 sign-off and the execution target. The Move **package** hash is recorded by [`move.yml`](../../.github/workflows/move.yml) once compilation succeeds.
 - [x] `Complete` — Add Rust-to-Move conformance tests for state roots and proof encodings. → [`move_conformance.rs`](../../crates/sena-stf/tests/move_conformance.rs) — checks constants agree; does **not** compile Move
@@ -89,9 +91,9 @@ finding.
 
 ## 6. Move contract lifecycle and authorization
 
-- [ ] `In progress` — Compile the full Move package in clean CI. → [`move.yml`](../../.github/workflows/move.yml) added; GitHub runners have AVX2. **The workflow has never run — the contracts have still never compiled.** Its first run produces the error list. Until it passes, Gates B through G stay blocked.
-- [ ] `In progress` — Run Move unit tests in clean CI. → wired into [`move.yml`](../../.github/workflows/move.yml); tests are written ([`move/sena/sources/`](../../move/sena/sources)) and have still never executed
-- [ ] `Blocked` — Add coverage and publish the coverage artifact. → blocked until compilation passes
+- [x] `Complete` — Compile the full Move package in clean CI. → all six modules compile with CLI `7.9.0` and the framework pinned to `46d871fa`; [`move.yml`](../../.github/workflows/move.yml) runs it. Verified locally on 2026-09-23.
+- [x] `Complete` — Run Move unit tests in clean CI. → **36 of 36 pass**, including the cross-language conformance tests that compute digests in Move and compare against Rust
+- [ ] `Not started` — Add coverage and publish the coverage artifact. → now unblocked
 - [ ] `Not started` — Verify all public functions enforce valid lifecycle stages.
 - [ ] `Not started` — Add signer or capability checks for privileged transitions.
 - [ ] `Not started` — Prevent unauthorized dispute resolution.
@@ -113,7 +115,7 @@ finding.
 - [x] `Complete` — Automatically open a challenge on divergence. → `VerifierNode::open_dispute`
 - [x] `Complete` — Complete bisection within move deadlines. → `TracePlayer::play`; converges in 2 rounds over 48 steps
 - [x] `Complete` — Generate a valid OSP. → `TracePlayer::one_step_proof`
-- [ ] `Blocked` — Resolve a deliberately invalid assertion on Aptos. → resolved in Rust; **Aptos path blocked on §6**
+- [ ] `Not started` — Resolve a deliberately invalid assertion on Aptos. → resolved in Rust; the Move path now compiles and self-tests, but **nothing has been deployed to run it against**
 - [x] `Complete` — Confirm the invalid assertion cannot finalize. → tested in Rust
 - [x] `Complete` — Confirm descendants are rejected. → `a_successful_challenge_rejects_every_descendant`
 - [ ] `Not started` — Confirm proposer bond slashing and challenger reward. → no real bonds exist
@@ -185,10 +187,11 @@ finding.
 - [x] Parameters and formats frozen
 - [ ] Toolchain and STF hash recorded → Rust pinned; STF hash blocked
 
-### Gate B — Local end-to-end integration — **Blocked on §6**
+### Gate B — Local end-to-end integration — **Unblocked, not started**
 
-All items blocked: no local Aptos deployment is possible until the Move package
-compiles.
+The Move package compiles and self-tests, so this can now begin. It needs a
+local Aptos node, the package published to it, and the honest and adversarial
+assertion lifecycles run end to end.
 
 ### Gate C — Reproducible testnet deployment — **Not started**
 
@@ -233,7 +236,7 @@ hashes — as a CI artifact with 90-day retention. Those should be committed to
 | 3. Durable node | Mostly complete — no RocksDB, no auth |
 | 4. Data availability | **Weakest area** — no independent publication |
 | 5. Aptos settlement | Not started |
-| 6. Move contracts | CI workflow added; **has never run** — blocks Gates B–G |
+| 6. Move contracts | Compiles, 36/36 tests; bonds and events not implemented |
 | 7. Fraud proofs and verifier | Complete in Rust, untested on Aptos |
 | 8. Bridge | Not started |
 | 9. User access | Complete for what exists |
@@ -241,8 +244,8 @@ hashes — as a CI artifact with 90-day retention. Those should be committed to
 | 11. Observability | Not started |
 | 12. Security review | Property tests only |
 
-**Critical path:** compile the Move package → local Aptos integration → settlement
-adapter → independent data availability → bridge.
+**Critical path:** ~~compile the Move package~~ ✅ → local Aptos integration →
+settlement adapter → independent data availability → bridge.
 
 ## References
 
