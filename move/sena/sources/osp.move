@@ -156,6 +156,15 @@ module sena::osp {
         Account { nonce: 0, balances: vector::empty<Balance>() }
     }
 
+    /// Returns an account's balance in an asset.
+    ///
+    /// Public so the bridge can read a proven account's balance rather than
+    /// taking the withdrawal amount as an argument, which would make the proof
+    /// decorative.
+    public fun account_balance(a: &Account, asset: u32): u128 {
+        balance_of(a, asset)
+    }
+
     fun balance_of(a: &Account, asset: u32): u128 {
         let i = 0;
         while (i < vector::length(&a.balances)) {

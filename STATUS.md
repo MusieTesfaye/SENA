@@ -101,7 +101,12 @@ What remains open:
 
 - **Devnet only, and devnet resets.** Nothing is on testnet.
 - **Bond escrow is bookkeeping, not custody.** No coin moves; posting an
-  assertion costs gas and nothing else.
+  assertion costs gas and nothing else. The *bridge* does custody real assets —
+  bonds do not.
+- **The bridge is written but unproven on chain.** It custodies Circle USDC on
+  testnet via `dispatchable_fungible_asset`, and deposits and withdrawals
+  compile and unit-test, but nothing has been deposited yet: testnet funding is
+  a manual faucet step.
 - **No dispute has been played to completion on chain.** Only that a challenge
   blocks finalization.
 - **Four instructions are not adjudicable.** `VerifyGasAsset`, `VerifyCouncil`,

@@ -128,6 +128,43 @@ Move and Rust hashing shows up as a rejected argument.
 
 Devnet resets periodically. Use `testnet` for evidence you want to keep.
 
+## 6. Real stablecoins on testnet
+
+The bridge custodies **Circle USDC on Aptos testnet** —
+`0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832`, 6
+decimals. It is a *dispatchable* fungible asset, so transfers run Circle's
+blocklist and pause hooks; the bridge calls `dispatchable_fungible_asset`
+rather than the plain entry point, or a blocked account would be silently
+permitted.
+
+Testnet has no programmatic faucet, so funding is manual and one-off:
+
+```sh
+aptos init --network testnet --profile sena-testnet --assume-yes </dev/null
+scripts/bridge-test.sh status        # prints your address and what is missing
+```
+
+Then fund it:
+
+- **APT for gas** — <https://aptos.dev/network/faucet>
+- **USDC** — <https://faucet.circle.com>, select Aptos testnet
+
+```sh
+scripts/bridge-test.sh setup         # publish and initialise
+scripts/bridge-test.sh deposit       # move USDC into custody
+scripts/bridge-test.sh status        # custody balance
+```
+
+### Why you cannot demonstrate a withdrawal the same day
+
+A withdrawal requires an assertion that has **finalized**, and the challenge
+window floor is 24 hours. There is no configuration that shortens it — the floor
+is enforced in `assertions.move` and governance has no path to lower it. Waiting
+is the design working.
+
+The withdrawal path also needs a Merkle proof of your L2 balance, which the
+sequencer produces. Wiring that into the script is outstanding.
+
 ---
 
 ## Trying to break it
@@ -162,7 +199,10 @@ encode `u128`, and a JSON number above 2^53 would be silently rounded. Try
 ## What no test here covers
 
 - **No bonds move.** `bond` is a number in a struct. Posting an assertion costs
-  gas and nothing else, so none of the economic arguments are tested.
+  gas and nothing else, so none of the economic arguments are tested. Deposits
+  and withdrawals move real USDC; assertion bonds do not.
+- **Withdrawal is not end-to-end.** The contract verifies the proof and releases
+  custody, but nothing yet generates the proof from a running sequencer.
 - **No dispute has been played to completion on chain.** Bisection and one-step
   adjudication run in Rust and in Move unit tests, not against a live network.
 - **No batch data is published to L1.** A verifier gets it from the sequencer's
