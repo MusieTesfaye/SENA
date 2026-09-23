@@ -60,23 +60,30 @@ hashing agree on a real value.
 ## Reproducing
 
 ```sh
-aptos init --network devnet --assume-yes
-ADDR=<your account>
-
-aptos move publish --package-dir move/sena --named-addresses sena=$ADDR --assume-yes
-
-aptos move run --function-id ${ADDR}::assertions::initialize \
-  --args hex:0x1111111111111111111111111111111111111111111111111111111111111111 \
-         u64:604800 u128:1000000 \
-  --max-gas 100000 --gas-unit-price 100 --assume-yes
-
-aptos move run --function-id ${ADDR}::disputes::initialize \
-  --args address:$ADDR --max-gas 100000 --gas-unit-price 100 --assume-yes
+scripts/chain-lifecycle.sh devnet     # or testnet
 ```
 
-`--max-gas` and `--gas-unit-price` are supplied explicitly because the devnet
-gas-simulation endpoint timed out repeatedly from this connection. Passing them
-skips the simulate call.
+Deploys to a **fresh account** and asserts an outcome at every step. Verified
+2026-09-23 on devnet: **10 passed, 0 failed**, account
+`0x6a22eb3f4c8be603ac91f15133c65fb262910bbfedcc4e93784b6e1c271b4488`.
+
+Three things the script had to get right, each found by it failing first:
+
+- **Gas is specified, not estimated.** The devnet simulate endpoint times out
+  from some connections. Publishing also needs a far larger budget than an entry
+  call — 184,594 versus a few thousand — so the two budgets are separate.
+- **Output is captured before being matched, never piped into `grep`.** Under
+  `pipefail`, a correctly-aborting transaction makes the pipeline exit non-zero
+  even when the match succeeds, which reported every properly-refused
+  transaction as a safety failure.
+- **A fresh account per run.** Reusing one makes every step fail for the wrong
+  reason: `initialize` aborts because the resource exists, `post` aborts because
+  the assertion id is already in the table, and `finalize` reports the previous
+  run's status instead of the window check.
+
+`aptos init` also reads stdin for a private key even under `--assume-yes`, so
+the script redirects `/dev/null` into it. Without that it blocks indefinitely
+when run without a terminal.
 
 ## What this does **not** demonstrate
 

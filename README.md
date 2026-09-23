@@ -128,7 +128,19 @@ Transaction hashes and a reproduction script are in
 [`docs/beta/evidence/03-devnet-deployment.md`](docs/beta/evidence/03-devnet-deployment.md).
 No bonds move yet — posting an assertion costs gas and nothing else.
 
-### 5. Verify the chain yourself
+### 5. Run it against Aptos yourself
+
+```sh
+scripts/chain-lifecycle.sh devnet     # or testnet
+```
+
+Deploys to a fresh account and asserts an expected outcome at every step. The
+two that matter are failures — if a challenged assertion ever finalizes, the
+script fails loudly.
+
+Full guide: [`docs/TESTING.md`](docs/TESTING.md).
+
+### 6. Verify the chain yourself
 
 Do not take the node's word for its own state root. Fetch the published
 transactions and re-execute them:
@@ -204,6 +216,8 @@ deny-level lint, and CI executes the state-root tests twice in separate
 processes and diffs the results.
 
 ## Development
+
+See [`docs/TESTING.md`](docs/TESTING.md) for what each layer actually proves.
 
 ```sh
 cargo test --workspace                                    # 248 tests
