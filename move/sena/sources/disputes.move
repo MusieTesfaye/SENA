@@ -303,20 +303,22 @@ module sena::disputes {
         id: vector<u8>,
         winner: u8,
     ) acquires Registry {
-        let (chain, assertion) = {
+        let (chain, assertion, challenger) = {
             let registry = borrow_global_mut<Registry>(registry_addr);
             assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
             let d = table::borrow_mut(&mut registry.disputes, id);
             assert!(d.stage != STAGE_RESOLVED, E_RESOLVED);
             d.stage = STAGE_RESOLVED;
             d.winner = winner;
-            (registry.chain, d.assertion)
+            (registry.chain, d.assertion, d.challenger)
         };
 
+        // The challenger is named either way: on a win they are paid, on a loss
+        // their bond is the one forfeited.
         if (winner == PARTY_CHALLENGER) {
-            assertions::challenger_won(chain, assertion);
+            assertions::challenger_won(chain, assertion, challenger);
         } else {
-            assertions::defender_won(chain, assertion);
+            assertions::defender_won(chain, assertion, challenger);
         };
     }
 

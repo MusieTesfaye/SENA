@@ -115,6 +115,11 @@ impl TestNode {
             block_interval_secs: 1,
             max_block_transactions: 512,
             persist_interval_secs: 1,
+            // Unauthenticated with a generous limit: these tests exercise the
+            // protocol, and access control has its own tests below.
+            auth_token: None,
+            rate_limit_per_minute: 10_000,
+            max_body_bytes: 1 << 20,
         };
 
         let flag = Arc::clone(&shutdown);
@@ -436,5 +441,181 @@ fn a_data_directory_cannot_be_reused_across_chains() {
         }
         Ok(None) => panic!("there should be saved state to reject"),
         Ok(Some(_)) => panic!("a different chain's genesis must not be accepted"),
+    }
+}
+
+// --- Access control ----------------------------------------------------------
+
+/// Starts a node that requires a bearer token.
+fn start_authenticated(
+    config: &GenesisConfig,
+    data_dir: std::path::PathBuf,
+    token: &str,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let store = Store::open(&data_dir).expect("store opens");
+    store.save_genesis(config).expect("genesis saves");
+    let state = config.build_state().expect("genesis builds");
+    let chain = AssertionChain::new(
+        state.root(),
+        config.challenge_window_secs,
+        config.minimum_bond,
+    );
+    let mut sequencer = Sequencer::new(state, chain, PartyId(1), config.minimum_bond);
+
+    let server_config = ServerConfig {
+        listen: format!("127.0.0.1:{port}"),
+        chain_id: config.chain_id.clone(),
+        block_interval_secs: 1,
+        max_block_transactions: 512,
+        persist_interval_secs: 60,
+        auth_token: Some(token.to_owned()),
+        rate_limit_per_minute: 5,
+        max_body_bytes: 2_048,
+    };
+
+    let flag = Arc::clone(&shutdown);
+    let owned = config.clone();
+    let handle = thread::spawn(move || {
+        let _ = run(&mut sequencer, &store, &owned, &server_config, &flag);
+    });
+
+    // Wait for it to accept connections.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ureq::post(&endpoint)
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(serde_json::to_value(Request::GetChainInfo).unwrap())
+            .is_ok()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    (endpoint, shutdown, handle)
+}
+
+/// Posts with an optional bearer token, returning the parsed response.
+fn call_with_token(endpoint: &str, token: Option<&str>, request: &Request) -> Response {
+    let body = serde_json::to_value(request).expect("serialises");
+    let mut req = ureq::post(endpoint).set("Content-Type", "application/json");
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    req.send_json(body)
+        .expect("node should respond")
+        .into_json()
+        .expect("response should be JSON")
+}
+
+#[test]
+fn an_authenticated_node_refuses_requests_without_a_token() {
+    let alice = signer(11);
+    let config = dev_genesis(&alice);
+    let (endpoint, shutdown, handle) =
+        start_authenticated(&config, temp_dir("auth"), "correct-horse");
+
+    // No token at all.
+    match call_with_token(&endpoint, None, &Request::GetChainInfo) {
+        Response::Error { message } => assert!(message.contains("unauthorised"), "{message}"),
+        other => panic!("an unauthenticated request was served: {other:?}"),
+    }
+
+    // Wrong token.
+    match call_with_token(&endpoint, Some("wrong"), &Request::GetChainInfo) {
+        Response::Error { message } => assert!(message.contains("unauthorised"), "{message}"),
+        other => panic!("a request with a wrong token was served: {other:?}"),
+    }
+
+    // Correct token.
+    match call_with_token(&endpoint, Some("correct-horse"), &Request::GetChainInfo) {
+        Response::ChainInfo { .. } => {}
+        other => panic!("a correctly authenticated request was refused: {other:?}"),
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+}
+
+#[test]
+fn a_client_exceeding_the_rate_limit_is_refused() {
+    // Without this an exposed endpoint is trivially flooded: every request
+    // otherwise costs the node a JSON parse and a state read.
+    let alice = signer(12);
+    let config = dev_genesis(&alice);
+    let (endpoint, shutdown, handle) = start_authenticated(&config, temp_dir("ratelimit"), "tok");
+
+    let mut refused = 0;
+    for _ in 0..12 {
+        if let Response::Error { message } =
+            call_with_token(&endpoint, Some("tok"), &Request::GetChainInfo)
+        {
+            if message.contains("rate limit") {
+                refused += 1;
+            }
+        }
+    }
+    assert!(
+        refused > 0,
+        "the rate limit never engaged over 12 requests at a limit of 5"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+}
+
+#[test]
+fn an_oversized_request_body_is_refused() {
+    let alice = signer(13);
+    let config = dev_genesis(&alice);
+    let (endpoint, shutdown, handle) = start_authenticated(&config, temp_dir("bodycap"), "tok");
+
+    let huge = "x".repeat(8_192);
+    let response = ureq::post(&endpoint)
+        .set("Authorization", "Bearer tok")
+        .set("Content-Type", "application/json")
+        .send_string(&huge);
+
+    // Either refused with a message, or the connection rejected outright; both
+    // are acceptable, silently parsing 8 KiB against a 2 KiB cap is not.
+    if let Ok(resp) = response {
+        let body: Response = resp.into_json().expect("JSON");
+        match body {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("exceeds") || message.contains("malformed"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("an oversized body was accepted: {other:?}"),
+        }
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+}
+
+#[test]
+fn a_withdrawal_proof_is_refused_before_anything_finalizes() {
+    // A proof against a non-finalized root would be rejected on chain, so the
+    // node must not hand one out and let the user discover that as a failed
+    // transaction.
+    let alice = signer(14);
+    let config = dev_genesis(&alice);
+    let node = TestNode::start(&config, temp_dir("wproof"));
+
+    match call(
+        &node.endpoint,
+        &Request::GetWithdrawalProof {
+            address: address_of(&alice),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(message.contains("finalized"), "unexpected: {message}");
+        }
+        other => panic!("a proof was produced with nothing finalized: {other:?}"),
     }
 }

@@ -10,6 +10,7 @@
 //! to be engineered around — it is what ordering means. Throughput work belongs
 //! in batch execution, not in parallel request handling.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +34,47 @@ pub struct ServerConfig {
     pub max_block_transactions: usize,
     /// Seconds between writing state to disk.
     pub persist_interval_secs: u64,
+    /// Bearer token required on every request, if set.
+    ///
+    /// `None` means unauthenticated, which is correct for a local devnet and
+    /// wrong for anything reachable from outside the machine.
+    pub auth_token: Option<String>,
+    /// Requests allowed per client per minute.
+    pub rate_limit_per_minute: u32,
+    /// Largest request body accepted, in bytes.
+    pub max_body_bytes: usize,
+}
+
+/// A fixed-window request counter, keyed by client.
+///
+/// Deliberately simple: a token bucket per IP would be better behaved under
+/// bursty load, but this is the difference between an endpoint that can be
+/// trivially flooded and one that cannot, and it has no dependencies.
+#[derive(Debug, Default)]
+struct RateLimiter {
+    /// Client to (window start, requests in window).
+    seen: BTreeMap<String, (u64, u32)>,
+}
+
+impl RateLimiter {
+    /// Records a request, returning whether it is within the limit.
+    fn allow(&mut self, client: &str, now: u64, limit: u32) -> bool {
+        let window = now / 60;
+
+        // Bound memory first: a flood of distinct clients must not grow this
+        // without limit, and dropping stale windows is exactly what a fixed
+        // window permits.
+        if self.seen.len() > 4_096 {
+            self.seen.retain(|_, (w, _)| *w == window);
+        }
+
+        let entry = self.seen.entry(client.to_owned()).or_insert((window, 0));
+        if entry.0 != window {
+            *entry = (window, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= limit
+    }
 }
 
 impl Default for ServerConfig {
@@ -43,6 +85,9 @@ impl Default for ServerConfig {
             block_interval_secs: 2,
             max_block_transactions: 512,
             persist_interval_secs: 10,
+            auth_token: None,
+            rate_limit_per_minute: 600,
+            max_body_bytes: 1 << 20,
         }
     }
 }
@@ -102,7 +147,20 @@ pub fn run(
     println!("  challenge window {}s", sequencer.chain.challenge_window());
     println!("  state root       {}", sequencer.state.root());
     println!("  data directory   {}", store.path().display());
+    println!(
+        "  auth             {}",
+        if config.auth_token.is_some() {
+            "bearer token required"
+        } else {
+            "NONE (local use only)"
+        }
+    );
+    println!(
+        "  rate limit       {}/min per client",
+        config.rate_limit_per_minute
+    );
 
+    let mut limiter = RateLimiter::default();
     let mut last_block = unix_now();
     let mut last_persist = unix_now();
 
@@ -142,7 +200,7 @@ pub fn run(
 
         match server.recv_timeout(Duration::from_millis(200)) {
             Ok(Some(mut request)) => {
-                let response = serve(sequencer, &config.chain_id, &mut request);
+                let response = serve(sequencer, config, &mut limiter, &mut request);
                 let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                     .expect("static header is valid");
                 let _ = request.respond(HttpResponse::from_string(response).with_header(header));
@@ -177,13 +235,54 @@ fn finalize_due(sequencer: &mut Sequencer) {
     }
 }
 
-fn serve(sequencer: &mut Sequencer, chain_id: &str, request: &mut tiny_http::Request) -> String {
+fn serve(
+    sequencer: &mut Sequencer,
+    config: &ServerConfig,
+    limiter: &mut RateLimiter,
+    request: &mut tiny_http::Request,
+) -> String {
     if *request.method() != Method::Post {
         return error_json("send a JSON-RPC request as an HTTP POST body");
     }
 
+    // Authenticate before doing any work, so an unauthorised caller cannot make
+    // the node parse a megabyte of JSON on their behalf.
+    if let Some(expected) = &config.auth_token {
+        let presented = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().to_owned())
+            .unwrap_or_default();
+        let offered = presented.strip_prefix("Bearer ").unwrap_or(&presented);
+        // Length-independent comparison is unnecessary here: the token is a
+        // shared secret over a local transport, not a per-message MAC.
+        if offered != expected {
+            return error_json("unauthorised: a valid bearer token is required");
+        }
+    }
+
+    let client = request
+        .remote_addr()
+        .map_or_else(|| "unknown".to_owned(), |addr| addr.ip().to_string());
+    if !limiter.allow(&client, unix_now(), config.rate_limit_per_minute) {
+        return error_json("rate limit exceeded");
+    }
+
+    // A body larger than the cap is refused without being read into memory.
+    if let Some(len) = request.body_length() {
+        if len > config.max_body_bytes {
+            return error_json(&format!(
+                "request body of {len} bytes exceeds the {} byte limit",
+                config.max_body_bytes
+            ));
+        }
+    }
+
     let mut body = String::new();
-    if std::io::Read::read_to_string(request.as_reader(), &mut body).is_err() {
+    let cap = config.max_body_bytes as u64;
+    let mut capped_reader = std::io::Read::take(request.as_reader(), cap);
+    if std::io::Read::read_to_string(&mut capped_reader, &mut body).is_err() {
         return error_json("request body could not be read");
     }
 
@@ -192,7 +291,7 @@ fn serve(sequencer: &mut Sequencer, chain_id: &str, request: &mut tiny_http::Req
         Err(error) => return error_json(&format!("malformed request: {error}")),
     };
 
-    let response = handle(sequencer, chain_id, parsed);
+    let response = handle(sequencer, &config.chain_id, parsed);
     serde_json::to_string(&response)
         .unwrap_or_else(|_| error_json("response could not be serialised"))
 }

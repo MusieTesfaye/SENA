@@ -55,6 +55,15 @@ enum Command {
         /// Stop after this many seconds. Zero runs until interrupted.
         #[arg(long, default_value_t = 0)]
         run_for: u64,
+        /// Require this bearer token on every RPC request.
+        ///
+        /// Without it the endpoint is unauthenticated, which is fine bound to
+        /// localhost and wrong for anything reachable from elsewhere.
+        #[arg(long)]
+        auth_token: Option<String>,
+        /// Requests allowed per client per minute.
+        #[arg(long, default_value_t = 600)]
+        rate_limit: u32,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -133,7 +142,16 @@ fn main() {
             listen,
             block_interval,
             run_for,
-        } => serve(&data_dir, &listen, block_interval, run_for),
+            auth_token,
+            rate_limit,
+        } => serve(
+            &data_dir,
+            &listen,
+            block_interval,
+            run_for,
+            auth_token,
+            rate_limit,
+        ),
         Command::Verify { data_dir, rpc } => verify(&data_dir, &rpc),
         Command::Keygen => {
             keygen();
@@ -197,7 +215,14 @@ fn genesis(data_dir: &str, dev: bool, fund: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn serve(data_dir: &str, listen: &str, block_interval: u64, run_for: u64) -> Result<(), String> {
+fn serve(
+    data_dir: &str,
+    listen: &str,
+    block_interval: u64,
+    run_for: u64,
+    auth_token: Option<String>,
+    rate_limit: u32,
+) -> Result<(), String> {
     let store = Store::open(data_dir).map_err(|e| e.to_string())?;
     let config = store
         .load_genesis()
@@ -223,10 +248,23 @@ fn serve(data_dir: &str, listen: &str, block_interval: u64, run_for: u64) -> Res
         }
     };
 
+    // Warn rather than refuse: binding a public interface without a token is a
+    // choice an operator can legitimately make behind their own proxy, but it
+    // should never be made by accident.
+    if auth_token.is_none() && !listen.starts_with("127.0.0.1") && !listen.starts_with("localhost")
+    {
+        eprintln!(
+            "warning: listening on {listen} with no --auth-token; anyone who can reach this \
+             address can submit transactions"
+        );
+    }
+
     let server_config = ServerConfig {
         listen: listen.to_owned(),
         chain_id: config.chain_id.clone(),
         block_interval_secs: block_interval,
+        auth_token,
+        rate_limit_per_minute: rate_limit,
         ..ServerConfig::default()
     };
 

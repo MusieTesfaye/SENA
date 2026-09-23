@@ -72,6 +72,16 @@ pub enum Request {
     /// Report chain-level status.
     #[serde(rename = "sena_getChainInfo")]
     GetChainInfo,
+    /// Produce everything needed to withdraw on Aptos (REQ-CORE-004).
+    ///
+    /// The proof is made against the most recent **finalized** assertion, not
+    /// the current root, because that is what the L1 bridge checks against. A
+    /// proof against the current root would be rejected on chain.
+    #[serde(rename = "sena_getWithdrawalProof")]
+    GetWithdrawalProof {
+        /// The account to prove a balance for.
+        address: L2Address,
+    },
 }
 
 /// A response from the node.
@@ -154,11 +164,81 @@ pub enum Response {
         /// How many transactions are waiting.
         mempool_size: usize,
     },
+    /// Everything the L1 bridge needs to release custody.
+    ///
+    /// Encoded as hex because these go straight into `aptos move run` arguments.
+    WithdrawalProof {
+        /// The assertion the proof is against. Must be finalized on L1.
+        assertion_height: u64,
+        /// Root the proof reconstructs to.
+        state_root: Hash256,
+        /// The account's stored bytes.
+        account_value: String,
+        /// Sibling hashes, root-first.
+        siblings: Vec<String>,
+        /// Whether the path ends in a leaf.
+        terminal_is_leaf: bool,
+        /// The key at the terminal, if it is a leaf.
+        terminal_key: String,
+        /// The value digest at the terminal, if it is a leaf.
+        terminal_value_hash: String,
+        /// Whether the covering assertion has finalized. A withdrawal submitted
+        /// while this is false will be refused on chain.
+        finalized: bool,
+    },
     /// The request could not be served.
     Error {
         /// A human-readable explanation.
         message: String,
     },
+}
+
+/// Builds the proof the L1 bridge needs to release custody.
+///
+/// Made against the most recent **finalized** assertion rather than the current
+/// root. A proof against an unfinalized root is one the bridge refuses, and
+/// handing one out would let the user discover that as a failed transaction.
+fn withdrawal_proof(sequencer: &Sequencer, address: L2Address) -> Response {
+    let height = sequencer.finalized_height();
+    if height == 0 {
+        return Response::Error {
+            message: "no assertion has finalized yet; nothing is withdrawable".to_owned(),
+        };
+    }
+
+    let Some(block) = usize::try_from(height - 1)
+        .ok()
+        .and_then(|i| sequencer.blocks.get(i))
+    else {
+        return Response::Error {
+            message: format!("no block at finalized height {height}"),
+        };
+    };
+
+    let root = block.post_state_root;
+    let slot = keys::account(&address);
+    let proof = sequencer.state.prove_at(root, &slot);
+    let value = sequencer
+        .state
+        .get(&slot)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
+
+    let (terminal_is_leaf, terminal_key, terminal_value_hash) = match &proof.terminal {
+        sena_state::Terminal::Leaf { key, value_hash } => (true, key.to_hex(), value_hash.to_hex()),
+        sena_state::Terminal::Empty => (false, String::new(), String::new()),
+    };
+
+    Response::WithdrawalProof {
+        assertion_height: height,
+        state_root: root,
+        account_value: hex::encode(value),
+        siblings: proof.siblings.iter().map(Hash256::to_hex).collect(),
+        terminal_is_leaf,
+        terminal_key,
+        terminal_value_hash,
+        finalized: true,
+    }
 }
 
 /// Serves one request against the node.
@@ -254,6 +334,8 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
                 },
             }
         }
+
+        Request::GetWithdrawalProof { address } => withdrawal_proof(sequencer, address),
 
         Request::GetChainInfo => Response::ChainInfo {
             chain_id: chain_id.to_owned(),

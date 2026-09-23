@@ -112,8 +112,28 @@ impl MerkleTrie {
     /// yet know whether a key exists makes one request rather than two.
     #[must_use]
     pub fn prove(&self, key: &Hash256) -> MerkleProof {
+        self.prove_at(self.root, key)
+    }
+
+    /// Produces a proof against a historical root.
+    ///
+    /// Withdrawals are checked against a **finalized** assertion, which by
+    /// definition covers a state at least a challenge window old. Proving only
+    /// against the current root would therefore produce proofs the bridge
+    /// rejects, which is the difference between a bridge that pays out and one
+    /// that does not.
+    ///
+    /// This works because nodes are never evicted from the store: every root the
+    /// trie has ever had remains reachable. That retention is what
+    /// `NFR-REL-004` asks for, and the cost of it is that the store grows.
+    ///
+    /// A root the trie has never held yields a proof that verifies against
+    /// nothing, which the caller detects by verification failing rather than by
+    /// an error here.
+    #[must_use]
+    pub fn prove_at(&self, root: Hash256, key: &Hash256) -> MerkleProof {
         let mut siblings = Vec::new();
-        let mut current = self.root;
+        let mut current = root;
         let mut depth = 0;
 
         loop {

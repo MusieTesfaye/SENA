@@ -427,3 +427,50 @@ fn a_truncated_snapshot_is_rejected() {
         );
     }
 }
+
+// --- Historical proofs -------------------------------------------------------
+
+#[test]
+fn a_proof_can_be_made_against_an_earlier_root() {
+    // Withdrawals are checked against a finalized assertion, whose root is at
+    // least a challenge window old. Proving only against the current root would
+    // produce proofs the bridge rejects.
+    let mut trie = MerkleTrie::new();
+    for i in 0..32 {
+        trie.insert(key(i), format!("v{i}").into_bytes());
+    }
+    let historical_root = trie.root();
+
+    // The chain moves on.
+    for i in 32..64 {
+        trie.insert(key(i), format!("v{i}").into_bytes());
+    }
+    assert_ne!(trie.root(), historical_root);
+
+    // A proof against the old root still verifies against it.
+    let proof = trie.prove_at(historical_root, &key(7));
+    proof
+        .verify_inclusion(&historical_root, &key(7), b"v7")
+        .expect("historical proof must verify against its own root");
+
+    // And does not verify against the current one.
+    assert!(proof
+        .verify_inclusion(&trie.root(), &key(7), b"v7")
+        .is_err());
+}
+
+#[test]
+fn a_historical_proof_reflects_the_value_at_that_root() {
+    let mut trie = MerkleTrie::new();
+    trie.insert(key(1), b"before");
+    let old_root = trie.root();
+    trie.insert(key(1), b"after");
+
+    trie.prove_at(old_root, &key(1))
+        .verify_inclusion(&old_root, &key(1), b"before")
+        .expect("the old root must still prove the old value");
+
+    trie.prove(&key(1))
+        .verify_inclusion(&trie.root(), &key(1), b"after")
+        .expect("the current root proves the current value");
+}

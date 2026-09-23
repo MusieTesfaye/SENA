@@ -19,6 +19,10 @@ module sena::assertions {
     use std::signer;
     use std::vector;
     use aptos_std::table::{Self, Table};
+    use aptos_framework::dispatchable_fungible_asset;
+    use aptos_framework::fungible_asset::{Self, FungibleStore, Metadata};
+    use aptos_framework::object::{Self, Object, ExtendRef};
+    use aptos_framework::primary_fungible_store;
     use aptos_framework::timestamp;
     use sena::codec;
 
@@ -42,6 +46,22 @@ module sena::assertions {
     const E_PARENT_NOT_FINAL: u64 = 38;
     /// The caller is not the party this operation belongs to.
     const E_NOT_PROPOSER: u64 = 39;
+    /// The bond does not fit the bonded asset's u64 amount.
+    const E_BOND_TOO_LARGE: u64 = 60;
+    /// No challenge by that party is open against this assertion.
+    const E_NO_SUCH_CHALLENGE: u64 = 61;
+    /// This party already has a challenge open against this assertion.
+    const E_ALREADY_CHALLENGING: u64 = 62;
+    /// The proposer may not challenge their own assertion.
+    const E_SELF_CHALLENGE: u64 = 63;
+
+    /// Share of a slashed bond paid to the winner, as a percentage.
+    ///
+    /// Deliberately below 100. A challenger who receives everything the proposer
+    /// forfeits has an incentive to collude with -- or simply be -- the
+    /// proposer, posting invalid assertions to harvest bonds in a wash. The
+    /// remainder goes to the treasury (REQ-FRAUD-020).
+    const SLASH_REWARD_PERCENT: u128 = 50;
 
     const STATUS_PENDING: u8 = 0;
     const STATUS_CHALLENGED: u8 = 1;
@@ -55,6 +75,12 @@ module sena::assertions {
     /// not safe under congestion. Governance may raise it and cannot lower it
     /// past here.
     const CHALLENGE_WINDOW_FLOOR: u64 = 86400;
+
+    /// A bonded challenge against an assertion.
+    struct Challenge has store, copy, drop {
+        challenger: address,
+        bond: u128,
+    }
 
     struct Assertion has store, copy, drop {
         parent: vector<u8>,
@@ -72,11 +98,21 @@ module sena::assertions {
     struct Chain has key {
         admin: address,
         assertions: Table<vector<u8>, Assertion>,
+        /// Open challenges per assertion, with the bond each carries.
+        challenges: Table<vector<u8>, vector<Challenge>>,
         /// Ids in posting order, so descendants can be swept on rejection.
         order: vector<vector<u8>>,
         latest_finalized: vector<u8>,
         challenge_window: u64,
         minimum_bond: u128,
+        /// The asset bonds are posted in.
+        bond_metadata: Object<Metadata>,
+        /// Where bonds are held while at risk.
+        escrow: Object<FungibleStore>,
+        /// Lets the module sign for the escrow when paying out.
+        escrow_extend: ExtendRef,
+        /// Receives the share of a slashed bond not paid to the winner.
+        treasury: address,
     }
 
     /// Computes an assertion's identifier.
@@ -115,6 +151,8 @@ module sena::assertions {
         genesis_root: vector<u8>,
         challenge_window: u64,
         minimum_bond: u128,
+        bond_metadata: Object<Metadata>,
+        treasury: address,
     ) {
         let window = if (challenge_window < CHALLENGE_WINDOW_FLOOR) {
             CHALLENGE_WINDOW_FLOOR
@@ -143,14 +181,58 @@ module sena::assertions {
         let assertions = table::new<vector<u8>, Assertion>();
         table::add(&mut assertions, id, genesis);
 
+        // Escrow lives in its own object rather than the admin's primary store,
+        // so the admin's own holdings can never be spent as somebody's bond.
+        let constructor = object::create_object(signer::address_of(admin));
+        let escrow_extend = object::generate_extend_ref(&constructor);
+        let escrow = fungible_asset::create_store(&constructor, bond_metadata);
+
         move_to(admin, Chain {
             admin: signer::address_of(admin),
             assertions,
+            challenges: table::new<vector<u8>, vector<Challenge>>(),
             order: vector::singleton(id),
             latest_finalized: id,
             challenge_window: window,
             minimum_bond,
+            bond_metadata,
+            escrow,
+            escrow_extend,
+            treasury,
         });
+    }
+
+    /// Moves a bond from `payer` into escrow.
+    ///
+    /// Dispatchable so the bonded asset's own controls run: a frozen or blocked
+    /// account must fail to bond rather than appear to.
+    fun take_bond(chain: &Chain, payer: &signer, amount: u128) {
+        assert!(amount <= 18446744073709551615, E_BOND_TOO_LARGE);
+        let from = primary_fungible_store::ensure_primary_store_exists(
+            signer::address_of(payer), chain.bond_metadata
+        );
+        let assets = dispatchable_fungible_asset::withdraw(payer, from, (amount as u64));
+        dispatchable_fungible_asset::deposit(chain.escrow, assets);
+    }
+
+    /// Pays `amount` out of escrow to `recipient`.
+    fun pay_from_escrow(chain: &Chain, recipient: address, amount: u128) {
+        if (amount == 0) { return };
+        let escrow_signer = object::generate_signer_for_extending(&chain.escrow_extend);
+        let assets = dispatchable_fungible_asset::withdraw(
+            &escrow_signer, chain.escrow, (amount as u64)
+        );
+        let to = primary_fungible_store::ensure_primary_store_exists(
+            recipient, chain.bond_metadata
+        );
+        dispatchable_fungible_asset::deposit(to, assets);
+    }
+
+    /// Splits a forfeited bond between the winner and the treasury.
+    fun distribute_slashed(chain: &Chain, winner: address, bond: u128) {
+        let reward = bond * SLASH_REWARD_PERCENT / 100;
+        pay_from_escrow(chain, winner, reward);
+        pay_from_escrow(chain, chain.treasury, bond - reward);
     }
 
     /// Posts a bonded assertion.
@@ -180,6 +262,12 @@ module sena::assertions {
         let id = assertion_id(
             parent, 0, pre_state_root, post_state_root, batch_commitment, trace_length, bond
         );
+
+        // The bond moves before the assertion is recorded. An assertion on the
+        // books without its bond in escrow would be a claim backed by nothing,
+        // which is the state this whole change exists to end.
+        take_bond(chain, proposer, bond);
+
         table::add(&mut chain.assertions, id, Assertion {
             parent,
             proposer: proposer_addr,
@@ -201,12 +289,32 @@ module sena::assertions {
     /// signer is required so that opening a challenge is an authenticated act
     /// with an identifiable party, not so that it can be restricted.
     public entry fun open_challenge(
-        _challenger: &signer,
+        challenger: &signer,
         chain_addr: address,
         id: vector<u8>,
+        bond: u128,
     ) acquires Chain {
+        let who = signer::address_of(challenger);
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        assert!(bond >= chain.minimum_bond, E_BOND_TOO_SMALL);
+
+        let proposer = table::borrow(&chain.assertions, id).proposer;
+        // A proposer challenging themselves could move their own bond between
+        // their own pockets and waste a window doing it.
+        assert!(who != proposer, E_SELF_CHALLENGE);
+
+        if (table::contains(&chain.challenges, id)) {
+            let existing = table::borrow(&chain.challenges, id);
+            let i = 0;
+            while (i < vector::length(existing)) {
+                assert!(vector::borrow(existing, i).challenger != who, E_ALREADY_CHALLENGING);
+                i = i + 1;
+            };
+        };
+
+        take_bond(chain, challenger, bond);
+
         let record = table::borrow_mut(&mut chain.assertions, id);
         assert!(
             record.status == STATUS_PENDING || record.status == STATUS_CHALLENGED,
@@ -214,37 +322,90 @@ module sena::assertions {
         );
         record.status = STATUS_CHALLENGED;
         record.open_challenges = record.open_challenges + 1;
+
+        if (!table::contains(&chain.challenges, id)) {
+            table::add(&mut chain.challenges, id, vector::empty<Challenge>());
+        };
+        vector::push_back(
+            table::borrow_mut(&mut chain.challenges, id),
+            Challenge { challenger: who, bond },
+        );
+    }
+
+    /// Removes a challenge, returning the bond it carried.
+    fun take_challenge(chain: &mut Chain, id: vector<u8>, who: address): u128 {
+        assert!(table::contains(&chain.challenges, id), E_NO_SUCH_CHALLENGE);
+        let list = table::borrow_mut(&mut chain.challenges, id);
+        let i = 0;
+        while (i < vector::length(list)) {
+            if (vector::borrow(list, i).challenger == who) {
+                let c = vector::remove(list, i);
+                return c.bond
+            };
+            i = i + 1;
+        };
+        abort E_NO_SUCH_CHALLENGE
     }
 
     /// Records a challenge resolved in the proposer's favour.
     ///
     /// The assertion returns to pending only once every challenge against it has
     /// resolved (REQ-FRAUD-006).
-    public fun defender_won(chain_addr: address, id: vector<u8>) acquires Chain {
+    /// Only the dispute module may call this: an outcome is the result of
+    /// adjudication, not something a party can assert for itself.
+    public(friend) fun defender_won(
+        chain_addr: address,
+        id: vector<u8>,
+        loser: address,
+    ) acquires Chain {
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+
+        let bond = take_challenge(chain, id, loser);
+        let proposer = table::borrow(&chain.assertions, id).proposer;
+
         let record = table::borrow_mut(&mut chain.assertions, id);
         assert!(record.status == STATUS_CHALLENGED, E_WRONG_STATUS);
         record.open_challenges = record.open_challenges - 1;
         if (record.open_challenges == 0) { record.status = STATUS_PENDING };
+
+        // A groundless challenge costs the challenger their bond, or delaying an
+        // honest chain would be free (REQ-FRAUD-021).
+        distribute_slashed(chain, proposer, bond);
     }
 
     /// Rejects an assertion and every assertion built on it (REQ-FRAUD-019).
     ///
     /// Descendants cannot survive: they claim to continue from a state that was
     /// never reached.
-    public fun challenger_won(chain_addr: address, id: vector<u8>) acquires Chain {
+    /// Only the dispute module may call this. Left public, any caller could
+    /// reject a sound assertion -- the inverse of the attack this system exists
+    /// to prevent.
+    public(friend) fun challenger_won(
+        chain_addr: address,
+        id: vector<u8>,
+        winner: address,
+    ) acquires Chain {
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
-        {
+
+        let challenger_bond = take_challenge(chain, id, winner);
+        let proposer_bond = {
             let record = table::borrow_mut(&mut chain.assertions, id);
             assert!(record.status == STATUS_CHALLENGED, E_WRONG_STATUS);
             record.status = STATUS_REJECTED;
             record.open_challenges = 0;
+            record.bond
         };
 
-        // Sweep forward in posting order. A child is always posted after its
-        // parent, so one pass rejects the whole subtree.
+        // The winner gets their own bond back, then a share of the forfeited
+        // one. The remainder goes to the treasury rather than the winner, so
+        // posting fraud and challenging it yourself is not profitable.
+        pay_from_escrow(chain, winner, challenger_bond);
+        distribute_slashed(chain, winner, proposer_bond);
+
+        // Rejecting only the disputed assertion would leave its children
+        // claiming to continue from a state that was never reached.
         let i = 0;
         let len = vector::length(&chain.order);
         while (i < len) {
@@ -284,8 +445,16 @@ module sena::assertions {
         let elapsed = timestamp::now_seconds() - posted_at;
         assert!(elapsed >= chain.challenge_window, E_WINDOW_OPEN);
 
-        table::borrow_mut(&mut chain.assertions, id).status = STATUS_FINALIZED;
+        let (proposer, bond) = {
+            let record = table::borrow_mut(&mut chain.assertions, id);
+            record.status = STATUS_FINALIZED;
+            (record.proposer, record.bond)
+        };
         chain.latest_finalized = id;
+
+        // The bond was at risk only while the assertion could still be
+        // overturned. Once finalized it cannot be, so it is returned.
+        pay_from_escrow(chain, proposer, bond);
     }
 
     #[view]
@@ -317,4 +486,12 @@ module sena::assertions {
     public fun status_finalized(): u8 { STATUS_FINALIZED }
     public fun status_rejected(): u8 { STATUS_REJECTED }
     public fun challenge_window_floor(): u64 { CHALLENGE_WINDOW_FLOOR }
+    public fun slash_reward_percent(): u128 { SLASH_REWARD_PERCENT }
+
+    #[view]
+    /// Total bonds currently at risk. Should equal the sum of live assertion
+    /// and challenge bonds; a divergence means value leaked.
+    public fun escrow_balance(chain_addr: address): u64 acquires Chain {
+        fungible_asset::balance(borrow_global<Chain>(chain_addr).escrow)
+    }
 }

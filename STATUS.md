@@ -1,6 +1,6 @@
 # Status
 
-**Version 0.2.0-beta** · 248 Rust tests + 45 Move tests passing · **deployed to Aptos devnet** · not audited
+**Version 0.2.0-beta** · 254 Rust tests + 52 Move tests passing · **deployed to Aptos devnet** · not audited
 
 > **Live on devnet.** The package is published and the assertion lifecycle runs
 > on chain. Aptos itself refuses to finalize an assertion inside its challenge
@@ -43,7 +43,10 @@ These are exercised by the test suite on every run, and by
 | Independent verification from published data | `sena-node` | `published_batch_data_reproduces_the_asserted_root` |
 | Persistence across restart, verified on load | `sena-node` | Corrupt state and cross-chain data both refused |
 | Keyless claim validation and ephemeral-key binding | `sena-stf` | Stolen-JWT and expiry-extension attacks rejected |
-| Move contracts compile and self-test | `move/sena` | 45/45 Move tests, including Rust conformance |
+| Move contracts compile and self-test | `move/sena` | 52/52 Move tests, including Rust conformance |
+| Bonds are escrowed, slashed and refunded | `move/sena` | Balances checked on reject, refund and groundless challenge |
+| Withdrawal proofs against finalized roots | `sena-node` | `sena_getWithdrawalProof`; historical roots provable |
+| RPC auth, rate limiting, body cap | `sena-node` | Unauthenticated, wrong-token, flood and oversized-body all refused |
 | Assertion lifecycle enforced by Aptos | `move/sena` | Devnet: window and challenge both block finalization |
 
 ### The claim that matters
@@ -100,13 +103,10 @@ transaction:
 What remains open:
 
 - **Devnet only, and devnet resets.** Nothing is on testnet.
-- **Bond escrow is bookkeeping, not custody.** No coin moves; posting an
-  assertion costs gas and nothing else. The *bridge* does custody real assets —
-  bonds do not.
-- **The bridge is written but unproven on chain.** It custodies Circle USDC on
-  testnet via `dispatchable_fungible_asset`, and deposits and withdrawals
-  compile and unit-test, but nothing has been deposited yet: testnet funding is
-  a manual faucet step.
+- **The bridge and bonds are written but unproven on chain.** Both custody real
+  fungible assets — Circle USDC on testnet via `dispatchable_fungible_asset` —
+  and both compile and unit-test, but nothing has been deposited or bonded on a
+  live network: testnet funding is a manual faucet step.
 - **No dispute has been played to completion on chain.** Only that a challenge
   blocks finalization.
 - **Four instructions are not adjudicable.** `VerifyGasAsset`, `VerifyCouncil`,

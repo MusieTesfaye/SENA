@@ -128,6 +128,27 @@ Move and Rust hashing shows up as a rejected argument.
 
 Devnet resets periodically. Use `testnet` for evidence you want to keep.
 
+### Access control
+
+The node is unauthenticated by default, which is right bound to localhost and
+wrong for anything else:
+
+```sh
+sena-node run --data-dir ./dev --listen 0.0.0.0:8545 \
+    --auth-token "$(openssl rand -hex 32)" --rate-limit 600
+```
+
+Binding a non-local address without a token prints a warning rather than
+refusing — an operator behind their own proxy may legitimately want it, but it
+should never happen by accident.
+
+```sh
+cargo test -p sena-node --test beta_e2e
+```
+
+covers a missing token, a wrong token, a client exceeding the limit, and a body
+over the cap.
+
 ## 6. Real stablecoins on testnet
 
 The bridge custodies **Circle USDC on Aptos testnet** —
@@ -198,11 +219,13 @@ encode `u128`, and a JSON number above 2^53 would be silently rounded. Try
 
 ## What no test here covers
 
-- **No bonds move.** `bond` is a number in a struct. Posting an assertion costs
-  gas and nothing else, so none of the economic arguments are tested. Deposits
-  and withdrawals move real USDC; assertion bonds do not.
-- **Withdrawal is not end-to-end.** The contract verifies the proof and releases
-  custody, but nothing yet generates the proof from a running sequencer.
+- **Bonds have not been posted on a live network.** They are escrowed, slashed
+  and refunded in Move, with balances checked by test, but no bond has been put
+  at risk on devnet or testnet.
+- **The withdrawal path has not been driven end to end.** The node produces a
+  proof and the contract accepts the shape of one, but nobody has yet taken a
+  proof from `sena_getWithdrawalProof` and spent it against a finalized
+  assertion on chain.
 - **No dispute has been played to completion on chain.** Bisection and one-step
   adjudication run in Rust and in Move unit tests, not against a live network.
 - **No batch data is published to L1.** A verifier gets it from the sequencer's
