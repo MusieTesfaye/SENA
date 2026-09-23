@@ -7,7 +7,8 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="tests" src="https://img.shields.io/badge/tests-248%20passing-brightgreen">
+<img alt="tests" src="https://img.shields.io/badge/tests-248%20rust%20%2B%2045%20move-brightgreen">
+<img alt="devnet" src="https://img.shields.io/badge/aptos-devnet%20deployed-blue">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
@@ -113,7 +114,21 @@ nothing can be withdrawn against it. **Soft confirmation and L1 finality are
 different things**, and every response that touches a transaction keeps them
 apart.
 
-### 4. Verify the chain yourself
+### 4. It runs on Aptos devnet
+
+The contracts are published and the lifecycle is verified on chain. Aptos itself
+rejects the two things it must:
+
+```
+assertions::finalize  (inside challenge window)  →  E_WINDOW_OPEN
+assertions::finalize  (while challenged)         →  E_WRONG_STATUS
+```
+
+Transaction hashes and a reproduction script are in
+[`docs/beta/evidence/03-devnet-deployment.md`](docs/beta/evidence/03-devnet-deployment.md).
+No bonds move yet — posting an assertion costs gas and nothing else.
+
+### 5. Verify the chain yourself
 
 Do not take the node's word for its own state root. Fetch the published
 transactions and re-execute them:
@@ -173,7 +188,7 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 | [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless, execution traces |
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
 | [`sena-node`](crates/sena-node) | Mempool, block production, RPC, verifier mode, CLI |
-| [`move/sena`](move/sena) | Aptos L1 contracts — compiles, 36/36 tests, **not deployed**, see [`move/README.md`](move/README.md) |
+| [`move/sena`](move/sena) | Aptos L1 contracts — **deployed to devnet**, 45/45 tests, see [`move/README.md`](move/README.md) |
 
 ## Determinism is a security property
 

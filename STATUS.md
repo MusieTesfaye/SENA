@@ -1,6 +1,12 @@
 # Status
 
-**Version 0.2.0-beta** · 248 Rust tests + 36 Move tests passing · not audited · not deployed
+**Version 0.2.0-beta** · 248 Rust tests + 45 Move tests passing · **deployed to Aptos devnet** · not audited
+
+> **Live on devnet.** The package is published and the assertion lifecycle runs
+> on chain. Aptos itself refuses to finalize an assertion inside its challenge
+> window, and refuses to finalize a challenged one —
+> [evidence with transaction hashes](docs/beta/evidence/03-devnet-deployment.md).
+> No bonds move yet, and nothing is audited.
 
 **Beta planning:** [`docs/beta/BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) ·
 [`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) ·
@@ -37,7 +43,8 @@ These are exercised by the test suite on every run, and by
 | Independent verification from published data | `sena-node` | `published_batch_data_reproduces_the_asserted_root` |
 | Persistence across restart, verified on load | `sena-node` | Corrupt state and cross-chain data both refused |
 | Keyless claim validation and ephemeral-key binding | `sena-stf` | Stolen-JWT and expiry-extension attacks rejected |
-| Move contracts compile and self-test | `move/sena` | 36/36 Move tests, including Rust conformance |
+| Move contracts compile and self-test | `move/sena` | 45/45 Move tests, including Rust conformance |
+| Assertion lifecycle enforced by Aptos | `move/sena` | Devnet: window and challenge both block finalization |
 
 ### The claim that matters
 
@@ -73,16 +80,30 @@ the strength of the checks that *are* implemented would let anyone spend from an
 keyless account by presenting claims they invented. Refusing is the only safe
 behaviour, and the code does refuse.
 
-### 2. The Aptos L1 contracts compile but are not deployed
+### 2. The Aptos L1 contracts are deployed to devnet, not testnet
 
-**Resolved since the last revision.** All six modules compile and 36 of 36 Move
-unit tests pass, including cross-language conformance tests that compute digests
-in Move and compare them against the Rust reference.
+**Resolved since the last revision.** All six modules compile, 45 of 45 Move
+tests pass, and the package is published to Aptos devnet with the assertion
+lifecycle verified on chain.
+
+Two authorization holes were found and fixed in the process, both invisible to
+unit tests because those call Move functions directly rather than through a
+transaction:
+
+- `disputes::Registry` was never created by anything, so every dispute entry
+  point would have aborted on a real network.
+- Dispute moves took the acting party as a *parameter* rather than deriving it
+  from the signer, so any account could have moved as either side — making the
+  turn and clock checks decorative. `challenger_won` was also `public`, meaning
+  any module could reject a sound assertion.
 
 What remains open:
 
-- **Nothing is deployed.** No SENA transaction has ever been submitted to Aptos.
-- **Bond escrow is bookkeeping, not custody.** No coin moves.
+- **Devnet only, and devnet resets.** Nothing is on testnet.
+- **Bond escrow is bookkeeping, not custody.** No coin moves; posting an
+  assertion costs gas and nothing else.
+- **No dispute has been played to completion on chain.** Only that a challenge
+  blocks finalization.
 - **Four instructions are not adjudicable.** `VerifyGasAsset`, `VerifyCouncil`,
   `SetGasAsset` and `SetParameter` abort, so a dispute over a gas-rate or
   governance step cannot be settled on L1. That is a beta blocker.

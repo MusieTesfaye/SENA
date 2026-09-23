@@ -10,6 +10,12 @@
 /// one. REQ-FRAUD-015 and REQ-GOV-007 survive a compromised governance council
 /// only if the capability does not exist to be abused.
 module sena::assertions {
+    // Dispute outcomes may only be applied by the dispute module. Without this
+    // `challenger_won` is reachable by any module, which means any caller could
+    // reject a sound assertion -- the inverse of the attack fraud proofs exist
+    // to stop.
+    friend sena::disputes;
+
     use std::signer;
     use std::vector;
     use aptos_std::table::{Self, Table};
@@ -34,6 +40,8 @@ module sena::assertions {
     const E_WINDOW_OPEN: u64 = 37;
     /// The parent has not finalized.
     const E_PARENT_NOT_FINAL: u64 = 38;
+    /// The caller is not the party this operation belongs to.
+    const E_NOT_PROPOSER: u64 = 39;
 
     const STATUS_PENDING: u8 = 0;
     const STATUS_CHALLENGED: u8 = 1;
@@ -146,16 +154,21 @@ module sena::assertions {
     }
 
     /// Posts a bonded assertion.
-    public fun post(
+    ///
+    /// The proposer is derived from the signer rather than passed in. Taking it
+    /// as a parameter would let anyone post an assertion attributed to someone
+    /// else, putting a bond at risk that is not theirs.
+    public entry fun post(
+        proposer: &signer,
         chain_addr: address,
-        proposer: address,
         parent: vector<u8>,
         pre_state_root: vector<u8>,
         post_state_root: vector<u8>,
         batch_commitment: vector<u8>,
         trace_length: u64,
         bond: u128,
-    ): vector<u8> acquires Chain {
+    ) acquires Chain {
+        let proposer_addr = signer::address_of(proposer);
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, parent), E_UNKNOWN_PARENT);
 
@@ -169,7 +182,7 @@ module sena::assertions {
         );
         table::add(&mut chain.assertions, id, Assertion {
             parent,
-            proposer,
+            proposer: proposer_addr,
             pre_state_root,
             post_state_root,
             batch_commitment,
@@ -180,11 +193,18 @@ module sena::assertions {
             open_challenges: 0,
         });
         vector::push_back(&mut chain.order, id);
-        id
     }
 
     /// Records that a challenge has opened.
-    public fun open_challenge(chain_addr: address, id: vector<u8>) acquires Chain {
+    ///
+    /// Permissionless by design (REQ-FRAUD-011): any account may challenge. The
+    /// signer is required so that opening a challenge is an authenticated act
+    /// with an identifiable party, not so that it can be restricted.
+    public entry fun open_challenge(
+        _challenger: &signer,
+        chain_addr: address,
+        id: vector<u8>,
+    ) acquires Chain {
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
         let record = table::borrow_mut(&mut chain.assertions, id);

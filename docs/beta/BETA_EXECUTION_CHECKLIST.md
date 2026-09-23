@@ -10,10 +10,11 @@ finding.
 > repository rather than left blank. Where an item is `Complete`, the evidence
 > column names what to check. Where it is `Blocked`, the blocker is named.
 >
-> **Update: the Move package now compiles and 36 of 36 Move tests pass.** That
-> was the item blocking the most downstream work. Gate B is now reachable; what
-> it still needs is a local Aptos deployment and an assertion lifecycle run
-> against it. Nothing has been deployed.
+> **Update: published to Aptos devnet, 45 of 45 Move tests passing.** The
+> assertion lifecycle runs on chain and Aptos enforces both safety properties —
+> see [`evidence/03-devnet-deployment.md`](evidence/03-devnet-deployment.md).
+> Bonds are still bookkeeping, no dispute has been played to completion on
+> chain, and nothing is on testnet.
 
 ## 1. Release identity and scope
 
@@ -94,15 +95,15 @@ finding.
 - [x] `Complete` — Compile the full Move package in clean CI. → all six modules compile with CLI `7.9.0` and the framework pinned to `46d871fa`; [`move.yml`](../../.github/workflows/move.yml) runs it. Verified locally on 2026-09-23.
 - [x] `Complete` — Run Move unit tests in clean CI. → **36 of 36 pass**, including the cross-language conformance tests that compute digests in Move and compare against Rust
 - [ ] `Not started` — Add coverage and publish the coverage artifact. → now unblocked
-- [ ] `Not started` — Verify all public functions enforce valid lifecycle stages.
-- [ ] `Not started` — Add signer or capability checks for privileged transitions.
-- [ ] `Not started` — Prevent unauthorized dispute resolution.
+- [x] `Complete` — Verify all public functions enforce valid lifecycle stages. → covered by [`lifecycle_test.move`](../../move/sena/tests/lifecycle_test.move)
+- [x] `Complete` — Add signer or capability checks for privileged transitions. → `post`, `open_challenge`, `dissect` and `select` derive the acting party from the signer instead of a parameter
+- [x] `Complete` — Prevent unauthorized dispute resolution. → `defender_won`/`challenger_won` are `public(friend)`, reachable only from `sena::disputes`
 - [x] `Complete` — Prevent governance from finalizing assertions, dismissing challenges, or weakening safety floors. → by construction: no such entry point exists in `assertions.move` or `disputes.move`; window floor clamped in code
 - [ ] `Not started` — Implement real assertion bond escrow. → modelled as bookkeeping, not coin movement
 - [ ] `Not started` — Implement challenger bond escrow.
 - [ ] `Not started` — Implement refund, slash, reward, and treasury accounting.
 - [ ] `Not started` — Ensure each settlement action is exactly-once.
-- [ ] `In progress` — Connect OSP results to dispute and assertion status. → implemented in Rust; Move side written and uncompiled
+- [x] `Complete` — Connect OSP results to dispute and assertion status. → `disputes::resolve_internal` applies the outcome to the assertion chain; tested by `a_timeout_resolves_the_dispute_and_the_assertion`
 - [x] `Complete` — Implement descendant rejection and rollback semantics. → `challenger_won` sweeps descendants; tested in Rust
 - [ ] `Not started` — Emit lifecycle events.
 
@@ -115,7 +116,7 @@ finding.
 - [x] `Complete` — Automatically open a challenge on divergence. → `VerifierNode::open_dispute`
 - [x] `Complete` — Complete bisection within move deadlines. → `TracePlayer::play`; converges in 2 rounds over 48 steps
 - [x] `Complete` — Generate a valid OSP. → `TracePlayer::one_step_proof`
-- [ ] `Not started` — Resolve a deliberately invalid assertion on Aptos. → resolved in Rust; the Move path now compiles and self-tests, but **nothing has been deployed to run it against**
+- [ ] `In progress` — Resolve a deliberately invalid assertion on Aptos. → a challenge is opened on chain and blocks finalization ([evidence](evidence/03-devnet-deployment.md)); **bisection and one-step adjudication have not been played on chain**
 - [x] `Complete` — Confirm the invalid assertion cannot finalize. → tested in Rust
 - [x] `Complete` — Confirm descendants are rejected. → `a_successful_challenge_rejects_every_descendant`
 - [ ] `Not started` — Confirm proposer bond slashing and challenger reward. → no real bonds exist
@@ -187,11 +188,15 @@ finding.
 - [x] Parameters and formats frozen
 - [ ] Toolchain and STF hash recorded → Rust pinned; STF hash blocked
 
-### Gate B — Local end-to-end integration — **Unblocked, not started**
+### Gate B — Local end-to-end integration — **Partially met on devnet**
 
-The Move package compiles and self-tests, so this can now begin. It needs a
-local Aptos node, the package published to it, and the honest and adversarial
-assertion lifecycles run end to end.
+- [x] Aptos deployment succeeds → devnet
+- [x] Honest assertion lifecycle succeeds → posted, Pending, window enforced
+- [ ] Invalid assertion lifecycle → challenge blocks finalization, but no
+      dispute has been played to completion on chain
+- [ ] Full bisection and OSP on chain
+- [ ] Bridge accounting and test-asset transfer
+- [ ] Restart, timeout, and rollback against a live chain
 
 ### Gate C — Reproducible testnet deployment — **Not started**
 
@@ -208,7 +213,8 @@ but entirely within Rust. Nothing has touched Aptos.
 
 ## 14. Evidence index
 
-Not yet created as a directory. The Move workflow uploads build evidence —
+[`evidence/03-devnet-deployment.md`](evidence/03-devnet-deployment.md) records the
+first deployment. The Move workflow uploads build evidence —
 toolchain inputs, resolved framework revision, compile and test logs, module
 hashes — as a CI artifact with 90-day retention. Those should be committed to
 `docs/beta/evidence/02-local-aptos/` once the build is green.
@@ -236,7 +242,7 @@ hashes — as a CI artifact with 90-day retention. Those should be committed to
 | 3. Durable node | Mostly complete — no RocksDB, no auth |
 | 4. Data availability | **Weakest area** — no independent publication |
 | 5. Aptos settlement | Not started |
-| 6. Move contracts | Compiles, 36/36 tests; bonds and events not implemented |
+| 6. Move contracts | Deployed to devnet, 45/45 tests; bonds and events not implemented |
 | 7. Fraud proofs and verifier | Complete in Rust, untested on Aptos |
 | 8. Bridge | Not started |
 | 9. User access | Complete for what exists |
@@ -244,7 +250,8 @@ hashes — as a CI artifact with 90-day retention. Those should be committed to
 | 11. Observability | Not started |
 | 12. Security review | Property tests only |
 
-**Critical path:** ~~compile the Move package~~ ✅ → local Aptos integration →
+**Critical path:** ~~compile the Move package~~ ✅ → ~~deploy and run the
+lifecycle on Aptos~~ ✅ → play a full dispute on chain → real bond escrow →
 settlement adapter → independent data availability → bridge.
 
 ## References

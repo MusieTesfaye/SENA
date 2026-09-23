@@ -11,9 +11,11 @@
 /// party entering correctly cannot lose. That is the property the entire
 /// security argument rests on.
 module sena::disputes {
+    use std::signer;
     use std::vector;
     use aptos_std::table::{Self, Table};
     use aptos_framework::timestamp;
+    use sena::assertions;
 
     /// The dispute is over.
     const E_RESOLVED: u64 = 50;
@@ -27,6 +29,10 @@ module sena::disputes {
     const E_SEGMENT_OUT_OF_RANGE: u64 = 54;
     /// No such dispute.
     const E_NO_SUCH_DISPUTE: u64 = 55;
+    /// The caller is not a party to this dispute.
+    const E_NOT_A_PARTY: u64 = 56;
+    /// The registry has already been created.
+    const E_ALREADY_INITIALIZED: u64 = 57;
 
     const PARTY_DEFENDER: u8 = 0;
     const PARTY_CHALLENGER: u8 = 1;
@@ -72,6 +78,22 @@ module sena::disputes {
 
     struct Registry has key {
         disputes: Table<vector<u8>, Dispute>,
+        /// The assertion chain whose outcomes this registry applies.
+        chain: address,
+    }
+
+    /// Creates the dispute registry.
+    ///
+    /// Without this nothing in the module works: every entry point borrows
+    /// `Registry`, and a resource that is never moved to an account cannot be
+    /// borrowed. Unit tests did not catch it because they call the functions
+    /// directly rather than through a transaction.
+    public entry fun initialize(admin: &signer, chain: address) {
+        assert!(!exists<Registry>(signer::address_of(admin)), E_ALREADY_INITIALIZED);
+        move_to(admin, Registry {
+            disputes: table::new<vector<u8>, Dispute>(),
+            chain,
+        });
     }
 
     public fun clock_budget(challenge_window: u64): u64 {
@@ -98,12 +120,15 @@ module sena::disputes {
     }
 
     /// Opens a dispute over a whole trace.
-    public fun open(
+    ///
+    /// The challenger is the signer. Accepting it as a parameter would let one
+    /// account enrol another as a party to a dispute it never entered.
+    public entry fun open(
+        challenger: &signer,
         registry_addr: address,
         id: vector<u8>,
         assertion: vector<u8>,
         defender: address,
-        challenger: address,
         trace_length: u64,
         lo_commitment: vector<u8>,
         hi_commitment: vector<u8>,
@@ -117,12 +142,13 @@ module sena::disputes {
 
         let stage = if (trace_length == 1) { STAGE_ONE_STEP } else { STAGE_BISECTING };
         let turn = if (trace_length == 1) { PARTY_CHALLENGER } else { PARTY_DEFENDER };
+        let challenger_addr = signer::address_of(challenger);
 
         let registry = borrow_global_mut<Registry>(registry_addr);
         table::add(&mut registry.disputes, id, Dispute {
             assertion,
             defender,
-            challenger,
+            challenger: challenger_addr,
             lo: 0,
             hi: trace_length,
             lo_commitment,
@@ -137,6 +163,21 @@ module sena::disputes {
             last_move_at: now,
             winner: 255,
         });
+    }
+
+    /// Returns which party an address is in this dispute, aborting if neither.
+    ///
+    /// The party is derived from the caller rather than taken as an argument.
+    /// Trusting a parameter would let anyone move as either side, which makes
+    /// the turn and clock checks decorative.
+    fun party_of(d: &Dispute, who: address): u8 {
+        if (who == d.defender) {
+            PARTY_DEFENDER
+        } else if (who == d.challenger) {
+            PARTY_CHALLENGER
+        } else {
+            abort E_NOT_A_PARTY
+        }
     }
 
     /// Charges the mover's clock and checks the turn.
@@ -192,15 +233,18 @@ module sena::disputes {
     }
 
     /// The defender divides the interval and publishes the interior states.
-    public fun dissect(
+    public entry fun dissect(
+        mover: &signer,
         registry_addr: address,
         id: vector<u8>,
         commitments: vector<vector<u8>>,
     ) acquires Registry {
+        let who = signer::address_of(mover);
         let registry = borrow_global_mut<Registry>(registry_addr);
         assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
         let d = table::borrow_mut(&mut registry.disputes, id);
 
+        assert!(party_of(d, who) == PARTY_DEFENDER, E_WRONG_TURN);
         begin_move(d, PARTY_DEFENDER);
         assert!(d.stage == STAGE_BISECTING, E_WRONG_STAGE);
 
@@ -213,11 +257,18 @@ module sena::disputes {
     }
 
     /// The challenger names the first segment whose end it disputes.
-    public fun select(registry_addr: address, id: vector<u8>, index: u64) acquires Registry {
+    public entry fun select(
+        mover: &signer,
+        registry_addr: address,
+        id: vector<u8>,
+        index: u64,
+    ) acquires Registry {
+        let who = signer::address_of(mover);
         let registry = borrow_global_mut<Registry>(registry_addr);
         assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
         let d = table::borrow_mut(&mut registry.disputes, id);
 
+        assert!(party_of(d, who) == PARTY_CHALLENGER, E_WRONG_TURN);
         begin_move(d, PARTY_CHALLENGER);
         assert!(d.stage == STAGE_BISECTING && d.has_offer, E_WRONG_STAGE);
 
@@ -242,13 +293,51 @@ module sena::disputes {
         enter_one_step_if_narrow(d);
     }
 
-    /// Records the outcome of one-step adjudication.
-    public fun resolve(registry_addr: address, id: vector<u8>, winner: u8) acquires Registry {
-        let registry = borrow_global_mut<Registry>(registry_addr);
-        assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
-        let d = table::borrow_mut(&mut registry.disputes, id);
-        d.stage = STAGE_RESOLVED;
-        d.winner = winner;
+    /// Records the outcome of one-step adjudication and applies it.
+    ///
+    /// Recording the winner without applying it would leave the assertion chain
+    /// unaware of the result -- a fraudulent assertion could lose its dispute
+    /// and still finalize. This is the link between adjudication and status.
+    fun resolve_internal(
+        registry_addr: address,
+        id: vector<u8>,
+        winner: u8,
+    ) acquires Registry {
+        let (chain, assertion) = {
+            let registry = borrow_global_mut<Registry>(registry_addr);
+            assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
+            let d = table::borrow_mut(&mut registry.disputes, id);
+            assert!(d.stage != STAGE_RESOLVED, E_RESOLVED);
+            d.stage = STAGE_RESOLVED;
+            d.winner = winner;
+            (registry.chain, d.assertion)
+        };
+
+        if (winner == PARTY_CHALLENGER) {
+            assertions::challenger_won(chain, assertion);
+        } else {
+            assertions::defender_won(chain, assertion);
+        };
+    }
+
+    /// Resolves a dispute whose party failed to move before its deadline.
+    ///
+    /// Permissionless: a party that has stopped responding will not report
+    /// itself, so anyone must be able to claim the timeout (REQ-FRAUD-014).
+    public entry fun claim_timeout(
+        _caller: &signer,
+        registry_addr: address,
+        id: vector<u8>,
+    ) acquires Registry {
+        let winner = {
+            let registry = borrow_global<Registry>(registry_addr);
+            assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
+            let d = table::borrow(&registry.disputes, id);
+            assert!(d.stage != STAGE_RESOLVED, E_RESOLVED);
+            assert!(timestamp::now_seconds() > d.deadline, E_WRONG_STAGE);
+            if (d.turn == PARTY_DEFENDER) { PARTY_CHALLENGER } else { PARTY_DEFENDER }
+        };
+        resolve_internal(registry_addr, id, winner);
     }
 
     #[view]
