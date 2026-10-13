@@ -81,12 +81,41 @@ For production Keyless accounts, SENA features a high-performance Groth16 Prover
 
 #### External Prover Service REST API (Port 8090)
 
-- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), `universal_oidc: true`, and `social_connect: "Celo-ODIS-tOPRF"`.
+- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), `universal_oidc: true`, `social_connect: "Celo-ODIS-tOPRF"`, and `distributed_pepper: "BN254-tOPRF-V-Shamir"`.
 - **`POST /api/v1/prove`**: Generates a 128-byte Groth16 zero-knowledge proof binding any OIDC identity (Google, Apple, Microsoft, Discord, GitHub, Auth0) to a client ephemeral keypair (EPK). Supports **unified single-wallet address derivation** ($\text{iss} + \text{sub} + \text{pepper}$) without `client_id` lock-in. Average proving time: **~19 ms**.
 - **`POST /api/v1/verify`**: Verifies a 128-byte Groth16 proof against public statement inputs with cryptographic pairing checks over BN254.
 - **`POST /api/v1/odis/evaluate`**: **Celo-style ODIS Oblivious PRF (tOPRF)** service for SocialConnect. Evaluates blinded curve points ($B = r \cdot M$) so users can derive anti-enumeration `ObfuscatedIdentifier`s for phone numbers and emails without ever exposing plaintext contact details to the server.
+- **`POST /api/v1/pepper/get`**: Gateway derivation for cross-device Keyless peppers. Queries the distributed guardian cluster, performs Lagrange interpolation, unblinds, and returns the deterministic 32-byte pepper and unified address.
+- **`POST /api/v1/pepper/blinded_evaluate`**: Privacy-preserving endpoint evaluating user-blinded points ($B = r \cdot M$) across guardians with zero leakage of user identity.
+- **`GET /api/v1/pepper/cluster`**: Returns quorum status, threshold requirements, and guardian node endpoints.
 
-### 4. Run your own devnet
+### 4. Distributed Pepper Storage & Guardian Cluster (Aptos & Celo Model)
+
+To guarantee that user wallets are recoverable across multiple devices (phone, laptop, desktop) without relying on a centralized database or exposing user identities to rainbow table dictionary attacks, SENA implements a **Verifiable Threshold Oblivious PRF (V-tOPRF)** cluster:
+
+1. **Shamir Secret Sharing over BN254**: The master pepper secret $s \in \mathbb{F}_r$ is split into $N$ polynomial shares $\{ s_1, \dots, s_N \}$ with threshold $T$. No individual guardian node holds the secret or can de-anonymize accounts.
+2. **Oblivious Evaluation (Zero-Knowledge Privacy)**: The client blinds their identity with a private random scalar $r$: $B = r \cdot H_{\mathbb{G}_1}(\text{iss} \parallel \text{sub})$. Guardian nodes evaluate $S_i = s_i \cdot B$ without **ever learning who the user is**.
+3. **Byzantine Fault Tolerance (Chaum-Pedersen DLEQ Proofs)**: Each guardian attaches a zero-knowledge discrete log equality proof $(c, z)$ proving that $\log_{G_1}(VK_i) = \log_B(S_i) = s_i$. The client cryptographically verifies each proof against the guardian's public verification key before accepting the share, detecting and rejecting any corrupted or malicious nodes.
+4. **Lagrange Interpolation & Unblinding**: The client interpolates $S = \sum L_i(0) S_i = s \cdot B$, unblinds $P = r^{-1} \cdot S = s \cdot M \in \mathbb{G}_1$, and digests $P$ into the deterministic 32-byte pepper.
+
+```sh
+# 1. Generate 2-of-3 production cluster key shares and config
+./target/release/sena-prover guardian-keygen --threshold 2 --nodes 3 --output ./cluster-keys
+
+# 2. Launch individual guardian daemons
+./target/release/sena-prover guardian --config ./cluster-keys/guardian_1.json --port 8091
+./target/release/sena-prover guardian --config ./cluster-keys/guardian_2.json --port 8092
+./target/release/sena-prover guardian --config ./cluster-keys/guardian_3.json --port 8093
+
+# 3. Derive pepper across guardians with automatic Byzantine fault detection
+./target/release/sena-prover pepper-client \
+    --guardians http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093 \
+    --threshold 2 \
+    --iss https://accounts.google.com \
+    --sub user_99999
+```
+
+### 5. Run your own devnet
 
 ```sh
 # A keypair to play with. Note the secret and the address.
@@ -105,7 +134,7 @@ The node prints its state root on startup. **Two operators with the same genesis
 file must see the same root** — that is how you tell you are on the same chain
 before exchanging a single transaction.
 
-### 5. Send a transaction
+### 6. Send a transaction
 
 In another terminal:
 
@@ -152,7 +181,7 @@ nothing can be withdrawn against it. **Soft confirmation and L1 finality are
 different things**, and every response that touches a transaction keeps them
 apart.
 
-### 6. It runs on Aptos devnet
+### 7. It runs on Aptos devnet
 
 The contracts are published and the lifecycle is verified on chain. Aptos itself
 rejects the two things it must:
@@ -166,7 +195,7 @@ Transaction hashes and a reproduction script are in
 [`docs/beta/evidence/03-devnet-deployment.md`](docs/beta/evidence/03-devnet-deployment.md).
 No bonds move yet — posting an assertion costs gas and nothing else.
 
-### 5. Run it against Aptos yourself
+### 8. Run it against Aptos yourself
 
 ```sh
 scripts/chain-lifecycle.sh devnet     # or testnet
@@ -178,7 +207,7 @@ script fails loudly.
 
 Full guide: [`docs/TESTING.md`](docs/TESTING.md).
 
-### 6. Verify the chain yourself
+### 9. Verify the chain yourself
 
 Do not take the node's word for its own state root. Fetch the published
 transactions and re-execute them:

@@ -1,16 +1,21 @@
 //! The SENA Prover Service CLI binary.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use ark_bn254::Fr;
+use ark_serialize::CanonicalDeserialize;
 use clap::{Parser, Subcommand};
 use sena_prover::{
-    load_ceremony_keys, run_ceremony, run_prover_server, save_ceremony_keys, KeylessProver,
+    export_cluster_keys, load_ceremony_keys, run_ceremony, run_guardian_node, run_prover_server,
+    save_ceremony_keys, ClusterConfig, DistributedPepperClient, GuardianNodeConfig, GuardianShare,
+    KeylessProver,
 };
 
 #[derive(Parser)]
 #[command(name = "sena-prover")]
-#[command(about = "SENA Production Groth16 Prover Daemon & Ceremony Manager", long_about = None)]
+#[command(about = "SENA Production Groth16 Prover Daemon & Distributed Pepper Guardian Cluster", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -38,6 +43,59 @@ enum Commands {
 
     /// Benchmark witness generation and Groth16 proving throughput
     Bench,
+
+    /// Start a standalone Byzantine-fault-tolerant Guardian Node
+    Guardian {
+        /// Guardian 1-based index (e.g. 1, 2, 3)
+        #[arg(short, long)]
+        index: Option<u32>,
+
+        /// 32-byte secret share scalar in hex
+        #[arg(short, long)]
+        share: Option<String>,
+
+        /// Path to guardian key configuration JSON file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Port to listen on
+        #[arg(short, long, default_value = "8091")]
+        port: u16,
+    },
+
+    /// Generate production threshold secret shares and cluster configuration
+    GuardianKeygen {
+        /// Quorum threshold T (minimum shares required to reconstruct pepper)
+        #[arg(short, long, default_value = "2")]
+        threshold: usize,
+
+        /// Total number of guardian nodes N
+        #[arg(short, long, default_value = "3")]
+        nodes: usize,
+
+        /// Output directory for cluster configuration and share files
+        #[arg(short, long, default_value = "./cluster-keys")]
+        output: PathBuf,
+    },
+
+    /// Derive pepper across distributed guardians via threshold OPRF
+    PepperClient {
+        /// Comma-separated guardian HTTP URLs
+        #[arg(short, long, default_value = "http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093")]
+        guardians: String,
+
+        /// Threshold requirement
+        #[arg(short, long, default_value = "2")]
+        threshold: usize,
+
+        /// Identity issuer
+        #[arg(long, default_value = "https://accounts.google.com")]
+        iss: String,
+
+        /// Identity subject
+        #[arg(long, default_value = "user_test_999")]
+        sub: String,
+    },
 }
 
 fn main() {
@@ -109,6 +167,97 @@ fn main() {
             let avg: f64 = times.iter().sum::<f64>() / (times.len() as f64);
             println!("⚡ Average Proving Latency: {:.2} ms per proof", avg);
             println!("✅ Prover benchmark completed successfully!");
+        }
+
+        Commands::Guardian {
+            index,
+            share,
+            config,
+            port,
+        } => {
+            let (idx, share_scalar) = if let Some(cfg_path) = config {
+                println!("📂 Loading guardian configuration from: {}", cfg_path.display());
+                let content = fs::read_to_string(&cfg_path).expect("Failed to read guardian config");
+                let g_share: GuardianShare = serde_json::from_str(&content).expect("Invalid JSON in config");
+                let scalar = g_share.parse_secret().expect("Failed to parse secret scalar");
+                (g_share.index, scalar)
+            } else if let (Some(i), Some(s_hex)) = (index, share) {
+                let clean = s_hex.trim_start_matches("0x");
+                let bytes = hex::decode(clean).expect("Invalid hex for secret share");
+                let mut cursor = bytes.as_slice();
+                let scalar = Fr::deserialize_compressed(&mut cursor).expect("Invalid scalar bytes");
+                (i, scalar)
+            } else {
+                eprintln!("❌ Error: Either provide --config <PATH> or both --index <U32> and --share <HEX>");
+                std::process::exit(1);
+            };
+
+            let addr = format!("127.0.0.1:{port}");
+            println!("🛡️ Starting SENA Guardian Node #{idx} on http://{addr}...");
+            if let Err(e) = run_guardian_node(idx, share_scalar, &addr) {
+                eprintln!("❌ Guardian server error: {e}");
+            }
+        }
+
+        Commands::GuardianKeygen {
+            threshold,
+            nodes,
+            output,
+        } => {
+            println!("🔑 Generating Production {threshold}-of-{nodes} Guardian Cluster Keys...");
+            match export_cluster_keys(threshold, nodes, &output) {
+                Ok(cluster) => {
+                    println!("✅ Cluster configuration written to: {}/cluster_config.json", output.display());
+                    for g in &cluster.guardians {
+                        println!(
+                            "   Guardian #{}: {} (VK: {})",
+                            g.index,
+                            g.url,
+                            g.verification_key_hex.as_deref().unwrap_or("none")
+                        );
+                    }
+                    println!("🎉 Cluster generation completed successfully!");
+                }
+                Err(e) => eprintln!("❌ Keygen failed: {e}"),
+            }
+        }
+
+        Commands::PepperClient {
+            guardians,
+            threshold,
+            iss,
+            sub,
+        } => {
+            println!("🌐 Running Distributed Pepper Client across guardians...");
+            let urls: Vec<String> = guardians.split(',').map(|s| s.trim().to_string()).collect();
+            let guardian_configs = urls
+                .iter()
+                .enumerate()
+                .map(|(i, u)| GuardianNodeConfig {
+                    index: (i + 1) as u32,
+                    url: u.clone(),
+                    verification_key_hex: None,
+                })
+                .collect();
+
+            let cluster = ClusterConfig {
+                threshold,
+                guardians: guardian_configs,
+            };
+
+            let client = DistributedPepperClient::new(cluster);
+            let start = Instant::now();
+            match client.derive_pepper(&iss, &sub) {
+                Ok(pepper) => {
+                    let elapsed = start.elapsed();
+                    let addr = sena_primitives::L2Address::derive_from_oidc_unified(&iss, &sub, &pepper);
+                    println!("⚡ Pepper Derived in {:?}:", elapsed);
+                    println!("   Pepper (32 bytes):  0x{}", hex::encode(pepper));
+                    println!("   Unified Address:    {}", addr);
+                    println!("✅ Cross-device recovery successfully verified!");
+                }
+                Err(e) => eprintln!("❌ Failed to derive pepper: {e}"),
+            }
         }
     }
 }

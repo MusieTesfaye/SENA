@@ -131,3 +131,67 @@ fn test_celo_odis_social_connect_pipeline() {
     );
     println!("Celo ODIS Obfuscated Identifier: {:?}", obfuscated_id_1);
 }
+
+#[test]
+fn test_distributed_pepper_cluster_keygen_and_byzantine_fault_tolerance() {
+    use ark_ec::AffineRepr;
+    use sena_prover::pepper::*;
+    use sena_primitives::L2Address;
+
+    let temp_dir = std::env::temp_dir().join(format!("sena_pepper_test_{}", std::time::SystemTime::now().elapsed().unwrap().as_micros()));
+    let cluster = export_cluster_keys(2, 3, &temp_dir).expect("Cluster keygen must succeed");
+
+    assert_eq!(cluster.threshold, 2);
+    assert_eq!(cluster.guardians.len(), 3);
+
+    // Read back exported shares from disk
+    let g1_file: GuardianShare = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("guardian_1.json")).unwrap()).unwrap();
+    let g2_file: GuardianShare = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("guardian_2.json")).unwrap()).unwrap();
+    let g3_file: GuardianShare = serde_json::from_str(&std::fs::read_to_string(temp_dir.join("guardian_3.json")).unwrap()).unwrap();
+
+    let s1 = g1_file.parse_secret().unwrap();
+    let s2 = g2_file.parse_secret().unwrap();
+    let s3 = g3_file.parse_secret().unwrap();
+
+    let vk1 = g1_file.parse_verification_key().unwrap();
+    let vk2 = g2_file.parse_verification_key().unwrap();
+    let vk3 = g3_file.parse_verification_key().unwrap();
+
+    let iss = "https://accounts.google.com";
+    let sub = "google_corp_user_44882";
+
+    // Client blinds identity
+    let (blinded, r) = client_blind_identity(iss, sub);
+
+    // Guardians evaluate and generate DLEQ proofs
+    let pt1 = guardian_evaluate_share(&blinded, &s1);
+    let pt2 = guardian_evaluate_share(&blinded, &s2);
+    let pt3 = guardian_evaluate_share(&blinded, &s3);
+
+    let dleq1 = dleq_prove(&s1, &vk1, &blinded, &pt1);
+    let dleq2 = dleq_prove(&s2, &vk2, &blinded, &pt2);
+    let dleq3 = dleq_prove(&s3, &vk3, &blinded, &pt3);
+
+    // Assert all 3 DLEQ proofs verify
+    assert!(dleq_verify(&vk1, &blinded, &pt1, &dleq1).unwrap());
+    assert!(dleq_verify(&vk2, &blinded, &pt2, &dleq2).unwrap());
+    assert!(dleq_verify(&vk3, &blinded, &pt3, &dleq3).unwrap());
+
+    // Reconstruct pepper from subsets {1,2} and {2,3}
+    let pepper_subset_12 = client_unblind_threshold_pepper(&[(1, pt1), (2, pt2)], &r).unwrap();
+    let pepper_subset_23 = client_unblind_threshold_pepper(&[(2, pt2), (3, pt3)], &r).unwrap();
+    assert_eq!(pepper_subset_12, pepper_subset_23, "Subsets must yield identical pepper");
+
+    let addr_12 = L2Address::derive_from_oidc_unified(iss, sub, &pepper_subset_12);
+    let addr_23 = L2Address::derive_from_oidc_unified(iss, sub, &pepper_subset_23);
+    assert_eq!(addr_12, addr_23, "Unified address must be identical across guardian subsets");
+
+    // Byzantine Fault Tolerance: Guardian #1 injects forged/poisoned share point
+    let poisoned_pt1 = ark_bn254::G1Affine::generator();
+    let byzantine_dleq_result = dleq_verify(&vk1, &blinded, &poisoned_pt1, &dleq1).unwrap();
+    assert!(!byzantine_dleq_result, "Corrupted guardian share MUST be rejected by DLEQ verification");
+
+    // Clean up temporary cluster directory
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
