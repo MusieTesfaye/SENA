@@ -64,7 +64,28 @@ Simulates an entire Web2-to-Web3 payment workflow live:
 4. **Mempool Verification & Block Production:** Sequencer admits the transaction via Groth16 verification, executes it, and seals block 1.
 5. **Ultralight Mobile Verification:** Bob's mobile wallet performs ultralight sync via Sparse Merkle Proof verification in **< 0.25 ms** with zero trust in the RPC node.
 
-### 3. Run your own devnet
+### 3. Production Proving Ceremony & Prover Daemon
+
+For production Keyless accounts, SENA features a high-performance Groth16 Prover Service over the BN254 curve ([`crates/sena-prover`](crates/sena-prover)):
+
+```sh
+# 1. Run the BN254 Phase 2 Setup Ceremony (exports .pk, .vk, and verification_key.json)
+./target/release/sena-prover ceremony --output ./prover-params
+
+# 2. Run prover benchmarks (averaging ~19ms per proof)
+./target/release/sena-prover bench
+
+# 3. Launch the production Prover Daemon on port 8090
+./target/release/sena-prover run --port 8090 --params ./prover-params
+```
+
+#### External Prover Service REST API (Port 8090)
+
+- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), and circuit metadata.
+- **`POST /api/v1/prove`**: Generates a 128-byte Groth16 zero-knowledge proof binding a JWT identity to a client ephemeral keypair (EPK). Average proving time: **~19 ms**.
+- **`POST /api/v1/verify`**: Verifies a 128-byte Groth16 proof against public statement inputs with cryptographic pairing checks over BN254.
+
+### 4. Run your own devnet
 
 ```sh
 # A keypair to play with. Note the secret and the address.
@@ -83,7 +104,7 @@ The node prints its state root on startup. **Two operators with the same genesis
 file must see the same root** — that is how you tell you are on the same chain
 before exchanging a single transaction.
 
-### 3. Send a transaction
+### 5. Send a transaction
 
 In another terminal:
 
@@ -130,7 +151,7 @@ nothing can be withdrawn against it. **Soft confirmation and L1 finality are
 different things**, and every response that touches a transaction keeps them
 apart.
 
-### 4. It runs on Aptos devnet
+### 6. It runs on Aptos devnet
 
 The contracts are published and the lifecycle is verified on chain. Aptos itself
 rejects the two things it must:
