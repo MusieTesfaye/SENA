@@ -127,6 +127,12 @@ pub enum KeylessError {
          current, but nothing here can establish that the provider actually issued it"
     )]
     ProofVerificationUnavailable,
+    /// The zero-knowledge proof or verification key is malformed.
+    #[error("zero-knowledge proof is malformed: {0}")]
+    MalformedProof(String),
+    /// The zero-knowledge proof failed verification against the public inputs.
+    #[error("zero-knowledge proof failed verification")]
+    InvalidProof,
 }
 
 /// The network's policy for accepting keyless identities.

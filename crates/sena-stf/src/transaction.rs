@@ -242,7 +242,69 @@ impl Transaction {
                 key.verify(self.signing_digest().as_bytes(), &sig)
                     .map_err(|_| AuthError::BadSignature)
             }
-            Authenticator::Keyless { .. } => Err(AuthError::KeylessNotImplemented),
+            Authenticator::Keyless {
+                ephemeral_public_key,
+                signature,
+                zk_proof,
+            } => {
+                let key = VerifyingKey::from_bytes(ephemeral_public_key)
+                    .map_err(|_| AuthError::MalformedKey)?;
+                let sig = Signature::from_bytes(signature);
+                key.verify(self.signing_digest().as_bytes(), &sig)
+                    .map_err(|_| AuthError::BadSignature)?;
+
+                if zk_proof.len() == 128 {
+                    let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
+                        .map_err(|_| AuthError::InvalidZkProof)?;
+                    let public_inputs = crate::groth16::canonical_keyless_public_inputs(
+                        ephemeral_public_key,
+                        &self.sender,
+                    );
+                    crate::groth16::canonical_verifier()
+                        .verify_raw(&proof, &public_inputs)
+                        .map_err(|_| AuthError::InvalidZkProof)?;
+                    Ok(())
+                } else {
+                    Err(AuthError::KeylessNotImplemented)
+                }
+            }
+        }
+    }
+
+    /// Verifies that a transaction is authenticated, validating Groth16 ZK proofs for keyless accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the signature does not verify, or if the ZK proof is invalid or malformed.
+    pub fn authenticate_with_groth16(
+        &self,
+        verifier: &crate::groth16::Bn254Groth16Verifier,
+        public_inputs: &[ark_bn254::Fr],
+    ) -> Result<(), AuthError> {
+        match &self.authenticator {
+            Authenticator::Keyless {
+                ephemeral_public_key,
+                signature,
+                zk_proof,
+            } => {
+                let key = VerifyingKey::from_bytes(ephemeral_public_key)
+                    .map_err(|_| AuthError::MalformedKey)?;
+                let sig = Signature::from_bytes(signature);
+                key.verify(self.signing_digest().as_bytes(), &sig)
+                    .map_err(|_| AuthError::BadSignature)?;
+
+                if zk_proof.is_empty() {
+                    return Err(AuthError::KeylessNotImplemented);
+                }
+
+                let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
+                    .map_err(|_| AuthError::InvalidZkProof)?;
+                verifier
+                    .verify_raw(&proof, public_inputs)
+                    .map_err(|_| AuthError::InvalidZkProof)?;
+                Ok(())
+            }
+            Authenticator::Ed25519 { .. } => self.authenticate(),
         }
     }
 }
@@ -263,4 +325,7 @@ pub enum AuthError {
              rather than accepted unchecked"
     )]
     KeylessNotImplemented,
+    /// The zero-knowledge proof did not verify against the public inputs.
+    #[error("zero-knowledge proof does not verify")]
+    InvalidZkProof,
 }

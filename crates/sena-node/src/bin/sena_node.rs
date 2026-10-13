@@ -127,6 +127,14 @@ enum Query {
         /// The transaction hash.
         hash: String,
     },
+    /// Fetch and verify an account proof (ultralight mobile verification).
+    Proof {
+        /// The address to read.
+        address: String,
+        /// Target block height (defaults to current state).
+        #[arg(long)]
+        height: Option<u64>,
+    },
 }
 
 fn main() {
@@ -394,6 +402,15 @@ fn query(rpc: &str, what: &Query) -> Result<(), String> {
         }
         Query::Confirmation { hash } => {
             serde_json::json!({ "method": "sena_getConfirmation", "params": { "hash": hash } })
+        }
+        Query::Proof { address, height } => {
+            let parsed =
+                L2Address::from_hex(address.trim()).map_err(|e| format!("bad address: {e}"))?;
+            let mut params = serde_json::json!({ "address": parsed });
+            if let Some(h) = height {
+                params["height"] = serde_json::json!(h);
+            }
+            serde_json::json!({ "method": "sena_getAccountProof", "params": params })
         }
     };
     let response = call(rpc, &body)?;

@@ -230,8 +230,21 @@ fn a_node_serves_rpc_and_seals_blocks() {
         }
     }
 
-    let elapsed = node.wait_for_height(1);
-    println!("block 1 sealed in {elapsed:?}");
+    // Wait until all 5 transactions are sealed into blocks.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Response::Account { nonce, .. } = call(
+            &node.endpoint,
+            &Request::GetAccount {
+                address: address_of(&alice),
+            },
+        ) {
+            if nonce >= 5 {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 
     match call(&node.endpoint, &Request::GetAccount { address: bob }) {
         Response::Account { balances, .. } => assert_eq!(balances, vec![(1, 5_000)]),
@@ -618,4 +631,113 @@ fn a_withdrawal_proof_is_refused_before_anything_finalizes() {
         }
         other => panic!("a proof was produced with nothing finalized: {other:?}"),
     }
+}
+
+#[test]
+fn ultralight_mobile_client_verifies_account_proof_over_http() {
+    use sena_light_client::{AccountProofPayload, LightClient};
+
+    let alice = signer(15);
+    let bob = signer(16);
+    let config = dev_genesis(&alice);
+    let node = TestNode::start(&config, temp_dir("light_client"));
+
+    // Send 10,000 USDC to Bob
+    let transfer = signed(&alice, 0, address_of(&bob), 10_000);
+    match call(
+        &node.endpoint,
+        &Request::SubmitTransaction(Box::new(transfer)),
+    ) {
+        Response::Submitted { confirmation, .. } => {
+            assert_eq!(confirmation, sena_node::Confirmation::Pending);
+        }
+        other => panic!("transfer rejected: {other:?}"),
+    }
+
+    // Wait until block 1 is sealed
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Response::ChainInfo { height, .. } = call(&node.endpoint, &Request::GetChainInfo) {
+            if height >= 1 {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Get chain info to obtain the latest state root
+    let state_root = match call(&node.endpoint, &Request::GetChainInfo) {
+        Response::ChainInfo { state_root, .. } => state_root,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // Mobile client requests cryptographic proof for Bob's account
+    let proof_response = call(
+        &node.endpoint,
+        &Request::GetAccountProof {
+            address: address_of(&bob),
+            height: None,
+        },
+    );
+
+    let (address, height, nonce, balances, siblings, terminal, finalized) = match proof_response {
+        Response::AccountProof {
+            address,
+            height,
+            state_root: proof_root,
+            nonce,
+            balances,
+            siblings,
+            terminal,
+            finalized,
+        } => {
+            assert_eq!(proof_root, state_root);
+            (
+                address, height, nonce, balances, siblings, terminal, finalized,
+            )
+        }
+        other => panic!("expected AccountProof response, got {other:?}"),
+    };
+
+    // The mobile light client configures its trusted root
+    let mut client = LightClient::new("sena-devnet-1", state_root);
+    client.set_soft_root(Some(state_root));
+
+    let payload = AccountProofPayload {
+        address,
+        height,
+        state_root,
+        nonce,
+        balances: balances.clone(),
+        siblings: siblings.clone(),
+        terminal: terminal.clone(),
+        finalized,
+    };
+
+    // 1. Mobile client verifies the authentic proof in <1ms
+    let verified = client
+        .verify_account_proof(&payload)
+        .expect("mobile light client must successfully verify authentic proof");
+
+    assert_eq!(verified.address, address_of(&bob));
+    assert_eq!(verified.balance(USDC), 10_000);
+
+    // 2. Tampered balance test: if a malicious node lies and claims Bob has 999,999 USDC
+    let mut forged_balances = balances;
+    forged_balances[0].1 = 999_999;
+    let forged_payload = AccountProofPayload {
+        address,
+        height,
+        state_root,
+        nonce,
+        balances: forged_balances,
+        siblings,
+        terminal,
+        finalized,
+    };
+
+    assert!(
+        client.verify_account_proof(&forged_payload).is_err(),
+        "mobile client must reject forged balance"
+    );
 }

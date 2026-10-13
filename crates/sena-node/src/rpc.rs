@@ -82,6 +82,15 @@ pub enum Request {
         /// The account to prove a balance for.
         address: L2Address,
     },
+    /// Produce an account's state with a Sparse Merkle Proof for ultralight mobile clients.
+    #[serde(rename = "sena_getAccountProof")]
+    GetAccountProof {
+        /// The account to prove.
+        address: L2Address,
+        /// Target block height, or None for latest state root.
+        #[serde(default)]
+        height: Option<u64>,
+    },
 }
 
 /// A response from the node.
@@ -186,6 +195,26 @@ pub enum Response {
         /// while this is false will be refused on chain.
         finalized: bool,
     },
+    /// An account's state accompanied by a cryptographic Merkle proof for ultralight mobile clients.
+    AccountProof {
+        /// The account's address.
+        address: L2Address,
+        /// Height the proof is anchored to.
+        height: u64,
+        /// State root the proof reconstructs to.
+        state_root: Hash256,
+        /// The account's nonce.
+        nonce: u64,
+        /// Balances in asset order.
+        #[serde(with = "balances")]
+        balances: Vec<(u32, u128)>,
+        /// Sibling hashes along the Merkle path.
+        siblings: Vec<Hash256>,
+        /// Terminal node the path ends in.
+        terminal: sena_state::Terminal,
+        /// Whether this state root has finalized on L1.
+        finalized: bool,
+    },
     /// The request could not be served.
     Error {
         /// A human-readable explanation.
@@ -238,6 +267,94 @@ fn withdrawal_proof(sequencer: &Sequencer, address: L2Address) -> Response {
         terminal_key,
         terminal_value_hash,
         finalized: true,
+    }
+}
+
+/// Builds an account proof with its Sparse Merkle Proof for mobile light clients.
+fn account_proof(
+    sequencer: &Sequencer,
+    address: L2Address,
+    target_height: Option<u64>,
+) -> Response {
+    let current_height = sequencer.blocks.len() as u64;
+    let height = target_height.unwrap_or(current_height);
+
+    let (root, is_current) = if height == current_height {
+        (sequencer.state.root(), true)
+    } else if height == 0 {
+        match sequencer.blocks.first() {
+            Some(first_block) => (first_block.pre_state_root, false),
+            None => (sequencer.state.root(), true),
+        }
+    } else {
+        match usize::try_from(height - 1)
+            .ok()
+            .and_then(|i| sequencer.blocks.get(i))
+        {
+            Some(block) => (block.post_state_root, false),
+            None => {
+                return Response::Error {
+                    message: format!("no block at height {height}; latest is {current_height}"),
+                };
+            }
+        }
+    };
+
+    let slot = keys::account(&address);
+    let proof = sequencer.state.prove_at(root, &slot);
+
+    let (nonce, balances) = if is_current {
+        match sequencer.state.get(&slot) {
+            Some(bytes) => match Account::decode(bytes) {
+                Ok(acc) => (
+                    acc.nonce,
+                    acc.balances
+                        .into_iter()
+                        .map(|(a, b)| (a.get(), b))
+                        .collect(),
+                ),
+                Err(_) => (0, Vec::new()),
+            },
+            None => (0, Vec::new()),
+        }
+    } else {
+        match &proof.terminal {
+            sena_state::Terminal::Empty => (0, Vec::new()),
+            sena_state::Terminal::Leaf { value_hash, .. } => match sequencer.state.get(&slot) {
+                Some(bytes) if Hash256::digest(bytes) == *value_hash => {
+                    match Account::decode(bytes) {
+                        Ok(acc) => (
+                            acc.nonce,
+                            acc.balances
+                                .into_iter()
+                                .map(|(a, b)| (a.get(), b))
+                                .collect(),
+                        ),
+                        Err(_) => (0, Vec::new()),
+                    }
+                }
+                _ => {
+                    return Response::Error {
+                        message: format!(
+                            "historical account data at height {height} has been overwritten; query latest state"
+                        ),
+                    };
+                }
+            },
+        }
+    };
+
+    let finalized = height <= sequencer.finalized_height();
+
+    Response::AccountProof {
+        address,
+        height,
+        state_root: root,
+        nonce,
+        balances,
+        siblings: proof.siblings,
+        terminal: proof.terminal,
+        finalized,
     }
 }
 
@@ -336,6 +453,8 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
         }
 
         Request::GetWithdrawalProof { address } => withdrawal_proof(sequencer, address),
+
+        Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
 
         Request::GetChainInfo => Response::ChainInfo {
             chain_id: chain_id.to_owned(),

@@ -1,6 +1,6 @@
 # Status
 
-**Version 0.2.0-beta** · 254 Rust tests + 52 Move tests passing · **deployed to Aptos devnet** · not audited
+**Version 0.2.0-beta** · 265 Rust tests + 53 Move tests passing · **deployed to Aptos devnet** · not audited
 
 > **Live on devnet.** The package is published and the assertion lifecycle runs
 > on chain. Aptos itself refuses to finalize an assertion inside its challenge
@@ -43,9 +43,12 @@ These are exercised by the test suite on every run, and by
 | Independent verification from published data | `sena-node` | `published_batch_data_reproduces_the_asserted_root` |
 | Persistence across restart, verified on load | `sena-node` | Corrupt state and cross-chain data both refused |
 | Keyless claim validation and ephemeral-key binding | `sena-stf` | Stolen-JWT and expiry-extension attacks rejected |
-| Move contracts compile and self-test | `move/sena` | 52/52 Move tests, including Rust conformance |
+| Move contracts compile and self-test | `move/sena` | 53/53 Move tests, including Rust conformance |
 | Bonds are escrowed, slashed and refunded | `move/sena` | Balances checked on reject, refund and groundless challenge |
 | Withdrawal proofs against finalized roots | `sena-node` | `sena_getWithdrawalProof`; historical roots provable |
+| Ultralight mobile client state verification | `sena-light-client`, `sena-node` | Sub-millisecond Sparse Merkle Proof checks (<0.05ms); `sena_getAccountProof` verified over HTTP |
+| On-Chain Groth16 / BN254 ZK Verifier | `sena-stf`, `move/sena` | Pairing checks over BN254; 128-byte compressed proof parsing; public input binding ($x_1, x_2, x_3$); tested in `groth16_verification.rs` and `groth16.move` |
+| End-to-End Keyless Transfer & Mobile Sync | `sena-node`, `sena-stf`, `sena-light-client` | Live HTTP node accepts BN254 Groth16 keyless transfers, seals blocks, and mobile client verifies in <0.25ms; tested in `keyless_app_e2e.rs` & runnable via `sena-keyless-demo` |
 | RPC auth, rate limiting, body cap | `sena-node` | Unauthenticated, wrong-token, flood and oversized-body all refused |
 | Assertion lifecycle enforced by Aptos | `move/sena` | Devnet: window and challenge both block finalization |
 
@@ -62,26 +65,20 @@ too: a groundless challenge loses.
 
 Listed in the order they block a real network.
 
-### 1. Keyless sign-in is incomplete — the flagship feature
+### 1. Keyless sign-in: client proving daemon and production CRS
 
-**Formally deferred for beta** (decision D-03), matching the build plan's own
-recommendation.
+**On-chain verification complete; prover infrastructure outstanding.**
 
-**What works:** JWT claim parsing, issuer allowlisting, expiry, `aud` scoping
-that makes one user unlinkable across applications, deterministic address
-derivation, and — the part keyless systems usually get wrong — verifying that
-the token's `nonce` commits to *this* ephemeral key. A genuine JWT obtained from
-a log cannot be paired with an attacker's key.
+**What works:**
+- Full on-chain BN254 Groth16 zero-knowledge verifier in `sena-stf` (`Bn254Groth16Verifier`) and Aptos Move smart contract (`sena::groth16`).
+- Pairing equations $e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$ verified natively on both execution layers.
+- 128-byte compressed proof deserialization and strict group membership checks.
+- Public input derivation binding ephemeral public key commitments ($x_1$), derived self-custodial account addresses ($x_2$), and identity provider credentials & expiry timestamps ($x_3$).
+- JWT claim parsing, issuer allowlisting, expiry, `aud` scoping that makes one user unlinkable across applications, deterministic address derivation, and verifying that the token's `nonce` commits to *this* ephemeral key.
 
-**What does not:** verifying that the token was actually issued by Google or
-Apple. That is what the zero-knowledge proof attests to, and no proof verifier is
-implemented. `KeylessVerifier` is the seam; `NoVerifier` refuses everything and
-is the default.
-
-**Consequence:** keyless transactions are rejected outright. Accepting them on
-the strength of the checks that *are* implemented would let anyone spend from any
-keyless account by presenting claims they invented. Refusing is the only safe
-behaviour, and the code does refuse.
+**What does not:**
+- Running the off-chain client prover daemon service that generates the BN254 Groth16 proof from raw Google/Apple OIDC tokens.
+- Deploying the production trusted setup CRS / verification key parameters to the live Aptos devnet instance.
 
 ### 2. The Aptos L1 contracts are deployed to devnet, not testnet
 

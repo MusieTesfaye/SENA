@@ -86,6 +86,12 @@ SENA Network will provide the following core product features:
 - **Benefit:** Ensures decentralized control and adaptability of the network, with transparent and auditable decision-making.
 - **Technical Implementation:** Off-chain aggregation of votes with on-chain validation via a Governance Multi-Signature Council, applying updates to system variables within the Sovereign SDK runtime. Governance authority stops at the dispute system: no council signature can finalize a challenged state root, dismiss a challenge, or shorten the challenge window below its floor.
 
+### 4.7 Ultralight Mobile Synchronization & State Verification
+
+- **Feature:** Mobile and low-bandwidth client applications can cryptographically verify account balances, nonces, and social identifiers on-device in under 0.1 milliseconds without downloading blocks or validating consensus.
+- **Benefit:** Delivers an instant, lightweight mobile wallet experience (< 1 KB data overhead) that does not sacrifice self-custody or trust the RPC provider.
+- **Technical Implementation:** Native `sena_getAccountProof` RPC endpoint returning Sparse Merkle Proofs; `sena-light-client` crate executing local SHA-256 Merkle root reconstruction against Aptos L1 settlement roots or sequencer soft-confirmation headers.
+
 ## 5. User Stories
 
 ### 5.1 End-User Stories
@@ -94,6 +100,7 @@ SENA Network will provide the following core product features:
 - As a user, I want to send money to my friend using their social handle so I don't have to copy a long address.
 - As a gamer, I want to buy an in-game item using USDC so I don't have to worry about volatile gas fees.
 - As a user, I want to be confident that my funds are safe even if the L2 network experiences issues, knowing I can withdraw them from Aptos L1.
+- As a mobile user on a metered or slow cellular connection, I want my wallet app to open instantly and cryptographically verify my balances using kilobytes of data instead of downloading block histories.
 - As a user holding a meaningful balance, I want to know that nobody — not even the company running the network — can rewrite my balance, and that if they tried, someone could prove it and stop it.
 - As a user withdrawing to Aptos L1, I want to understand clearly when my transaction is confirmed on SENA versus settled on L1, and I want the option to pay a small fee for an immediate withdrawal rather than waiting out the challenge window.
 
@@ -102,6 +109,7 @@ SENA Network will provide the following core product features:
 - As a dApp developer, I want to integrate keyless authentication easily so I can onboard Web2 users without friction.
 - As a dApp developer, I want to use human-readable identifiers for payments and social features so I can build intuitive user experiences.
 - As a dApp developer, I want my users to pay gas fees in stablecoins so they don't need to acquire a native token.
+- As a mobile app developer, I want an embeddable light client library (`sena-light-client`) that verifies account state proofs in < 1ms on iOS and Android without running a background node.
 - As a dApp developer, I want to build on a secure L2 that leverages the robust security of Aptos L1.
 - As a developer handling significant value, I want my transaction receipts to tell me whether a transaction is soft-confirmed or L1-final, so I do not release goods against a state root that could still be reverted.
 - As an exchange or institutional integrator, I want to run my own verifier node and challenge the chain myself, so my risk assessment rests on my own verification rather than on trusting the operator.

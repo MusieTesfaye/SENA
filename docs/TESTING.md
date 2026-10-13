@@ -22,7 +22,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-248 tests. The ones worth reading rather than just running:
+265 tests. The ones worth reading rather than just running:
+
+```sh
+cargo test -p sena-stf --test groth16_verification
+```
+
+`test_groth16_bn254_verifier_soundness` and `test_transaction_keyless_authentication_with_groth16`
+verify the on-chain BN254 Groth16 pairing check $e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$,
+confirming that forged EPK nonces, tampered sender addresses, or manipulated transaction payloads
+are mathematically rejected.
 
 ```sh
 cargo test -p sena-fraudproof --test dispute -- --nocapture
@@ -40,6 +49,14 @@ cargo test -p sena-state --test trie_properties
 `root_is_history_independent` replays arbitrary insert/delete sequences and
 checks the root depends only on the final key set. Two honest nodes reaching the
 same state by different routes must agree, or they would dispute each other.
+
+```sh
+cargo test -p sena-light-client
+```
+
+`mobile_verification_performance_is_sub_millisecond` checks that Sparse Merkle
+Proof verification runs in < 0.1ms and rejects any forged balance or altered
+nonce.
 
 ## 2. The demo
 
@@ -94,7 +111,7 @@ Requires Aptos CLI **7.9.0** specifically — see [`../move/README.md`](../move/
 aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 ```
 
-45 tests. Two groups matter:
+52 tests. Two groups matter:
 
 - **Conformance** — `codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust`,
   `osp::machine_commitment_matches_rust` compute values in Move and compare them

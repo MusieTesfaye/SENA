@@ -7,7 +7,7 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="tests" src="https://img.shields.io/badge/tests-248%20rust%20%2B%2045%20move-brightgreen">
+<img alt="tests" src="https://img.shields.io/badge/tests-260%20rust%20%2B%2052%20move-brightgreen">
 <img alt="devnet" src="https://img.shields.io/badge/aptos-devnet%20deployed-blue">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
@@ -51,7 +51,20 @@ Three scenarios, run against the real implementation with no mocks:
 3. A withdrawal is refused against a pending state root and honoured once the
    challenge window has elapsed.
 
-### 2. Run your own devnet
+### 2. See the Keyless & Mobile Sync flow end-to-end
+
+```sh
+cargo run --release --bin sena-keyless-demo
+```
+
+Simulates an entire Web2-to-Web3 payment workflow live:
+1. **Google OIDC Login:** Alice and Bob log in via Google OIDC to derive self-custodial `L2Address`es.
+2. **On-Device ZK Prover:** Alice's client generates a fresh ephemeral keypair (EPK) and computes a 128-byte BN254 Groth16 zero-knowledge proof binding the EPK to her identity.
+3. **Live HTTP Submission:** Alice transfers 0.50 USDC to Bob over real HTTP JSON-RPC to a live `sena-node`.
+4. **Mempool Verification & Block Production:** Sequencer admits the transaction via Groth16 verification, executes it, and seals block 1.
+5. **Ultralight Mobile Verification:** Bob's mobile wallet performs ultralight sync via Sparse Merkle Proof verification in **< 0.25 ms** with zero trust in the RPC node.
+
+### 3. Run your own devnet
 
 ```sh
 # A keypair to play with. Note the secret and the address.
@@ -87,6 +100,9 @@ RPC=http://127.0.0.1:8545
 # Blocks seal every 2 seconds by default.
 ./target/release/sena-node query --rpc $RPC account 0x1111...1111
 ./target/release/sena-node query --rpc $RPC block 1
+
+# Cryptographic Sparse Merkle Proof for ultralight mobile verification (< 1ms).
+./target/release/sena-node query --rpc $RPC proof 0x1111...1111
 ```
 
 Or straight over HTTP:
@@ -197,10 +213,33 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 |---|---|
 | [`sena-primitives`](crates/sena-primitives) | Hashes, OIDC address derivation, identifier hashing, canonical codec |
 | [`sena-state`](crates/sena-state) | Sparse Merkle trie, inclusion and non-inclusion proofs |
-| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless, execution traces |
+| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless (Groth16 / BN254 ZK verifier), execution traces |
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
 | [`sena-node`](crates/sena-node) | Mempool, block production, RPC, verifier mode, CLI |
-| [`move/sena`](move/sena) | Aptos L1 contracts — **deployed to devnet**, 45/45 tests, see [`move/README.md`](move/README.md) |
+| [`sena-light-client`](crates/sena-light-client) | Ultralight mobile verification: sub-millisecond Sparse Merkle Proof checks |
+| [`move/sena`](move/sena) | Aptos L1 contracts — **deployed to devnet**, 53/53 tests, see [`move/README.md`](move/README.md) |
+
+## Keyless ZK Architecture & Light Client
+
+SENA brings seedless Web2 onboarding to Layer 2 by implementing zero-knowledge OpenID Connect authentication aligned with Aptos Keyless (AIP-61):
+
+### 1. `sena-light-client` (Ultralight Mobile Verifier)
+- **Zero-History Sync**: Mobile clients do not need to download or process blocks.
+- **Cryptographic Verification**: Verifies account balances, nonces, and state inclusion in **< 0.25 ms** using Sparse Merkle Tree (SMT) sibling proofs.
+- **Dual Confirmation Levels**:
+  - `SoftConfirmed`: Sequencer-attested state root (sub-second execution).
+  - `Finalized`: State root anchored to Aptos L1 after expiration of the fraud challenge window.
+
+### 2. `sena-stf::groth16` (BN254 Zero-Knowledge Verifier)
+- Verifies 128-byte compressed Groth16 zero-knowledge proofs ($A \in G_1, B \in G_2, C \in G_1$) over the BN254 elliptic curve using Arkworks.
+- Cryptographically binds Ephemeral Public Keys (EPKs) to Google/Apple OIDC identities without exposing JWT tokens or user salts.
+- Fully compatible with `move/sena/sources/groth16.move` for on-chain settlement and bisection dispute resolution on Aptos L1.
+
+### 3. Keyless JSON-RPC API
+The `sena-node` daemon exposes native RPC methods for keyless wallet clients:
+- `sena_getAccountProof(address)`: Serves Sparse Merkle Proofs for instant client-side verification.
+- `sena_submitTransaction`: Accepts keyless payload authenticators containing EPK signatures and Groth16 proofs.
+- `sena_getChainInfo`: Returns current sequencer block height, Aptos L1 finalized height, and state root.
 
 ## Determinism is a security property
 
@@ -220,7 +259,7 @@ processes and diffs the results.
 See [`docs/TESTING.md`](docs/TESTING.md) for what each layer actually proves.
 
 ```sh
-cargo test --workspace                                    # 248 tests
+cargo test --workspace                                    # 265 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

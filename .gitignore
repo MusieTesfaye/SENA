@@ -5,3 +5,5 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 /move/**/build/
+/test-devnet/
+/frontend/

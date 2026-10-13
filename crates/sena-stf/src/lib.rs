@@ -39,6 +39,7 @@ pub mod account;
 pub mod execute;
 pub mod gas;
 pub mod governance;
+pub mod groth16;
 pub mod instruction;
 pub mod keyless;
 pub mod keys;
@@ -52,6 +53,7 @@ pub use execute::{
 };
 pub use gas::{GasError, WhitelistedAsset, RATE_SCALE};
 pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
+pub use groth16::{derive_keyless_public_inputs, hash_to_fr, Bn254Groth16Verifier, Bn254Proof};
 pub use instruction::{Instruction, MachineState};
 pub use keyless::{KeylessAuth, KeylessError, KeylessPolicy, KeylessVerifier, NoVerifier};
 pub use social::{MalformedBinding, SocialBinding};
