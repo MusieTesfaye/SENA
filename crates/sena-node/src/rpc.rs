@@ -91,6 +91,12 @@ pub enum Request {
         #[serde(default)]
         height: Option<u64>,
     },
+    /// Fetch canonical DA blob for a block (REQ-FRAUD-007, REQ-FRAUD-008).
+    #[serde(rename = "sena_getDaBlob")]
+    GetDaBlob {
+        /// Target block height.
+        height: u64,
+    },
 }
 
 /// A response from the node.
@@ -219,6 +225,11 @@ pub enum Response {
     Error {
         /// A human-readable explanation.
         message: String,
+    },
+    /// A canonical DA blob response.
+    DaBlob {
+        /// The DA blob.
+        blob: crate::da::DaBlob,
     },
 }
 
@@ -455,6 +466,26 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
         Request::GetWithdrawalProof { address } => withdrawal_proof(sequencer, address),
 
         Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
+
+        Request::GetDaBlob { height } => {
+            match usize::try_from(height.saturating_sub(1))
+                .ok()
+                .and_then(|i| sequencer.blocks.get(i))
+            {
+                None => Response::Error {
+                    message: format!("no block at height {height}"),
+                },
+                Some(block) => {
+                    let blob = crate::da::DaBlob::new(
+                        block.height,
+                        block.pre_state_root,
+                        block.post_state_root,
+                        block.transactions.clone(),
+                    );
+                    Response::DaBlob { blob }
+                }
+            }
+        }
 
         Request::GetChainInfo => Response::ChainInfo {
             chain_id: chain_id.to_owned(),

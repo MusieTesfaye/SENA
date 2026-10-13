@@ -30,6 +30,18 @@ module sena::osp {
     const E_UNSUPPORTED_INSTRUCTION: u64 = 26;
     /// The proof did not describe the state both parties agreed on.
     const E_PRE_STATE_MISMATCH: u64 = 27;
+    /// The gas asset was not whitelisted.
+    const E_ASSET_NOT_WHITELISTED: u64 = 28;
+    /// The gas asset is disabled.
+    const E_ASSET_DISABLED: u64 = 29;
+    /// The gas rate declared by the transaction does not match on-chain state.
+    const E_GAS_RATE_MISMATCH: u64 = 30;
+    /// A gas asset rate of zero is invalid.
+    const E_INVALID_ASSET_RATE: u64 = 31;
+    /// The parameter name is not in the governance allowlist.
+    const E_PARAMETER_NOT_ALLOWLISTED: u64 = 32;
+    /// The council record was malformed or missing.
+    const E_MALFORMED_COUNCIL: u64 = 33;
 
     // Instruction discriminants, matching the Rust `Instruction` enum order.
     const OP_CONSUME_NONCE: u8 = 0;
@@ -37,6 +49,10 @@ module sena::osp {
     const OP_CREDIT: u8 = 2;
     const OP_BIND_IDENTIFIER: u8 = 3;
     const OP_UNBIND_IDENTIFIER: u8 = 4;
+    const OP_VERIFY_GAS_ASSET: u8 = 5;
+    const OP_VERIFY_COUNCIL: u8 = 6;
+    const OP_SET_GAS_ASSET: u8 = 7;
+    const OP_SET_PARAMETER: u8 = 8;
 
     const TAG_BOUND: u8 = 0;
     const TAG_VACANT: u8 = 1;
@@ -264,10 +280,48 @@ module sena::osp {
             let out = vector::empty<u8>();
             vector::push_back(&mut out, TAG_VACANT);
             out
+        } else if (instruction.op == OP_VERIFY_GAS_ASSET) {
+            assert!(present, E_ASSET_NOT_WHITELISTED);
+            let r = codec::reader(current);
+            let _asset = codec::take_u32(&mut r);
+            let _symbol = codec::take_field(&mut r);
+            let rate = codec::take_u128(&mut r);
+            let enabled = codec::take_bool(&mut r);
+            codec::finish(&r);
+            assert!(enabled, E_ASSET_DISABLED);
+            assert!(rate == instruction.amount, E_GAS_RATE_MISMATCH);
+            current
+        } else if (instruction.op == OP_SET_GAS_ASSET) {
+            assert!(instruction.amount > 0, E_INVALID_ASSET_RATE);
+            let out = vector::empty<u8>();
+            codec::put_u32(&mut out, instruction.asset);
+            codec::put_field(&mut out, instruction.subject);
+            codec::put_u128(&mut out, instruction.amount);
+            vector::push_back(&mut out, 1);
+            out
+        } else if (instruction.op == OP_SET_PARAMETER) {
+            assert!(
+                instruction.subject == b"gas.base_native" || instruction.subject == b"batch.max_transactions",
+                E_PARAMETER_NOT_ALLOWLISTED
+            );
+            let out = vector::empty<u8>();
+            codec::put_u128(&mut out, instruction.amount);
+            out
+        } else if (instruction.op == OP_VERIFY_COUNCIL) {
+            assert!(present, E_MALFORMED_COUNCIL);
+            let r = codec::reader(current);
+            let count = codec::take_u32(&mut r);
+            let i = 0;
+            while (i < count) {
+                let _member = codec::take_bytes(&mut r, 32);
+                i = i + 1;
+            };
+            let threshold = codec::take_u32(&mut r);
+            codec::finish(&r);
+            assert!(threshold > 0 && count >= threshold, E_MALFORMED_COUNCIL);
+            assert!((instruction.amount as u32) >= threshold, E_MALFORMED_COUNCIL);
+            current
         } else {
-            // VerifyGasAsset and VerifyCouncil are not yet adjudicable here.
-            // They are rejected outright rather than approximated, because a
-            // verifier that guesses is worse than one that declines.
             abort E_UNSUPPORTED_INSTRUCTION
         }
     }
@@ -340,6 +394,10 @@ module sena::osp {
     public fun op_credit(): u8 { OP_CREDIT }
     public fun op_bind_identifier(): u8 { OP_BIND_IDENTIFIER }
     public fun op_unbind_identifier(): u8 { OP_UNBIND_IDENTIFIER }
+    public fun op_verify_gas_asset(): u8 { OP_VERIFY_GAS_ASSET }
+    public fun op_verify_council(): u8 { OP_VERIFY_COUNCIL }
+    public fun op_set_gas_asset(): u8 { OP_SET_GAS_ASSET }
+    public fun op_set_parameter(): u8 { OP_SET_PARAMETER }
 
     // --- Conformance tests ---------------------------------------------------
 
@@ -475,5 +533,50 @@ module sena::osp {
     fun an_unsupported_instruction_is_refused_rather_than_guessed() {
         let instr = instruction(99, vector::empty(), 0, 0, 0);
         transition(&instr, false, vector::empty());
+    }
+
+    #[test]
+    fun gas_asset_and_governance_steps_execute() {
+        // 1. SetGasAsset
+        let set_gas = instruction(OP_SET_GAS_ASSET, b"USDC", 1, 1000000, 0);
+        let gas_slot = transition(&set_gas, false, vector::empty());
+        assert!(vector::length(&gas_slot) > 0, 0);
+
+        // 2. VerifyGasAsset matches claimed rate 1000000
+        let verify_gas = instruction(OP_VERIFY_GAS_ASSET, vector::empty(), 1, 1000000, 0);
+        let verified_gas = transition(&verify_gas, true, gas_slot);
+        assert!(verified_gas == gas_slot, 1);
+
+        // 3. SetParameter allowlisted parameter "gas.base_native"
+        let set_param = instruction(OP_SET_PARAMETER, b"gas.base_native", 0, 1000, 0);
+        let param_slot = transition(&set_param, false, vector::empty());
+        assert!(vector::length(&param_slot) == 16, 2);
+
+        // 4. VerifyCouncil
+        let council_buf = vector::empty<u8>();
+        codec::put_u32(&mut council_buf, 2); // 2 members
+        let i = 0;
+        while (i < 64) {
+            vector::push_back(&mut council_buf, 0x01);
+            i = i + 1;
+        };
+        codec::put_u32(&mut council_buf, 2); // threshold = 2
+        let verify_council = instruction(OP_VERIFY_COUNCIL, x"5555555555555555555555555555555555555555555555555555555555555555", 0, 2, 0);
+        let verified_council = transition(&verify_council, true, council_buf);
+        assert!(verified_council == council_buf, 3);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = E_PARAMETER_NOT_ALLOWLISTED)]
+    fun unallowed_parameter_aborts() {
+        let set_param = instruction(OP_SET_PARAMETER, b"arbitrary.parameter", 0, 1000, 0);
+        transition(&set_param, false, vector::empty());
+    }
+
+    #[test]
+    #[expected_failure(abort_code = E_INVALID_ASSET_RATE)]
+    fun zero_rate_gas_asset_aborts() {
+        let set_gas = instruction(OP_SET_GAS_ASSET, b"USDC", 1, 0, 0);
+        transition(&set_gas, false, vector::empty());
     }
 }

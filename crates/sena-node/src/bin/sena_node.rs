@@ -106,6 +106,36 @@ enum Command {
         #[command(subcommand)]
         what: Query,
     },
+    /// Run the automated Aptos L1 Relayer daemon.
+    Relay {
+        /// L2 RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Aptos network (testnet, devnet, local).
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        /// Aptos REST endpoint.
+        #[arg(long, default_value = "https://api.testnet.aptoslabs.com/v1")]
+        aptos_rpc: String,
+        /// Deployed rollup contract address on Aptos.
+        #[arg(long, default_value = "0x1")]
+        contract: String,
+        /// Aptos CLI profile to use.
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Proposer address on Aptos L1.
+        #[arg(long, default_value = "0x1")]
+        proposer: String,
+        /// Bond per assertion in micro-units.
+        #[arg(long, default_value_t = 1_000_000)]
+        bond: u128,
+        /// Seconds between polling checks.
+        #[arg(long, default_value_t = 2)]
+        poll_interval: u64,
+        /// Dry run mode.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +204,33 @@ fn main() {
             asset,
         } => send(&rpc, &secret, &to, amount, nonce, asset),
         Command::Query { rpc, what } => query(&rpc, &what),
+        Command::Relay {
+            rpc,
+            network,
+            aptos_rpc,
+            contract,
+            profile,
+            proposer,
+            bond,
+            poll_interval,
+            dry_run,
+        } => {
+            let config = sena_node::RelayerConfig {
+                sena_rpc_url: rpc,
+                aptos_network: network,
+                aptos_rest_url: aptos_rpc,
+                contract_address: contract,
+                profile,
+                proposer_address: proposer,
+                bond_amount: bond,
+                poll_interval_secs: poll_interval,
+                auto_finalize: true,
+                dry_run,
+            };
+            let mut relayer = sena_node::AptosRelayer::new(config);
+            let running = Arc::new(AtomicBool::new(true));
+            relayer.run_daemon(running)
+        }
     };
 
     if let Err(message) = result {
