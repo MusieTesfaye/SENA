@@ -118,8 +118,11 @@ pub fn derive_keyless_public_inputs(auth: &KeylessAuth<'_>, claims: &JwtClaims) 
     let x1 = hash_to_fr(&epk_hash);
 
     // 2. Account address scalar
-    let address =
-        sena_primitives::L2Address::derive_from_oidc(&claims.aud, &claims.sub, auth.pepper);
+    let address = if claims.aud.is_empty() || claims.aud == "*" {
+        sena_primitives::L2Address::derive_from_oidc_unified(&claims.iss, &claims.sub, auth.pepper)
+    } else {
+        sena_primitives::L2Address::derive_from_oidc(&claims.aud, &claims.sub, auth.pepper)
+    };
     let x2 = Fr::from_be_bytes_mod_order(address.as_bytes());
 
     // 3. Provider & expiry scalar

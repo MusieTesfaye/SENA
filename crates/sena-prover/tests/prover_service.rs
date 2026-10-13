@@ -63,3 +63,71 @@ fn test_prover_witness_and_proof_generation() {
     println!("Direct prover.verify returned: {}", is_valid);
     assert!(is_valid, "Proof must verify successfully against public inputs");
 }
+
+#[test]
+fn test_universal_oidc_unified_address_derivation() {
+    let prover = KeylessProver::initialize_default().expect("Failed to initialize prover");
+
+    // Unified OIDC token (Microsoft / Discord / custom provider) with aud = "*" (no client_id lock-in)
+    let unified_jwt = "eyJhbGciOiJSUzI1NiIsImtpZCI6InNlbmFfdGVzdF9raWRfMDEifQ.eyJpc3MiOiJodHRwczovL2xvZ2luLm1pY3Jvc29mdG9ubGluZS5jb20vY29tbW9uL3YyLjAiLCJhdWQiOiIqIiwic3ViIjoibXMtYWRhbS05ODcyMyIsIm5vbmNlIjoiMHgwMSIsImV4cCI6MjAwMDAwMDAwMH0.signature_dummy";
+    let epk = [99u8; 32];
+    let pepper = b"adam_device_pepper_secret";
+
+    let result = prover
+        .prove(unified_jwt, &epk, pepper, 2_000_000_000)
+        .expect("Proving unified OIDC must succeed");
+
+    assert!(result.proof_hex.starts_with("0x"));
+    assert_eq!(result.proof_hex.len(), 258);
+    println!("Unified Address derived: {}", result.address);
+
+    let proof_bytes = hex::decode(&result.proof_hex[2..]).expect("Valid hex");
+    let is_valid = prover.verify(&proof_bytes, &result.public_inputs_field()).expect("Verification ok");
+    assert!(is_valid, "Unified OIDC proof must verify successfully");
+}
+
+#[test]
+fn test_celo_odis_social_connect_pipeline() {
+    use sena_primitives::Channel;
+    use sena_prover::{client_blind_identifier, client_unblind_identifier, OdisService};
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use ark_bn254::G1Affine;
+
+    let odis = OdisService::new_default();
+    let phone_number = "+1 (415) 555-2671";
+
+    // 1. Client blinds phone number with secret scalar r
+    let (blinded, r) = client_blind_identifier(Channel::Phone, phone_number);
+    let mut blinded_bytes = Vec::new();
+    blinded.serialize_compressed(&mut blinded_bytes).unwrap();
+
+    // 2. Server evaluates blinded point (server learns 0 bits about phone number)
+    let evaluated_bytes = odis.evaluate_blinded(&blinded_bytes).expect("ODIS evaluation must succeed");
+    let mut cursor = evaluated_bytes.as_slice();
+    let evaluated_point = G1Affine::deserialize_compressed(&mut cursor).unwrap();
+
+    // 3. Client unblinds evaluation
+    let (obfuscated_id_1, pepper_1) =
+        client_unblind_identifier(Channel::Phone, phone_number, &evaluated_point, &r).unwrap();
+
+    // 4. Repeat with independent random blinder r_2
+    let (blinded_2, r2) = client_blind_identifier(Channel::Phone, phone_number);
+    assert_ne!(blinded, blinded_2, "Blinded points must be unlinkable");
+
+    let mut blinded_bytes_2 = Vec::new();
+    blinded_2.serialize_compressed(&mut blinded_bytes_2).unwrap();
+    let evaluated_bytes_2 = odis.evaluate_blinded(&blinded_bytes_2).unwrap();
+    let mut cursor_2 = evaluated_bytes_2.as_slice();
+    let evaluated_point_2 = G1Affine::deserialize_compressed(&mut cursor_2).unwrap();
+
+    let (obfuscated_id_2, pepper_2) =
+        client_unblind_identifier(Channel::Phone, phone_number, &evaluated_point_2, &r2).unwrap();
+
+    // 5. Assert determinism: unblinded pepper and ObfuscatedIdentifier match 100%
+    assert_eq!(pepper_1, pepper_2, "Celo ODIS peppers must be deterministic");
+    assert_eq!(
+        obfuscated_id_1, obfuscated_id_2,
+        "Obfuscated identifiers must be identical across blinding sessions"
+    );
+    println!("Celo ODIS Obfuscated Identifier: {:?}", obfuscated_id_1);
+}

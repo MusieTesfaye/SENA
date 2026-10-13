@@ -9,6 +9,7 @@ use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Response, Server, StatusCode};
 
+use crate::odis::{OdisEvaluateRequest, OdisEvaluateResponse, OdisService};
 use crate::prover::KeylessProver;
 
 #[derive(Deserialize)]
@@ -38,10 +39,13 @@ struct HealthResponse {
     curve: &'static str,
     snark: &'static str,
     circuit: &'static str,
+    universal_oidc: bool,
+    social_connect: &'static str,
 }
 
 /// Runs the external Prover Service HTTP daemon on the specified port.
 pub fn run_prover_server(prover: Arc<KeylessProver>, listen_addr: &str) -> Result<(), String> {
+    let odis = Arc::new(OdisService::new_default());
     let server = Server::http(listen_addr)
         .map_err(|e| format!("Failed to bind Prover Service on {listen_addr}: {e}"))?;
 
@@ -49,6 +53,7 @@ pub fn run_prover_server(prover: Arc<KeylessProver>, listen_addr: &str) -> Resul
     println!("⚡ [SENA Prover Service] Endpoints:");
     println!("   POST http://{listen_addr}/api/v1/prove");
     println!("   POST http://{listen_addr}/api/v1/verify");
+    println!("   POST http://{listen_addr}/api/v1/odis/evaluate");
     println!("   GET  http://{listen_addr}/api/v1/health");
 
     for mut request in server.incoming_requests() {
@@ -78,6 +83,8 @@ pub fn run_prover_server(prover: Arc<KeylessProver>, listen_addr: &str) -> Resul
                     curve: "BN254 (alt_bn128)",
                     snark: "Groth16",
                     circuit: "JwtKeylessCircuit",
+                    universal_oidc: true,
+                    social_connect: "Celo-ODIS-tOPRF",
                 };
                 let body = serde_json::to_string(&health).unwrap_or_default();
                 let res = Response::from_string(body)
@@ -183,6 +190,51 @@ pub fn run_prover_server(prover: Arc<KeylessProver>, listen_addr: &str) -> Resul
                             .with_header(cors_origin)
                             .with_header(content_type);
                         let _ = request.respond(res);
+                    }
+                    Err(e) => {
+                        let body = format!(r#"{{"error":"Invalid JSON: {e}"}}"#);
+                        let res = Response::from_string(body)
+                            .with_status_code(StatusCode(400))
+                            .with_header(cors_origin)
+                            .with_header(content_type);
+                        let _ = request.respond(res);
+                    }
+                }
+            }
+
+            ("POST", "/api/v1/odis/evaluate") => {
+                let mut content = String::new();
+                let _ = request.as_reader().read_to_string(&mut content);
+
+                let parsed_req: Result<OdisEvaluateRequest, _> = serde_json::from_str(&content);
+                match parsed_req {
+                    Ok(req_data) => {
+                        let clean_hex = req_data.blinded_point_hex.trim_start_matches("0x");
+                        let blinded_bytes = hex::decode(clean_hex).unwrap_or_default();
+
+                        let start = Instant::now();
+                        match odis.evaluate_blinded(&blinded_bytes) {
+                            Ok(evaluated_bytes) => {
+                                let evaluation_time_us = start.elapsed().as_micros();
+                                let resp = OdisEvaluateResponse {
+                                    evaluated_point_hex: format!("0x{}", hex::encode(evaluated_bytes)),
+                                    evaluation_time_us,
+                                };
+                                let body = serde_json::to_string(&resp).unwrap_or_default();
+                                let res = Response::from_string(body)
+                                    .with_header(cors_origin)
+                                    .with_header(content_type);
+                                let _ = request.respond(res);
+                            }
+                            Err(e) => {
+                                let body = format!(r#"{{"error":"ODIS evaluation failed: {e}"}}"#);
+                                let res = Response::from_string(body)
+                                    .with_status_code(StatusCode(400))
+                                    .with_header(cors_origin)
+                                    .with_header(content_type);
+                                let _ = request.respond(res);
+                            }
+                        }
                     }
                     Err(e) => {
                         let body = format!(r#"{{"error":"Invalid JSON: {e}"}}"#);

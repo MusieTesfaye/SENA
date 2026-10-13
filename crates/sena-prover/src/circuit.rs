@@ -71,7 +71,11 @@ impl KeylessWitness {
         let claims = sena_stf::keyless::parse_claims_unverified(raw_jwt)
             .map_err(|e| format!("Invalid JWT claims: {e:?}"))?;
 
-        let derived_address = L2Address::derive_from_oidc(&claims.aud, &claims.sub, &pepper);
+        let derived_address = if claims.aud.is_empty() || claims.aud == "*" {
+            L2Address::derive_from_oidc_unified(&claims.iss, &claims.sub, &pepper)
+        } else {
+            L2Address::derive_from_oidc(&claims.aud, &claims.sub, &pepper)
+        };
 
         Ok(Self {
             epk,

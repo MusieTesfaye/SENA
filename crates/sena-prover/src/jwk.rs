@@ -89,14 +89,44 @@ impl JwkManager {
 
     /// Fetches live JWKs from Google and updates cache.
     pub fn refresh_google_jwks(&self) -> Result<usize, String> {
-        let resp = ureq::get(GOOGLE_CERTS_URL)
+        self.refresh_issuer_jwks("https://accounts.google.com")
+    }
+
+    /// Dynamically resolves and refreshes JWKs for any given OIDC issuer.
+    ///
+    /// Supports Google, Apple, Microsoft, Discord, Auth0, GitHub, Okta, and any
+    /// compliant OpenID Connect provider with a `/.well-known/openid-configuration`.
+    pub fn refresh_issuer_jwks(&self, issuer: &str) -> Result<usize, String> {
+        let jwks_url = match issuer {
+            "https://accounts.google.com" => GOOGLE_CERTS_URL.to_string(),
+            "https://appleid.apple.com" => "https://appleid.apple.com/auth/keys".to_string(),
+            iss if iss.contains("microsoftonline.com") => {
+                "https://login.microsoftonline.com/common/discovery/v2.0/keys".to_string()
+            }
+            iss => {
+                let config_url = format!("{}/.well-known/openid-configuration", iss.trim_end_matches('/'));
+                let resp = ureq::get(&config_url)
+                    .timeout(Duration::from_secs(3))
+                    .call()
+                    .map_err(|e| format!("Failed to fetch openid-configuration from {config_url}: {e}"))?;
+                let val: serde_json::Value = resp
+                    .into_json()
+                    .map_err(|e| format!("Invalid openid-configuration JSON: {e}"))?;
+                val["jwks_uri"]
+                    .as_str()
+                    .ok_or_else(|| "Missing jwks_uri in openid-configuration".to_string())?
+                    .to_string()
+            }
+        };
+
+        let resp = ureq::get(&jwks_url)
             .timeout(Duration::from_secs(3))
             .call()
-            .map_err(|e| format!("HTTP request to Google certs failed: {e}"))?;
+            .map_err(|e| format!("HTTP request to JWKS URL ({jwks_url}) failed: {e}"))?;
 
         let jwks: JwkSet = resp
             .into_json()
-            .map_err(|e| format!("Failed to parse Google JWKS JSON: {e}"))?;
+            .map_err(|e| format!("Failed to parse JWKS JSON: {e}"))?;
 
         let mut count = 0;
         if let Ok(mut cache) = self.cache.write() {
@@ -141,9 +171,9 @@ impl JwkManager {
         None
     }
 
-    /// Verifies the signature of a raw JWT against cached JWKs.
+    /// Verifies the signature of a raw JWT against cached or dynamically fetched JWKs.
     ///
-    /// Accepts RS256 signatures, returns Ok(()) on verification, or error on invalidity.
+    /// Accepts RS256 signatures, returns Ok(kid) on verification, or error on invalidity.
     pub fn verify_jwt_signature(&self, raw_jwt: &str) -> Result<String, String> {
         let parts: Vec<&str> = raw_jwt.split('.').collect();
         if parts.len() != 3 {
@@ -167,7 +197,17 @@ impl JwkManager {
             return Ok(kid);
         }
 
-        // Verify cryptographic RSA signature
+        // Extract issuer from payload
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|e| format!("Invalid base64 payload: {e}"))?;
+        let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| format!("Invalid JSON payload: {e}"))?;
+        let iss = payload_json["iss"]
+            .as_str()
+            .unwrap_or("https://accounts.google.com");
+
+        // Verify cryptographic RSA signature from cache
         if let Ok(cache) = self.cache.read() {
             if let Some((cached, _)) = cache.get(&kid) {
                 if let Some(vk) = &cached.verifying_key {
@@ -187,8 +227,8 @@ impl JwkManager {
             }
         }
 
-        // If not in cache, attempt single live refresh
-        if let Ok(_) = self.refresh_google_jwks() {
+        // If not in cache, attempt dynamic live refresh from the token's issuer
+        if let Ok(_) = self.refresh_issuer_jwks(iss) {
             if let Ok(cache) = self.cache.read() {
                 if let Some((cached, _)) = cache.get(&kid) {
                     if let Some(vk) = &cached.verifying_key {

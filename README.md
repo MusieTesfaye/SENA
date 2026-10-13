@@ -81,9 +81,10 @@ For production Keyless accounts, SENA features a high-performance Groth16 Prover
 
 #### External Prover Service REST API (Port 8090)
 
-- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), and circuit metadata.
-- **`POST /api/v1/prove`**: Generates a 128-byte Groth16 zero-knowledge proof binding a JWT identity to a client ephemeral keypair (EPK). Average proving time: **~19 ms**.
+- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), `universal_oidc: true`, and `social_connect: "Celo-ODIS-tOPRF"`.
+- **`POST /api/v1/prove`**: Generates a 128-byte Groth16 zero-knowledge proof binding any OIDC identity (Google, Apple, Microsoft, Discord, GitHub, Auth0) to a client ephemeral keypair (EPK). Supports **unified single-wallet address derivation** ($\text{iss} + \text{sub} + \text{pepper}$) without `client_id` lock-in. Average proving time: **~19 ms**.
 - **`POST /api/v1/verify`**: Verifies a 128-byte Groth16 proof against public statement inputs with cryptographic pairing checks over BN254.
+- **`POST /api/v1/odis/evaluate`**: **Celo-style ODIS Oblivious PRF (tOPRF)** service for SocialConnect. Evaluates blinded curve points ($B = r \cdot M$) so users can derive anti-enumeration `ObfuscatedIdentifier`s for phone numbers and emails without ever exposing plaintext contact details to the server.
 
 ### 4. Run your own devnet
 

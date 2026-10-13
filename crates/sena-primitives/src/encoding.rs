@@ -19,8 +19,12 @@
 pub mod domain {
     /// Derivation of an L2 address from OIDC claims (REQ-AUTH-002).
     pub const OIDC_ADDRESS: &[u8] = b"SENA:v1:oidc-address";
+    /// Derivation of a unified identity-scoped L2 address (Aptos Keyless model: iss + sub + pepper).
+    pub const OIDC_ADDRESS_UNIFIED: &[u8] = b"SENA:v1:oidc-address-unified";
     /// Hashing of a human-readable social identifier (REQ-SOCIAL-002).
     pub const SOCIAL_IDENTIFIER: &[u8] = b"SENA:v1:social-identifier";
+    /// Hashing of a social identifier using ODIS blinded pepper (Celo SocialConnect model).
+    pub const SOCIAL_ODIS: &[u8] = b"SENA:v1:social-odis";
     /// Interior node of the sparse Merkle trie.
     pub const TRIE_INTERNAL: &[u8] = b"SENA:v1:trie-internal";
     /// Leaf of the sparse Merkle trie.
