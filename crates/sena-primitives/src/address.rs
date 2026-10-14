@@ -51,21 +51,6 @@ impl L2Address {
         Self(digest.0)
     }
 
-    /// Derives a unified identity-scoped address across applications (Aptos Keyless model).
-    ///
-    /// Commits to `(iss, sub, pepper)` rather than application-scoped `aud`,
-    /// guaranteeing the user controls a single unified wallet across all dApps.
-    #[must_use]
-    pub fn derive_from_oidc_unified(iss: &str, sub: &str, pepper: &[u8]) -> Self {
-        let digest = Hash256::commit(
-            CanonicalEncoder::new(domain::OIDC_ADDRESS_UNIFIED)
-                .field(iss.as_bytes())
-                .field(sub.as_bytes())
-                .field(pepper),
-        );
-        Self(digest.0)
-    }
-
     /// Wraps raw address bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {

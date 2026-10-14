@@ -3,12 +3,12 @@
 //! Provides canonical serialization, cryptographic commitment, storage,
 //! and independent verification of rollup batches.
 
+use sena_primitives::Hash256;
+use sena_state::MerkleTrie;
+use sena_stf::{execute_batch, Transaction};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sena_primitives::Hash256;
-use sena_stf::{execute_batch, Transaction};
-use sena_state::MerkleTrie;
-use serde::{Deserialize, Serialize};
 
 /// A canonical data availability batch blob.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -60,9 +60,8 @@ impl DaBlob {
     /// Verifies the internal integrity of the blob (commitment matches transactions).
     #[must_use]
     pub fn verify_integrity(&self) -> bool {
-        let batch_bytes = match serde_json::to_vec(&self.transactions) {
-            Ok(b) => b,
-            Err(_) => return false,
+        let Ok(batch_bytes) = serde_json::to_vec(&self.transactions) else {
+            return false;
         };
         Hash256::digest(&batch_bytes) == self.batch_commitment
     }
@@ -158,13 +157,13 @@ impl DaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::{Allocation, GasAsset, GenesisConfig};
     use ed25519_dalek::{Signer as DalekSigner, SigningKey};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use sena_primitives::{AssetId, L2Address};
     use sena_stf::gas::fee_for;
     use sena_stf::{Authenticator, Payload, RATE_SCALE};
-    use crate::genesis::{Allocation, GasAsset, GenesisConfig};
 
     const USDC: AssetId = AssetId(1);
 
@@ -234,19 +233,19 @@ mod tests {
         let tx = signed_tx(&alice_key, 0, bob, 500);
 
         let mut exec_state = starting_state.clone();
-        execute_batch(&mut exec_state, &[tx.clone()]).unwrap();
+        execute_batch(&mut exec_state, std::slice::from_ref(&tx)).unwrap();
         let post_root = exec_state.root();
 
-        let blob = DaBlob::new(1, pre_root, post_root, vec![tx]);
-        assert!(blob.verify_integrity());
+        let da_blob = DaBlob::new(1, pre_root, post_root, vec![tx]);
+        assert!(da_blob.verify_integrity());
 
         // Independent replay from starting state
         let mut verifier_state = starting_state.clone();
-        let executed_root = blob.verify_execution(&mut verifier_state).unwrap();
+        let executed_root = da_blob.verify_execution(&mut verifier_state).unwrap();
         assert_eq!(executed_root, post_root);
 
         // Tampering test: modify commitment
-        let mut tampered = blob.clone();
+        let mut tampered = da_blob.clone();
         tampered.batch_commitment = Hash256::ZERO;
         assert!(!tampered.verify_integrity());
         assert!(tampered.verify_execution(&mut verifier_state).is_err());

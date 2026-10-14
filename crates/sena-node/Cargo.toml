@@ -34,10 +34,6 @@ name = "sena-demo"
 path = "src/bin/sena_demo.rs"
 
 [[bin]]
-name = "sena-keyless-demo"
-path = "src/bin/sena_keyless_demo.rs"
-
-[[bin]]
 name = "sena-node"
 path = "src/bin/sena_node.rs"
 

@@ -1,6 +1,6 @@
 //! Transactions and how they are authenticated.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
 use sena_primitives::Writer;
 use sena_primitives::{
@@ -226,87 +226,48 @@ impl Transaction {
 
     /// Checks that the transaction is authorised.
     ///
+    /// An Ed25519 account's address *is* its public key, so the key that signed
+    /// must be the sender's own. Checking only that the signature matches the
+    /// key carried alongside it would let any keypair spend from any account.
+    ///
+    /// Verification is strict (RFC 8032 with canonical `S` and no small-order
+    /// keys), because the Aptos one-step verifier uses
+    /// `ed25519::signature_verify_strict`. A lenient check here would accept
+    /// signatures L1 refuses, and the two would decide disputes differently.
+    ///
     /// # Errors
     ///
-    /// Returns [`AuthError`] if the signature is malformed or does not verify,
-    /// or if the scheme is not yet supported.
+    /// Returns [`AuthError`] if the key is not the sender's, the signature is
+    /// malformed or does not verify, or the scheme is not yet supported.
     pub fn authenticate(&self) -> Result<(), AuthError> {
         match &self.authenticator {
             Authenticator::Ed25519 {
                 public_key,
                 signature,
             } => {
-                let key =
-                    VerifyingKey::from_bytes(public_key).map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)
-            }
-            Authenticator::Keyless {
-                ephemeral_public_key,
-                signature,
-                zk_proof,
-            } => {
-                let key = VerifyingKey::from_bytes(ephemeral_public_key)
-                    .map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)?;
-
-                if zk_proof.len() == 128 {
-                    let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
-                        .map_err(|_| AuthError::InvalidZkProof)?;
-                    let public_inputs = crate::groth16::canonical_keyless_public_inputs(
-                        ephemeral_public_key,
-                        &self.sender,
-                    );
-                    crate::groth16::canonical_verifier()
-                        .verify_raw(&proof, &public_inputs)
-                        .map_err(|_| AuthError::InvalidZkProof)?;
-                    Ok(())
-                } else {
-                    Err(AuthError::KeylessNotImplemented)
+                if self.sender != L2Address::from_bytes(*public_key) {
+                    return Err(AuthError::WrongSigner);
                 }
+                verify_ed25519(public_key, signature, &self.signing_digest())
             }
+            Authenticator::Keyless { .. } => Err(AuthError::KeylessNotImplemented),
         }
     }
+}
 
-    /// Verifies that a transaction is authenticated, validating Groth16 ZK proofs for keyless accounts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AuthError`] if the signature does not verify, or if the ZK proof is invalid or malformed.
-    pub fn authenticate_with_groth16(
-        &self,
-        verifier: &crate::groth16::Bn254Groth16Verifier,
-        public_inputs: &[ark_bn254::Fr],
-    ) -> Result<(), AuthError> {
-        match &self.authenticator {
-            Authenticator::Keyless {
-                ephemeral_public_key,
-                signature,
-                zk_proof,
-            } => {
-                let key = VerifyingKey::from_bytes(ephemeral_public_key)
-                    .map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)?;
-
-                if zk_proof.is_empty() {
-                    return Err(AuthError::KeylessNotImplemented);
-                }
-
-                let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
-                    .map_err(|_| AuthError::InvalidZkProof)?;
-                verifier
-                    .verify_raw(&proof, public_inputs)
-                    .map_err(|_| AuthError::InvalidZkProof)?;
-                Ok(())
-            }
-            Authenticator::Ed25519 { .. } => self.authenticate(),
-        }
+/// Strict Ed25519 verification of `digest`, as Aptos L1 performs it.
+fn verify_ed25519(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    digest: &Hash256,
+) -> Result<(), AuthError> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| AuthError::MalformedKey)?;
+    if key.is_weak() {
+        return Err(AuthError::MalformedKey);
     }
+    let sig = Signature::from_bytes(signature);
+    key.verify_strict(digest.as_bytes(), &sig)
+        .map_err(|_| AuthError::BadSignature)
 }
 
 /// Why a transaction failed authentication.
@@ -318,6 +279,9 @@ pub enum AuthError {
     /// The signature did not verify against the signing digest.
     #[error("signature does not verify")]
     BadSignature,
+    /// The signing key does not belong to the sender.
+    #[error("the signing key is not the sender's")]
+    WrongSigner,
     /// Keyless authentication is not yet available.
     #[error(
         "keyless authentication is not implemented: the ZK proof binding the \
@@ -325,7 +289,4 @@ pub enum AuthError {
              rather than accepted unchecked"
     )]
     KeylessNotImplemented,
-    /// The zero-knowledge proof did not verify against the public inputs.
-    #[error("zero-knowledge proof does not verify")]
-    InvalidZkProof,
 }

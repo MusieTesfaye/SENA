@@ -319,6 +319,77 @@ fn keyless_authentication_is_refused_rather_than_partially_checked() {
     );
 }
 
+/// The key that signs must be the sender's own key.
+///
+/// Regression test: authentication once checked only that the signature
+/// matched the key carried in the transaction, so any keypair could spend from
+/// any account by naming it as the sender.
+#[test]
+fn a_key_cannot_spend_from_an_account_it_does_not_own() {
+    let victim = signer(1);
+    let thief = signer(66);
+    let mut trie = funded_trie(&[(address_of(&victim), 10_000)]);
+
+    let theft = resign(
+        &thief,
+        Transaction {
+            sender: address_of(&victim),
+            ..signed(
+                &thief,
+                0,
+                Payload::Transfer {
+                    to: address_of(&thief),
+                    asset: USDC,
+                    amount: 9_000,
+                },
+            )
+        },
+    );
+
+    assert_eq!(
+        compile(&theft).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::WrongSigner)
+    );
+    assert!(execute_batch(&mut trie, &[theft]).is_err());
+    assert_eq!(
+        account_in(&trie, &address_of(&victim)).balance(USDC),
+        10_000
+    );
+}
+
+/// A small-order public key is refused even with a "valid" signature.
+///
+/// The identity point verifies the all-zero-`R` signature for every message
+/// under lenient verification. Aptos L1 uses strict verification, so the node
+/// must too or the two would disagree in a dispute.
+#[test]
+fn a_small_order_key_is_refused() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1; // compressed Edwards identity
+    let mut signature = [0u8; 64];
+    signature[0] = 1; // R = identity, S = 0
+    let tx = Transaction {
+        sender: L2Address::from_bytes(identity),
+        nonce: 0,
+        fee_asset: USDC,
+        max_fee: fee(),
+        fee_rate: USDC_RATE,
+        payload: Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+        authenticator: Authenticator::Ed25519 {
+            public_key: identity,
+            signature,
+        },
+    };
+    assert!(matches!(
+        compile(&tx).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::MalformedKey | sena_stf::AuthError::BadSignature)
+    ));
+}
+
 // --- Social Connect ----------------------------------------------------------
 
 fn handle(name: &str) -> HashedIdentifier {

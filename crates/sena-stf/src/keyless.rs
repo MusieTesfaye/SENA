@@ -127,54 +127,32 @@ pub enum KeylessError {
          current, but nothing here can establish that the provider actually issued it"
     )]
     ProofVerificationUnavailable,
-    /// The zero-knowledge proof or verification key is malformed.
-    #[error("zero-knowledge proof is malformed: {0}")]
-    MalformedProof(String),
-    /// The zero-knowledge proof failed verification against the public inputs.
-    #[error("zero-knowledge proof failed verification")]
-    InvalidProof,
 }
 
 /// The network's policy for accepting keyless identities.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct KeylessPolicy {
     /// Issuers this network accepts, by their `iss` claim.
-    /// If empty, accepts any valid HTTPS OIDC provider (Universal OIDC mode).
     pub approved_issuers: BTreeSet<String>,
     /// The longest an ephemeral key may be valid for, in seconds.
+    ///
+    /// The EPK is held by a client application and is the thing that can
+    /// actually move funds, so its lifetime is the window in which a
+    /// compromised device can act. Keeping it to hours rather than days is what
+    /// makes "no seed phrase" safe rather than merely convenient.
     pub max_ephemeral_key_lifetime: u64,
-    /// When true, derives unified addresses across applications (Aptos model: iss + sub + pepper).
-    pub unified_mode: bool,
 }
 
 impl KeylessPolicy {
-    /// A policy accepting Google, Apple, Microsoft, GitHub, Discord, Auth0 with a two-hour key lifetime.
+    /// A policy accepting Google and Apple, with a two-hour key lifetime.
     #[must_use]
     pub fn default_providers() -> Self {
         Self {
-            approved_issuers: [
-                "https://accounts.google.com",
-                "https://appleid.apple.com",
-                "https://login.microsoftonline.com/common/v2.0",
-                "https://discord.com",
-                "https://auth0.com",
-                "https://github.com",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+            approved_issuers: ["https://accounts.google.com", "https://appleid.apple.com"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             max_ephemeral_key_lifetime: 2 * 60 * 60,
-            unified_mode: false,
-        }
-    }
-
-    /// Universal open policy accepting any valid HTTPS OIDC provider in unified identity mode.
-    #[must_use]
-    pub fn universal() -> Self {
-        Self {
-            approved_issuers: BTreeSet::new(),
-            max_ephemeral_key_lifetime: 2 * 60 * 60,
-            unified_mode: true,
         }
     }
 }
@@ -263,7 +241,7 @@ pub fn check_binding(
 ) -> Result<L2Address, KeylessError> {
     let claims = parse_claims_unverified(auth.token)?;
 
-    if !policy.approved_issuers.is_empty() && !policy.approved_issuers.contains(&claims.iss) {
+    if !policy.approved_issuers.contains(&claims.iss) {
         return Err(KeylessError::UntrustedIssuer { issuer: claims.iss });
     }
 
@@ -301,19 +279,11 @@ pub fn check_binding(
         return Err(KeylessError::NonceMismatch);
     }
 
-    if policy.unified_mode || claims.aud.is_empty() || claims.aud == "*" {
-        Ok(L2Address::derive_from_oidc_unified(
-            &claims.iss,
-            &claims.sub,
-            auth.pepper,
-        ))
-    } else {
-        Ok(L2Address::derive_from_oidc(
-            &claims.aud,
-            &claims.sub,
-            auth.pepper,
-        ))
-    }
+    Ok(L2Address::derive_from_oidc(
+        &claims.aud,
+        &claims.sub,
+        auth.pepper,
+    ))
 }
 
 /// Verifies that a presented identity token is genuine.

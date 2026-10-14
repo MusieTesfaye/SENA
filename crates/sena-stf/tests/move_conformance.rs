@@ -58,7 +58,6 @@ fn the_move_sources_are_present() {
         "assertions.move",
         "disputes.move",
         "bridge.move",
-        "groth16.move",
     ] {
         assert!(!source(file).is_empty(), "{file} is empty");
     }

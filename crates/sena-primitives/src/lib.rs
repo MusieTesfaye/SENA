@@ -51,4 +51,4 @@ pub use address::{AssetId, L2Address};
 pub use codec::{DecodeError, Reader, Writer};
 pub use encoding::{domain, CanonicalEncoder};
 pub use hash::{Hash256, HashParseError};
-pub use identity::{Channel, HashedIdentifier, NetworkSalt, ObfuscatedIdentifier};
+pub use identity::{Channel, HashedIdentifier, NetworkSalt};

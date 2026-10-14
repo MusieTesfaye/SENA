@@ -46,9 +46,7 @@ These are exercised by the test suite on every run, and by
 | Move contracts compile and self-test | `move/sena` | 53/53 Move tests, including Rust conformance |
 | Bonds are escrowed, slashed and refunded | `move/sena` | Balances checked on reject, refund and groundless challenge |
 | Withdrawal proofs against finalized roots | `sena-node` | `sena_getWithdrawalProof`; historical roots provable |
-| Ultralight mobile client state verification | `sena-light-client`, `sena-node` | Sub-millisecond Sparse Merkle Proof checks (<0.05ms); `sena_getAccountProof` verified over HTTP |
-| On-Chain Groth16 / BN254 ZK Verifier | `sena-stf`, `move/sena` | Pairing checks over BN254; 128-byte compressed proof parsing; public input binding ($x_1, x_2, x_3$); tested in `groth16_verification.rs` and `groth16.move` |
-| End-to-End Keyless Transfer & Mobile Sync | `sena-node`, `sena-stf`, `sena-light-client` | Live HTTP node accepts BN254 Groth16 keyless transfers, seals blocks, and mobile client verifies in <0.25ms; tested in `keyless_app_e2e.rs` & runnable via `sena-keyless-demo` |
+| Light-client account verification against a supplied root | `sena-light-client`, `sena-node` | `sena_getAccountProof` verified over HTTP; the caller must supply a trusted root |
 | RPC auth, rate limiting, body cap | `sena-node` | Unauthenticated, wrong-token, flood and oversized-body all refused |
 | Assertion lifecycle enforced by Aptos | `move/sena` | Devnet: window and challenge both block finalization |
 
@@ -65,20 +63,29 @@ too: a groundless challenge loses.
 
 Listed in the order they block a real network.
 
-### 1. Keyless sign-in: client proving daemon and production CRS
+### 1. Keyless sign-in is disabled
 
-**On-chain verification complete; prover infrastructure outstanding.**
+**Every keyless transaction is rejected.** The October 2026 prototype was
+unsound and has been quarantined in `attic/unsafe-keyless-2026-10/`:
 
-**What works:**
-- Full on-chain BN254 Groth16 zero-knowledge verifier in `sena-stf` (`Bn254Groth16Verifier`) and Aptos Move smart contract (`sena::groth16`).
-- Pairing equations $e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$ verified natively on both execution layers.
-- 128-byte compressed proof deserialization and strict group membership checks.
-- Public input derivation binding ephemeral public key commitments ($x_1$), derived self-custodial account addresses ($x_2$), and identity provider credentials & expiry timestamps ($x_3$).
-- JWT claim parsing, issuer allowlisting, expiry, `aud` scoping that makes one user unlinkable across applications, deterministic address derivation, and verifying that the token's `nonce` commits to *this* ephemeral key.
+- Its Groth16 verification key was built from known scalars with
+  beta = gamma = delta = G2, and a public helper forged a valid proof for any
+  sender. Any keyless account could be drained.
+- Its "ceremony" hard-coded the toxic waste and had no circuit; its "prover"
+  built proofs from public data; its JWK check could be bypassed; its pepper
+  and ODIS services leaked every pepper and needed no JWT.
 
-**What does not:**
-- Running the off-chain client prover daemon service that generates the BN254 Groth16 proof from raw Google/Apple OIDC tokens.
-- Deploying the production trusted setup CRS / verification key parameters to the live Aptos devnet instance.
+Keyless is being rebuilt on the Aptos Keyless circom circuit and its ceremony
+verification key, with JWKs held in L2 state and the whole check adjudicable on
+L1. JWT claim parsing, issuer allowlisting, expiry and nonce-to-ephemeral-key
+binding (`sena-stf::keyless`) are unaffected and still tested.
+
+### Fixed: any key could spend from any Ed25519 account
+
+`Transaction::authenticate` checked that a signature matched the key carried in
+the transaction but never that the key was the sender's. It now requires
+`sender == public_key` and verifies strictly, matching Aptos's
+`ed25519::signature_verify_strict` (regression tests in `sena-stf/tests/execution.rs`).
 
 ### 2. The Aptos L1 contracts are deployed to devnet, not testnet
 

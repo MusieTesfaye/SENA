@@ -5,21 +5,18 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
-### End-to-End Keyless Token Transfer with Live Node & Mobile Sync (`sena-node`, `sena-stf`, `sena-light-client`)
+### Security
 
-- Added canonical Groth16 verification to `Transaction::authenticate` validating keyless transactions against canonical BN254 verification keys and public inputs ($x_1, x_2, x_3$).
-- Implemented `sena-node/tests/keyless_app_e2e.rs`: full simulated client app workflow with Google OIDC logins for Alice and Bob, Ephemeral Key Pair (EPK) generation, 128-byte BN254 Groth16 ZK proof attestation, real HTTP submission to a live `sena-node`, block sealing, on-chain balance confirmation, and ultralight mobile verification via `sena-light-client`.
-- Added runnable CLI demo `sena-keyless-demo` (`crates/sena-node/src/bin/sena_keyless_demo.rs`) demonstrating the entire pipeline live with sub-millisecond mobile verification (<0.25ms).
-- Verified negative security paths: forged ZK proofs, tampered sender addresses, and invalid signatures are strictly rejected by the mempool.
-
-### On-Chain Groth16 / BN254 ZK Verifier (`sena-stf`, `move/sena`)
-
-- Implemented `Bn254Groth16Verifier` in `sena-stf` supporting on-chain pairing checks over the BN254 curve ($e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$).
-- Added `Bn254Proof` with 128-byte compressed and 256-byte uncompressed serialization, and validation against public input vectors.
-- Implemented `derive_keyless_public_inputs` binding the ephemeral key commitment ($x_1$), sender `L2Address` ($x_2$), and identity provider credentials & expiry ($x_3$).
-- Added `Transaction::authenticate_with_groth16` to authenticate keyless transactions via EPK Ed25519 signatures validated against Groth16 ZK proofs.
-- Added `sena::groth16` module to Aptos Move contracts leveraging `aptos_std::bn254_algebra` and `aptos_std::crypto_algebra` for L1 zero-knowledge verification.
-- Added comprehensive unit and integration tests across Rust (`tests/groth16_verification.rs`) and Move (`test_bn254_groth16_verification_pairing`).
+- **Fixed: any key could spend from any Ed25519 account.** Authentication now
+  requires the signing key to be the sender's and verifies strictly, matching
+  Aptos's `signature_verify_strict`.
+- **Withdrawn: the October 2026 keyless prototype.** Its Groth16 verifier used a
+  forgeable verification key, its ceremony and prover were placeholders, its JWK
+  check could be bypassed, and its pepper/ODIS services leaked peppers. The
+  code is quarantined in `attic/unsafe-keyless-2026-10/` and keyless
+  transactions are rejected again until the Aptos Keyless circuit integration
+  lands.
+- The relayer no longer records a block as relayed when the L1 post fails.
 
 ### The Move contracts compile
 

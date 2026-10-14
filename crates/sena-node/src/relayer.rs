@@ -8,7 +8,6 @@
 //! survived its challenge window without challenge.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -130,28 +129,42 @@ impl AptosRelayer {
     }
 
     /// Fetches the current chain info from the L2 RPC node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is unreachable or answers unexpectedly.
     pub fn query_l2_chain_info(&self) -> Result<(u64, Hash256), String> {
         let resp = ureq::post(&self.config.sena_rpc_url)
             .timeout(Duration::from_secs(3))
             .send_json(&Request::GetChainInfo)
             .map_err(|e| format!("RPC connection error: {e}"))?;
 
-        let val: Response = resp.into_json().map_err(|e| format!("JSON parse error: {e}"))?;
+        let val: Response = resp
+            .into_json()
+            .map_err(|e| format!("JSON parse error: {e}"))?;
         match val {
-            Response::ChainInfo { height, state_root, .. } => Ok((height, state_root)),
+            Response::ChainInfo {
+                height, state_root, ..
+            } => Ok((height, state_root)),
             Response::Error { message } => Err(format!("L2 RPC error: {message}")),
             other => Err(format!("Unexpected RPC response: {other:?}")),
         }
     }
 
     /// Fetches a block and its transactions from the L2 RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is unreachable or has no such block.
     pub fn query_l2_block(&self, height: u64) -> Result<(Hash256, Hash256, Hash256, u64), String> {
         let resp = ureq::post(&self.config.sena_rpc_url)
             .timeout(Duration::from_secs(3))
             .send_json(&Request::GetBlock { height })
             .map_err(|e| format!("RPC connection error: {e}"))?;
 
-        let val: Response = resp.into_json().map_err(|e| format!("JSON parse error: {e}"))?;
+        let val: Response = resp
+            .into_json()
+            .map_err(|e| format!("JSON parse error: {e}"))?;
         match val {
             Response::Block {
                 pre_state_root,
@@ -163,7 +176,12 @@ impl AptosRelayer {
                 let batch_bytes = serde_json::to_vec(&transactions).unwrap_or_default();
                 let batch_commitment = Hash256::digest(&batch_bytes);
                 let effective_trace_length = trace_length.max(1);
-                Ok((pre_state_root, post_state_root, batch_commitment, effective_trace_length))
+                Ok((
+                    pre_state_root,
+                    post_state_root,
+                    batch_commitment,
+                    effective_trace_length,
+                ))
             }
             Response::Error { message } => Err(format!("L2 RPC error: {message}")),
             other => Err(format!("Unexpected RPC response: {other:?}")),
@@ -171,6 +189,11 @@ impl AptosRelayer {
     }
 
     /// Relays newly sealed blocks from L2 to Aptos L1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the L2 node cannot be read or the L1 post fails, in
+    /// which case nothing is recorded and the same block is retried next time.
     pub fn step(&mut self) -> Result<Option<TrackedAssertion>, String> {
         let (current_height, _) = self.query_l2_chain_info()?;
         if current_height <= self.last_relayed_height {
@@ -178,10 +201,13 @@ impl AptosRelayer {
         }
 
         let target_height = self.last_relayed_height + 1;
-        let (pre_root, post_root, batch_commitment, trace_length) = self.query_l2_block(target_height)?;
+        let (pre_root, post_root, batch_commitment, trace_length) =
+            self.query_l2_block(target_height)?;
 
         let parent_bytes = if let Some(last) = self.tracked_assertions.last() {
-            Hash256::from_hex(&last.assertion_id).unwrap_or(Hash256::ZERO).0
+            Hash256::from_hex(&last.assertion_id)
+                .unwrap_or(Hash256::ZERO)
+                .0
         } else {
             [0u8; 32]
         };
@@ -199,50 +225,53 @@ impl AptosRelayer {
         let parent_hex = format!("0x{}", hex::encode(parent_bytes));
         let aid_hex = format!("0x{}", hex::encode(aid.0));
 
+        println!("[SENA Relayer] Relaying block #{target_height} to Aptos L1");
+        println!("   Assertion ID:     {aid_hex}");
+        println!("   Parent ID:        {parent_hex}");
+        println!("   Post State Root:  {post_root}");
         println!(
-            "⛓️  [SENA Relayer] Relaying Block #{} to Aptos L1...",
-            target_height
+            "   Bond Escrowed:    {} micro-units",
+            self.config.bond_amount
         );
-        println!("   Assertion ID:     {}", aid_hex);
-        println!("   Parent ID:        {}", parent_hex);
-        println!("   Post State Root:  {}", post_root);
-        println!("   Bond Escrowed:    {} micro-units", self.config.bond_amount);
 
         if !self.config.dry_run {
             let function_id = format!("{}::assertions::post", self.config.contract_address);
             println!(
-                "   Submitting L1 transaction -> {} --profile {}",
-                function_id, self.config.profile
+                "   Submitting L1 transaction -> {function_id} --profile {}",
+                self.config.profile
             );
             let status = std::process::Command::new("aptos")
                 .args([
-                    "move", "run",
-                    "--function-id", &function_id,
+                    "move",
+                    "run",
+                    "--function-id",
+                    &function_id,
                     "--args",
                     &format!("address:{}", self.config.contract_address),
-                    &format!("hex:{}", parent_hex),
+                    &format!("hex:{parent_hex}"),
                     &format!("hex:0x{}", hex::encode(pre_root.0)),
                     &format!("hex:0x{}", hex::encode(post_root.0)),
                     &format!("hex:0x{}", hex::encode(batch_commitment.0)),
-                    &format!("u64:{}", trace_length),
+                    &format!("u64:{trace_length}"),
                     &format!("u128:{}", self.config.bond_amount),
-                    "--profile", &self.config.profile,
+                    "--profile",
+                    &self.config.profile,
                     "--assume-yes",
                 ])
                 .output();
 
-            match status {
-                Ok(out) => {
-                    let out_str = String::from_utf8_lossy(&out.stdout);
-                    let err_str = String::from_utf8_lossy(&out.stderr);
-                    if !out.status.success() || (!out_str.contains("\"success\": true") && !out_str.is_empty()) {
-                        eprintln!("⚠️  L1 post warning: {out_str} {err_str}");
-                    } else {
-                        println!("   L1 Transaction Confirmed: {}", aid_hex);
-                    }
-                }
-                Err(e) => eprintln!("⚠️  Could not execute aptos CLI: {e}"),
+            // Fail closed: an assertion that did not land must not be
+            // recorded as relayed, or the next one would name a parent that
+            // does not exist on chain.
+            let out = status.map_err(|e| format!("could not execute aptos CLI: {e}"))?;
+            let out_str = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success() || !out_str.contains("\"success\": true") {
+                let err_str = String::from_utf8_lossy(&out.stderr);
+                return Err(format!(
+                    "L1 post of block {target_height} failed; not advancing: {out_str} {err_str}"
+                ));
             }
+            println!("   L1 transaction confirmed: {aid_hex}");
         }
 
         let tracked = TrackedAssertion {
@@ -264,7 +293,11 @@ impl AptosRelayer {
         self.last_relayed_height = target_height;
         self.tracked_assertions.push(tracked.clone());
 
-        println!("✅ [SENA Relayer] Block #{} successfully anchored to Aptos L1!", target_height);
+        if self.config.dry_run {
+            println!("[SENA Relayer] Block #{target_height} computed (dry run, nothing posted)");
+        } else {
+            println!("[SENA Relayer] Block #{target_height} anchored to Aptos L1");
+        }
         Ok(Some(tracked))
     }
 
@@ -280,34 +313,55 @@ impl AptosRelayer {
             .as_secs();
 
         // 86,400s floor on mainnet/testnet, or shorter if local
-        let window_secs = if self.config.aptos_network == "local" { 10 } else { 86_400 };
+        let window_secs = if self.config.aptos_network == "local" {
+            10
+        } else {
+            86_400
+        };
 
         for assertion in &mut self.tracked_assertions {
             if assertion.status == "Pending" && now >= assertion.posted_at_unix + window_secs {
-                println!("⏳ [SENA Relayer] Finalizing assertion {}...", assertion.assertion_id);
+                println!(
+                    "⏳ [SENA Relayer] Finalizing assertion {}...",
+                    assertion.assertion_id
+                );
                 if !self.config.dry_run {
-                    let function_id = format!("{}::assertions::finalize", self.config.contract_address);
+                    let function_id =
+                        format!("{}::assertions::finalize", self.config.contract_address);
                     let _ = std::process::Command::new("aptos")
                         .args([
-                            "move", "run",
-                            "--function-id", &function_id,
+                            "move",
+                            "run",
+                            "--function-id",
+                            &function_id,
                             "--args",
                             &format!("address:{}", self.config.contract_address),
                             &format!("hex:{}", assertion.assertion_id),
-                            "--profile", &self.config.profile,
+                            "--profile",
+                            &self.config.profile,
                             "--assume-yes",
                         ])
                         .output();
                 }
                 assertion.status = "Finalized";
-                println!("🎯 [SENA Relayer] Assertion {} is now Finalized!", assertion.assertion_id);
+                println!(
+                    "🎯 [SENA Relayer] Assertion {} is now Finalized!",
+                    assertion.assertion_id
+                );
             }
         }
     }
 
     /// Runs the relayer daemon continuously.
-    pub fn run_daemon(&mut self, running: Arc<AtomicBool>) -> Result<(), String> {
-        println!("🚀 [SENA Relayer Daemon] Started on network: {}", self.config.aptos_network);
+    ///
+    /// # Errors
+    ///
+    /// Does not currently return an error; failures are retried.
+    pub fn run_daemon(&mut self, running: &AtomicBool) -> Result<(), String> {
+        println!(
+            "🚀 [SENA Relayer Daemon] Started on network: {}",
+            self.config.aptos_network
+        );
         println!("   Monitoring L2 RPC: {}", self.config.sena_rpc_url);
         println!("   Target Contract:   {}", self.config.contract_address);
         println!("   Polling Interval:  {}s", self.config.poll_interval_secs);

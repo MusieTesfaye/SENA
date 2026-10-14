@@ -369,6 +369,29 @@ fn account_proof(
     }
 }
 
+/// Builds the data-availability blob for a sealed block.
+///
+/// Heights count from 1; height 0 is genesis, which has no batch.
+fn da_blob(sequencer: &Sequencer, height: u64) -> Response {
+    let block = height
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| sequencer.blocks.get(i));
+    match block {
+        None => Response::Error {
+            message: format!("no block at height {height}"),
+        },
+        Some(block) => Response::DaBlob {
+            blob: crate::da::DaBlob::new(
+                block.height,
+                block.pre_state_root,
+                block.post_state_root,
+                block.transactions.clone(),
+            ),
+        },
+    }
+}
+
 /// Serves one request against the node.
 ///
 /// `chain_id` is reported back so a client can tell at a glance whether it is
@@ -467,25 +490,7 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
 
         Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
 
-        Request::GetDaBlob { height } => {
-            match usize::try_from(height.saturating_sub(1))
-                .ok()
-                .and_then(|i| sequencer.blocks.get(i))
-            {
-                None => Response::Error {
-                    message: format!("no block at height {height}"),
-                },
-                Some(block) => {
-                    let blob = crate::da::DaBlob::new(
-                        block.height,
-                        block.pre_state_root,
-                        block.post_state_root,
-                        block.transactions.clone(),
-                    );
-                    Response::DaBlob { blob }
-                }
-            }
-        }
+        Request::GetDaBlob { height } => da_blob(sequencer, height),
 
         Request::GetChainInfo => Response::ChainInfo {
             chain_id: chain_id.to_owned(),

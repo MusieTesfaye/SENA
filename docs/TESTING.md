@@ -22,16 +22,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-265 tests. The ones worth reading rather than just running:
-
-```sh
-cargo test -p sena-stf --test groth16_verification
-```
-
-`test_groth16_bn254_verifier_soundness` and `test_transaction_keyless_authentication_with_groth16`
-verify the on-chain BN254 Groth16 pairing check $e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$,
-confirming that forged EPK nonces, tampered sender addresses, or manipulated transaction payloads
-are mathematically rejected.
+The ones worth reading rather than just running:
 
 ```sh
 cargo test -p sena-fraudproof --test dispute -- --nocapture

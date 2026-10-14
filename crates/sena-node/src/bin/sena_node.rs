@@ -228,8 +228,8 @@ fn main() {
                 dry_run,
             };
             let mut relayer = sena_node::AptosRelayer::new(config);
-            let running = Arc::new(AtomicBool::new(true));
-            relayer.run_daemon(running)
+            let running = AtomicBool::new(true);
+            relayer.run_daemon(&running)
         }
     };
 
