@@ -26,6 +26,7 @@
 //! as follow-up work; the present design is sound for the instruction set that
 //! exists.
 
+use sena_primitives::serde_hex::bytes_32;
 use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address};
 
 use crate::gas::WhitelistedAsset;
@@ -118,6 +119,30 @@ pub enum Instruction {
         /// Its new value.
         value: u128,
     },
+    /// Check that `jwk_hash` is a JWK the network accepts for `iss_hash`.
+    ///
+    /// Read-only, like [`Instruction::VerifyGasAsset`]: the keyless proof is
+    /// checked statelessly at compile time, but which JWKs are current is
+    /// state, so that half of the check lives in the trace.
+    VerifyJwk {
+        /// Poseidon hash of the issuer.
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK the proof was made against.
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+    },
+    /// Accept or retire a JWK for an issuer (REQ-AUTH-003).
+    SetJwk {
+        /// Poseidon hash of the issuer.
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK.
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+        /// Whether proofs against this JWK are accepted.
+        active: bool,
+    },
 }
 
 /// The machine's observable state between two steps.
@@ -183,6 +208,10 @@ impl Instruction {
             Self::SetGasAsset { record } => keys::asset(record.asset.get()),
             Self::VerifyCouncil { .. } => keys::council(),
             Self::SetParameter { name, .. } => keys::parameter(name),
+            Self::VerifyJwk { iss_hash, jwk_hash }
+            | Self::SetJwk {
+                iss_hash, jwk_hash, ..
+            } => keys::jwk(iss_hash, jwk_hash),
         }
     }
 }

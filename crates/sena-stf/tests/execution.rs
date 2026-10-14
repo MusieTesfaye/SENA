@@ -16,11 +16,14 @@ use sena_state::MerkleTrie;
 use sena_stf::execute::{genesis_credit, StepWitness};
 use sena_stf::gas::fee_for;
 use sena_stf::{
-    apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchError,
-    CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction, MachineState, Payload,
-    SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT, RATE_SCALE,
+    apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchContext,
+    BatchError, CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction,
+    MachineState, Payload, SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT,
+    RATE_SCALE,
 };
 
+/// Ed25519 accounts only; keyless is off.
+const CTX: BatchContext<'static> = BatchContext::without_keyless(0);
 const USDC: AssetId = AssetId(1);
 
 /// The rate USDC is whitelisted at in these tests: one-to-one with native units.
@@ -140,7 +143,7 @@ fn a_transfer_moves_value_and_charges_a_fee() {
             amount: 2_500,
         },
     );
-    execute_batch(&mut trie, &[tx]).expect("transfer should execute");
+    execute_batch(&mut trie, &CTX, &[tx]).expect("transfer should execute");
 
     assert_eq!(account_in(&trie, &bob).balance(USDC), 2_500);
     assert_eq!(
@@ -180,7 +183,7 @@ fn value_is_conserved_across_a_batch() {
             },
         ),
     ];
-    execute_batch(&mut trie, &batch).unwrap();
+    execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     let total_after = account_in(&trie, &address_of(&alice)).balance(USDC)
         + account_in(&trie, &address_of(&bob)).balance(USDC)
@@ -202,7 +205,7 @@ fn a_transfer_beyond_the_balance_invalidates_the_batch() {
             amount: 1_000_000,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(matches!(err, BatchError::Step { .. }), "got {err:?}");
 }
 
@@ -218,7 +221,7 @@ fn a_self_transfer_is_rejected() {
             amount: 1,
         },
     );
-    assert_eq!(compile(&tx).unwrap_err(), CompileError::SelfTransfer);
+    assert_eq!(compile(&tx, &CTX).unwrap_err(), CompileError::SelfTransfer);
 }
 
 // --- Authentication and replay ----------------------------------------------
@@ -243,7 +246,7 @@ fn a_tampered_transaction_does_not_authenticate() {
         asset: USDC,
         amount: 1,
     };
-    assert!(compile(&tx).is_err());
+    assert!(compile(&tx, &CTX).is_err());
 }
 
 #[test]
@@ -260,7 +263,7 @@ fn raising_the_fee_after_signing_is_detected() {
     );
     tx.max_fee = u128::MAX;
     assert!(
-        compile(&tx).is_err(),
+        compile(&tx, &CTX).is_err(),
         "max_fee must be covered by the signature"
     );
 }
@@ -280,8 +283,8 @@ fn a_transaction_cannot_be_replayed() {
         },
     );
 
-    execute_batch(&mut trie, std::slice::from_ref(&tx)).expect("first execution succeeds");
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    execute_batch(&mut trie, &CTX, std::slice::from_ref(&tx)).expect("first execution succeeds");
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -295,9 +298,10 @@ fn a_transaction_cannot_be_replayed() {
 }
 
 #[test]
-fn keyless_authentication_is_refused_rather_than_partially_checked() {
-    // Accepting a keyless transaction on the strength of its ephemeral signature
-    // alone would let anyone spend from any keyless account.
+fn keyless_is_refused_on_a_network_without_it() {
+    // A network that has not configured keyless parameters must refuse the
+    // scheme outright; the proof is never looked at. (Proof verification
+    // itself is covered against Aptos's vectors in keyless_aptos_vectors.rs.)
     let alice = signer(1);
     let mut tx = signed(
         &alice,
@@ -308,14 +312,23 @@ fn keyless_authentication_is_refused_rather_than_partially_checked() {
             amount: 1,
         },
     );
-    tx.authenticator = Authenticator::Keyless {
+    tx.authenticator = Authenticator::Keyless(Box::new(sena_stf::KeylessSignature {
+        iss_hash: [0; 32],
+        idc: [0; 32],
         ephemeral_public_key: alice.verifying_key().to_bytes(),
-        signature: alice.sign(tx.signing_digest().as_bytes()).to_bytes(),
-        zk_proof: vec![0xAA; 32],
-    };
+        ephemeral_signature: alice.sign(tx.signing_digest().as_bytes()).to_bytes(),
+        exp_date_secs: u64::MAX,
+        exp_horizon_secs: 0,
+        jwt_header_hash: [0; 32],
+        jwk_hash: [0; 32],
+        extra_field_hash: None,
+        proof: [0; 128],
+    }));
     assert_eq!(
-        compile(&tx).unwrap_err(),
-        CompileError::Auth(sena_stf::AuthError::KeylessNotImplemented)
+        compile(&tx, &CTX).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::Keyless(
+            sena_stf::KeylessError::Disabled
+        ))
     );
 }
 
@@ -347,10 +360,10 @@ fn a_key_cannot_spend_from_an_account_it_does_not_own() {
     );
 
     assert_eq!(
-        compile(&theft).unwrap_err(),
+        compile(&theft, &CTX).unwrap_err(),
         CompileError::Auth(sena_stf::AuthError::WrongSigner)
     );
-    assert!(execute_batch(&mut trie, &[theft]).is_err());
+    assert!(execute_batch(&mut trie, &CTX, &[theft]).is_err());
     assert_eq!(
         account_in(&trie, &address_of(&victim)).balance(USDC),
         10_000
@@ -385,7 +398,7 @@ fn a_small_order_key_is_refused() {
         },
     };
     assert!(matches!(
-        compile(&tx).unwrap_err(),
+        compile(&tx, &CTX).unwrap_err(),
         CompileError::Auth(sena_stf::AuthError::MalformedKey | sena_stf::AuthError::BadSignature)
     ));
 }
@@ -410,7 +423,7 @@ fn an_identifier_resolves_to_its_owner() {
             identifier: id,
         },
     );
-    execute_batch(&mut trie, &[tx]).unwrap();
+    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     let stored = trie
         .get(&keys::social_by_identifier(&id))
@@ -430,6 +443,7 @@ fn an_identifier_cannot_be_taken_from_its_owner() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &alice,
             0,
@@ -449,7 +463,7 @@ fn an_identifier_cannot_be_taken_from_its_owner() {
             identifier: id,
         },
     );
-    let err = execute_batch(&mut trie, &[theft]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[theft]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -471,6 +485,7 @@ fn releasing_an_identifier_frees_it_for_someone_else() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[
             signed(
                 &alice,
@@ -509,6 +524,7 @@ fn releasing_an_identifier_you_do_not_hold_fails() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &alice,
             0,
@@ -522,6 +538,7 @@ fn releasing_an_identifier_you_do_not_hold_fails() {
 
     let err = execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &mallory,
             0,
@@ -558,7 +575,7 @@ fn the_trace_records_a_state_for_every_step_boundary() {
             amount: 5,
         },
     );
-    let trace = execute_batch(&mut trie, &[tx]).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     assert_eq!(trace.states.len(), trace.instructions.len() + 1);
     assert_eq!(trace.initial().state_root, pre_root);
@@ -592,8 +609,8 @@ fn determinism_the_same_batch_yields_the_same_root() {
 
     let mut first = funded_trie(&[(address_of(&alice), 50_000)]);
     let mut second = funded_trie(&[(address_of(&alice), 50_000)]);
-    let a = execute_batch(&mut first, &batch).unwrap();
-    let b = execute_batch(&mut second, &batch).unwrap();
+    let a = execute_batch(&mut first, &CTX, &batch).unwrap();
+    let b = execute_batch(&mut second, &CTX, &batch).unwrap();
 
     println!("root={}", a.final_state().state_root);
     assert_eq!(a.final_state().state_root, b.final_state().state_root);
@@ -650,7 +667,7 @@ fn l1_verification_agrees_with_node_execution() {
     // Replay the batch one step at a time, and at each step check that the
     // stateless verifier derives exactly the state the node did.
     let mut replay = funded_trie(&[(address_of(&alice), 90_000), (address_of(&bob), 90_000)]);
-    let trace = execute_batch(&mut trie, &batch).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     for (index, instruction) in trace.instructions.iter().enumerate() {
         let witness = witness_for(&replay, instruction);
@@ -776,7 +793,7 @@ proptest! {
 
         let mut trie = funded_trie(&[(address_of(&alice), funding)]);
         let mut replay = funded_trie(&[(address_of(&alice), funding)]);
-        let trace = execute_batch(&mut trie, &batch).unwrap();
+        let trace = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
         for (index, instruction) in trace.instructions.iter().enumerate() {
             let witness = witness_for(&replay, instruction);
@@ -803,7 +820,7 @@ fn a_fee_is_charged_in_the_declared_stablecoin() {
             amount: 10,
         },
     );
-    execute_batch(&mut trie, &[tx]).unwrap();
+    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     // No native token was needed at any point (REQ-GAS-002).
     assert_eq!(
@@ -831,7 +848,7 @@ fn an_unlisted_asset_cannot_pay_fees() {
     tx.fee_asset = AssetId(77);
     let tx = resign(&alice, tx);
 
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -859,7 +876,7 @@ fn a_disabled_asset_cannot_pay_fees() {
             amount: 1,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -892,7 +909,7 @@ fn a_transaction_cannot_declare_a_cheaper_rate_than_the_chain_holds() {
     tx.max_fee = 1;
     let tx = resign(&alice, tx);
 
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -920,7 +937,7 @@ fn a_max_fee_below_the_real_cost_is_refused_at_compile_time() {
     tx.max_fee = fee() - 1;
     let tx = resign(&alice, tx);
     assert!(matches!(
-        compile(&tx).unwrap_err(),
+        compile(&tx, &CTX).unwrap_err(),
         CompileError::FeeTooLow { .. }
     ));
 }
@@ -964,7 +981,7 @@ fn the_council_can_whitelist_a_new_gas_asset() {
             signatures,
         },
     );
-    execute_batch(&mut trie, &[tx]).expect("a quorum-signed update should apply");
+    execute_batch(&mut trie, &CTX, &[tx]).expect("a quorum-signed update should apply");
 
     let stored = trie.get(&keys::asset(2)).expect("record should exist");
     assert_eq!(WhitelistedAsset::decode(stored).unwrap().symbol, "EURC");
@@ -993,7 +1010,7 @@ fn an_update_without_a_quorum_is_refused() {
             signatures,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -1029,7 +1046,7 @@ fn a_forged_council_signature_is_refused() {
             signatures,
         },
     );
-    assert!(execute_batch(&mut trie, &[tx]).is_err());
+    assert!(execute_batch(&mut trie, &CTX, &[tx]).is_err());
 }
 
 #[test]
@@ -1055,7 +1072,7 @@ fn a_governance_payload_cannot_be_replayed_in_a_later_epoch() {
             signatures,
         },
     );
-    assert!(execute_batch(&mut trie, &[replayed]).is_err());
+    assert!(execute_batch(&mut trie, &CTX, &[replayed]).is_err());
 }
 
 #[test]
@@ -1086,7 +1103,7 @@ fn the_council_cannot_reach_the_dispute_system() {
         );
 
         assert!(
-            execute_batch(&mut trie.clone(), &[tx]).is_err(),
+            execute_batch(&mut trie.clone(), &CTX, &[tx]).is_err(),
             "'{name}' must be unreachable by governance"
         );
     }
@@ -1117,7 +1134,7 @@ fn governance_changes_are_covered_by_the_execution_trace() {
         },
     );
 
-    let trace = execute_batch(&mut trie, &[tx]).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &[tx]).unwrap();
     for (index, instruction) in trace.instructions.iter().enumerate() {
         let witness = witness_for(&replay, instruction);
         let derived = verify_step(&trace.states[index], instruction, &witness)

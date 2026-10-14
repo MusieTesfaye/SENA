@@ -11,7 +11,9 @@
 //! disputes it deserves to lose.
 
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, BatchError};
+use std::sync::Arc;
+
+use sena_stf::{execute_batch, BatchContext, BatchError, KeylessConfig};
 
 use sena_fraudproof::{
     check_assertion, Assertion, AssertionId, Dispute, Finding, Opening, PartyId, TracePlayer,
@@ -56,16 +58,26 @@ pub struct VerifierNode {
     pub identity: PartyId,
     /// The trace it last computed, kept so it can play a dispute.
     last_trace: Option<TracePlayer>,
+    /// The network's keyless parameters. Must match the sequencer's: a
+    /// verifier without them would judge honest keyless blocks unexecutable
+    /// and challenge them, and lose.
+    keyless: Option<Arc<KeylessConfig>>,
 }
 
 impl VerifierNode {
-    /// Creates a verifier starting from `genesis_state`.
+    /// Creates a verifier starting from `genesis_state`, with the network's
+    /// keyless parameters (`None` if the network has keyless disabled).
     #[must_use]
-    pub const fn new(genesis_state: MerkleTrie, identity: PartyId) -> Self {
+    pub const fn new(
+        genesis_state: MerkleTrie,
+        identity: PartyId,
+        keyless: Option<Arc<KeylessConfig>>,
+    ) -> Self {
         Self {
             state: genesis_state,
             identity,
             last_trace: None,
+            keyless,
         }
     }
 
@@ -78,7 +90,11 @@ impl VerifierNode {
         let pre_state = self.state.clone();
         let mut next = self.state.clone();
 
-        let trace = match execute_batch(&mut next, &block.transactions) {
+        let ctx = BatchContext {
+            timestamp: block.timestamp,
+            keyless: self.keyless.as_deref(),
+        };
+        let trace = match execute_batch(&mut next, &ctx, &block.transactions) {
             Ok(trace) => trace,
             Err(BatchError::Compile { index, source }) => {
                 return Outcome::Unexecutable {

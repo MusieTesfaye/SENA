@@ -21,8 +21,8 @@
 //! that wanted to shorten the challenge window would have to persuade Aptos L1
 //! to run different code.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sena_primitives::serde_hex::{bytes_64, u128_string};
+use ed25519_dalek::{Signature, VerifyingKey};
+use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
 use sena_primitives::{CanonicalEncoder, DecodeError, Hash256, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +123,21 @@ pub enum GovernanceUpdate {
         #[serde(with = "u128_string")]
         value: u128,
     },
+    /// Accept or retire an identity provider's JWK (REQ-AUTH-003).
+    ///
+    /// Providers rotate their signing keys every few weeks, so the set of
+    /// acceptable JWKs is state, not code. Retiring is a write of
+    /// `active: false` rather than a removal, keeping the trie append-only.
+    SetJwk {
+        /// Poseidon hash of the issuer (`sena_stf::keyless::iss_hash`).
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK (`sena_stf::keyless::rsa_jwk_hash`).
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+        /// Whether proofs against the JWK are accepted.
+        active: bool,
+    },
 }
 
 /// Discriminants for the canonical update encoding, fixed explicitly because
@@ -130,6 +145,7 @@ pub enum GovernanceUpdate {
 mod update_tag {
     pub const SET_GAS_ASSET: u8 = 0;
     pub const SET_PARAMETER: u8 = 1;
+    pub const SET_JWK: u8 = 2;
 }
 
 impl GovernanceUpdate {
@@ -150,6 +166,16 @@ impl GovernanceUpdate {
                 w.u8(update_tag::SET_PARAMETER);
                 w.string(name);
                 w.u128(*value);
+            }
+            Self::SetJwk {
+                iss_hash,
+                jwk_hash,
+                active,
+            } => {
+                w.u8(update_tag::SET_JWK);
+                w.bytes32(iss_hash);
+                w.bytes32(jwk_hash);
+                w.bool(*active);
             }
         }
         w.finish()
@@ -199,6 +225,7 @@ impl GovernanceUpdate {
                     Ok(())
                 }
             }
+            Self::SetJwk { .. } => Ok(()),
         }
     }
 }
@@ -241,9 +268,14 @@ pub fn verify_council_signatures(
             .get(usize::try_from(*index).map_err(|_| GovernanceError::UnknownSigner)?)
             .ok_or(GovernanceError::UnknownSigner)?;
 
+        // Strict, as Aptos L1 verifies: a lenient check would accept
+        // signatures the one-step verifier refuses.
         let key =
             VerifyingKey::from_bytes(member).map_err(|_| GovernanceError::MalformedCouncil)?;
-        key.verify(digest.as_bytes(), &Signature::from_bytes(signature))
+        if key.is_weak() {
+            return Err(GovernanceError::MalformedCouncil);
+        }
+        key.verify_strict(digest.as_bytes(), &Signature::from_bytes(signature))
             .map_err(|_| GovernanceError::BadSignature { index: *index })?;
     }
 

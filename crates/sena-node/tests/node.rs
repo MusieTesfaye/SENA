@@ -97,7 +97,7 @@ fn a_valid_transaction_is_admitted() {
             amount: 10,
         },
     );
-    assert!(seq.mempool.submit(&seq.state, tx).is_ok());
+    assert!(seq.submit(tx).is_ok());
     assert_eq!(seq.mempool.len(), 1);
 }
 
@@ -118,7 +118,7 @@ fn an_unfunded_transaction_is_refused_at_admission() {
         },
     );
     assert!(matches!(
-        seq.mempool.submit(&seq.state, tx),
+        seq.submit(tx),
         Err(RejectReason::WouldNotExecute { .. })
     ));
 }
@@ -133,35 +133,27 @@ fn admission_accounts_for_what_is_already_queued() {
     let mut seq = node(genesis(&[(address_of(&alice), funds)]));
 
     assert!(seq
-        .mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 1_000
-                }
-            )
-        )
+        .submit(signed(
+            &alice,
+            0,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1_000
+            }
+        ))
         .is_ok());
     assert!(
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    1,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 1_000
-                    }
-                )
-            )
-            .is_err(),
+        seq.submit(signed(
+            &alice,
+            1,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1_000
+            }
+        ))
+        .is_err(),
         "the second transfer is unaffordable once the first is queued"
     );
 }
@@ -179,11 +171,8 @@ fn a_duplicate_transaction_is_refused() {
             amount: 10,
         },
     );
-    seq.mempool.submit(&seq.state, tx.clone()).unwrap();
-    assert_eq!(
-        seq.mempool.submit(&seq.state, tx),
-        Err(RejectReason::Duplicate)
-    );
+    seq.submit(tx.clone()).unwrap();
+    assert_eq!(seq.submit(tx), Err(RejectReason::Duplicate));
 }
 
 #[test]
@@ -191,33 +180,26 @@ fn a_repeated_nonce_is_refused_while_queued() {
     let alice = signer(1);
     let bob = address_of(&signer(2));
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     assert!(matches!(
-        seq.mempool.submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 2
-                }
-            )
-        ),
+        seq.submit(signed(
+            &alice,
+            0,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 2
+            }
+        )),
         Err(RejectReason::NonceQueued { nonce: 0 })
     ));
 }
@@ -231,20 +213,16 @@ fn producing_a_block_advances_state_and_posts_an_assertion() {
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
     let before = seq.state.root();
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 500,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 500,
+        },
+    ))
+    .unwrap();
     let (block, id) = seq
         .produce(100)
         .unwrap()
@@ -279,7 +257,7 @@ fn a_block_is_not_final_until_its_window_elapses() {
         },
     );
     let hash = tx.hash();
-    seq.mempool.submit(&seq.state, tx).unwrap();
+    seq.submit(tx).unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     assert_eq!(
@@ -305,20 +283,16 @@ fn several_blocks_chain_together() {
     let mut seq = node(genesis(&[(address_of(&alice), 5_000_000)]));
 
     for nonce in 0..3 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 100,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 100,
+            },
+        ))
+        .unwrap();
         seq.produce(1).unwrap().unwrap();
     }
 
@@ -339,23 +313,19 @@ fn a_verifier_reproduces_an_honest_sequencers_state() {
     let bob = address_of(&signer(2));
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     for nonce in 0..5 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 250,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 250,
+            },
+        ))
+        .unwrap();
     }
     let (block, id) = seq.produce(100).unwrap().unwrap();
     let assertion = seq.chain.get(&id).unwrap().assertion.clone();
@@ -373,22 +343,18 @@ fn a_verifier_rejects_a_falsified_root_and_does_not_adopt_it() {
     let alice = signer(1);
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start.clone(), PartyId(2));
+    let mut verifier = VerifierNode::new(start.clone(), PartyId(2), None);
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (block, id) = seq.produce(100).unwrap().unwrap();
 
     let mut lying = seq.chain.get(&id).unwrap().assertion.clone();
@@ -408,23 +374,19 @@ fn a_verifier_can_open_a_dispute_over_what_it_found() {
     let alice = signer(1);
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     for nonce in 0..4 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: address_of(&signer(2)),
-                        asset: USDC,
-                        amount: 10,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: address_of(&signer(2)),
+                asset: USDC,
+                amount: 10,
+            },
+        ))
+        .unwrap();
     }
     let (block, id) = seq.produce(100).unwrap().unwrap();
 
@@ -484,19 +446,15 @@ fn rpc_resolves_a_social_identifier() {
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
     let id = HashedIdentifier::new(Channel::Handle, "@alice", &NetworkSalt::new(*b"test-salt"));
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::BindIdentifier {
-                    channel: Channel::Handle,
-                    identifier: id,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::BindIdentifier {
+            channel: Channel::Handle,
+            identifier: id,
+        },
+    ))
+    .unwrap();
     seq.produce(100).unwrap().unwrap();
 
     match handle(
@@ -557,20 +515,16 @@ fn rpc_reports_an_assertions_remaining_window() {
     // to challenge -- and how long until a withdrawal is safe.
     let alice = signer(1);
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     match handle(&mut seq, "sena-test-1", Request::GetAssertion { id }) {
@@ -607,20 +561,16 @@ fn rpc_reports_an_assertions_remaining_window() {
 fn rpc_reports_whether_the_current_root_is_withdrawable() {
     let alice = signer(1);
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     match handle(&mut seq, "sena-test-1", Request::GetStateRoot) {

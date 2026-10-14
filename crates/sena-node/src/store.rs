@@ -82,6 +82,9 @@ struct Metadata {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct StoredBlock {
     height: u64,
+    /// Absent from data directories written before batch timestamps existed.
+    #[serde(default)]
+    timestamp: u64,
     transactions: Vec<Transaction>,
     pre_state_root: String,
     post_state_root: String,
@@ -89,7 +92,9 @@ struct StoredBlock {
 
 /// What a node reads back when it resumes: its state, the assertion chain, and
 /// the batch data it is still responsible for publishing.
-pub type Loaded = (MerkleTrie, ChainSnapshot, Vec<Vec<Transaction>>);
+/// Batches come back as `(timestamp, transactions)`, which is what re-executing
+/// one needs.
+pub type Loaded = (MerkleTrie, ChainSnapshot, Vec<(u64, Vec<Transaction>)>);
 
 /// A node's data directory.
 #[derive(Clone, Debug)]
@@ -204,6 +209,7 @@ impl Store {
             .iter()
             .map(|b| StoredBlock {
                 height: b.height,
+                timestamp: b.timestamp,
                 transactions: b.transactions.clone(),
                 pre_state_root: b.pre_state_root.to_hex(),
                 post_state_root: b.post_state_root.to_hex(),
@@ -284,7 +290,10 @@ impl Store {
                         file: "blocks.json",
                         detail: e.to_string(),
                     })?;
-                stored.into_iter().map(|b| b.transactions).collect()
+                stored
+                    .into_iter()
+                    .map(|b| (b.timestamp, b.transactions))
+                    .collect()
             }
             None => Vec::new(),
         };

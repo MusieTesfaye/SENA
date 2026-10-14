@@ -13,6 +13,9 @@
 use sena_primitives::serde_hex::u128_string;
 use sena_primitives::{AssetId, Hash256, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
+use std::sync::Arc;
+
+use sena_stf::keyless::{self, KeylessConfig};
 use sena_stf::{apply, Council, Instruction, WhitelistedAsset};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +54,36 @@ pub struct CouncilConfig {
     pub threshold: u32,
 }
 
+/// An `(iss_hash, jwk_hash)` pair, as stored in state.
+type JwkHashes = ([u8; 32], [u8; 32]);
+
+/// A JWK accepted at genesis.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct JwkConfig {
+    /// The issuer, exactly as it appears in the JWT `iss` claim.
+    pub iss: String,
+    /// The key id, for operators' reference; not part of consensus.
+    #[serde(default)]
+    pub kid: String,
+    /// The RSA-2048 modulus, base64url, as in the provider's JWKS `n` member.
+    pub n: String,
+}
+
+/// Keyless accounts at genesis.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct KeylessGenesis {
+    /// Which keyless parameter set the chain uses, by name. Use
+    /// `aptos-keyless-mainnet-2025-01` for any network that holds value.
+    pub setup: String,
+    /// Must be set to use the insecure devnet test setup, which exists only
+    /// because Aptos publishes a real proof for it.
+    #[serde(default)]
+    pub allow_insecure_test_setup: bool,
+    /// JWKs accepted from the start. Later rotations go through governance.
+    #[serde(default)]
+    pub jwks: Vec<JwkConfig>,
+}
+
 /// Everything a chain is configured with at genesis.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct GenesisConfig {
@@ -70,6 +103,10 @@ pub struct GenesisConfig {
     pub allocations: Vec<Allocation>,
     /// The governance council, if one is configured.
     pub council: Option<CouncilConfig>,
+    /// Keyless accounts, if enabled. Without this every keyless transaction is
+    /// rejected.
+    #[serde(default)]
+    pub keyless: Option<KeylessGenesis>,
 }
 
 /// Why a genesis configuration could not be applied.
@@ -98,6 +135,23 @@ pub enum GenesisError {
     /// Applying an instruction failed.
     #[error("applying genesis failed: {0}")]
     Apply(String),
+    /// The keyless setup name is not one this build knows.
+    #[error("unknown keyless setup {0:?}")]
+    UnknownKeylessSetup(String),
+    /// The insecure devnet setup was named without acknowledging it.
+    #[error(
+        "keyless setup {0:?} is an insecure single-party test setup; set \
+         allow_insecure_test_setup to use it on a network that holds nothing"
+    )]
+    InsecureKeylessSetup(String),
+    /// A genesis JWK could not be hashed.
+    #[error("JWK {index} is invalid: {reason}")]
+    BadJwk {
+        /// Which JWK.
+        index: usize,
+        /// Why.
+        reason: String,
+    },
 }
 
 impl GenesisConfig {
@@ -122,7 +176,49 @@ impl GenesisConfig {
             }],
             allocations,
             council: None,
+            keyless: None,
         }
+    }
+
+    /// The chain's keyless parameters, or `None` if keyless is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError`] for an unknown setup, or for the insecure test
+    /// setup without `allow_insecure_test_setup`.
+    pub fn keyless_config(&self) -> Result<Option<Arc<KeylessConfig>>, GenesisError> {
+        let Some(k) = &self.keyless else {
+            return Ok(None);
+        };
+        let config = KeylessConfig::by_name(&k.setup)
+            .ok_or_else(|| GenesisError::UnknownKeylessSetup(k.setup.clone()))?;
+        if config.name == KeylessConfig::aptos_devnet_insecure().name
+            && !k.allow_insecure_test_setup
+        {
+            return Err(GenesisError::InsecureKeylessSetup(k.setup.clone()));
+        }
+        Ok(Some(config))
+    }
+
+    /// The genesis JWKs as `(iss_hash, jwk_hash)` pairs.
+    fn jwk_hashes(&self) -> Result<Vec<JwkHashes>, GenesisError> {
+        let Some(k) = &self.keyless else {
+            return Ok(Vec::new());
+        };
+        k.jwks
+            .iter()
+            .enumerate()
+            .map(|(index, jwk)| {
+                let bad = |e: keyless::KeylessError| GenesisError::BadJwk {
+                    index,
+                    reason: e.to_string(),
+                };
+                Ok((
+                    keyless::iss_hash(&jwk.iss).map_err(bad)?,
+                    keyless::rsa_jwk_hash_b64(&jwk.n).map_err(bad)?,
+                ))
+            })
+            .collect()
     }
 
     /// Returns the network salt identifiers are hashed under.
@@ -156,13 +252,16 @@ impl GenesisConfig {
                 decode_key(member).ok_or(GenesisError::BadCouncilKey { index })?;
             }
         }
+        self.keyless_config()?;
+        self.jwk_hashes()?;
         Ok(())
     }
 
     /// Builds the genesis state.
     ///
     /// Order is fixed and documented because the resulting root is consensus:
-    /// gas assets, then the council, then allocations in the order written.
+    /// gas assets, then the council, then JWKs, then allocations, each in the
+    /// order written.
     ///
     /// # Errors
     ///
@@ -193,6 +292,18 @@ impl GenesisConfig {
                 threshold: config.threshold,
             };
             trie.insert(sena_stf::keys::council(), council.encode());
+        }
+
+        for (iss_hash, jwk_hash) in self.jwk_hashes()? {
+            apply(
+                &mut trie,
+                &Instruction::SetJwk {
+                    iss_hash,
+                    jwk_hash,
+                    active: true,
+                },
+            )
+            .map_err(|e| GenesisError::Apply(e.to_string()))?;
         }
 
         for allocation in &self.allocations {

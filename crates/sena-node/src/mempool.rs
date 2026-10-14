@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use sena_primitives::{Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, Transaction};
+use sena_stf::{execute_batch, BatchContext, Transaction};
 
 /// Why a transaction was not admitted.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
@@ -89,6 +89,7 @@ impl Mempool {
     pub fn submit(
         &mut self,
         state: &MerkleTrie,
+        ctx: &BatchContext<'_>,
         transaction: Transaction,
     ) -> Result<Hash256, RejectReason> {
         if self.queued.len() >= self.capacity {
@@ -113,7 +114,7 @@ impl Mempool {
         let mut speculative = state.clone();
         let mut candidate_batch = self.queued.clone();
         candidate_batch.push(transaction.clone());
-        if let Err(error) = execute_batch(&mut speculative, &candidate_batch) {
+        if let Err(error) = execute_batch(&mut speculative, ctx, &candidate_batch) {
             return Err(RejectReason::WouldNotExecute {
                 reason: error.to_string(),
             });

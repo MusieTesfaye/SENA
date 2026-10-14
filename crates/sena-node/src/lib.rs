@@ -19,7 +19,7 @@
 //!
 //! let sequencer = Sequencer::new(genesis.clone(), chain, PartyId(1), 1_000_000);
 //! // A verifier starts from the same genesis and rebuilds everything itself.
-//! let verifier = VerifierNode::new(genesis, PartyId(2));
+//! let verifier = VerifierNode::new(genesis, PartyId(2), None); // keyless off
 //!
 //! assert_eq!(sequencer.finalized_height(), 0);
 //! assert_eq!(verifier.state.root(), sequencer.state.root());

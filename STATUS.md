@@ -63,22 +63,37 @@ too: a groundless challenge loses.
 
 Listed in the order they block a real network.
 
-### 1. Keyless sign-in is disabled
+### 1. Keyless sign-in: verified on L2, not yet adjudicable on L1
 
-**Every keyless transaction is rejected.** The October 2026 prototype was
-unsound and has been quarantined in `attic/unsafe-keyless-2026-10/`:
+**What works (tested against Aptos's own vectors):**
 
-- Its Groth16 verification key was built from known scalars with
-  beta = gamma = delta = G2, and a public helper forged a valid proof for any
-  sender. Any keyless account could be drained.
-- Its "ceremony" hard-coded the toxic waste and had no circuit; its "prover"
-  built proofs from public data; its JWK check could be bypassed; its pepper
-  and ODIS services leaked every pepper and needed no JWT.
+- Keyless accounts use the audited **Aptos Keyless circom circuit**
+  (`circuit-v1.0.1`). The node recomputes the circuit's public-input hash
+  exactly as aptos-core does — Poseidon-BN254 (circomlib constants), the
+  identity commitment, issuer/header/JWK/extra-field hashes, and the OAuth
+  `nonce` — and every intermediate value matches aptos-core's output.
+- Aptos's published sample proof verifies end to end through SENA's verifier,
+  and a sample keyless transfer is admitted, sealed and independently verified
+  (`sena-stf/tests/keyless_aptos_vectors.rs`, `sena-node/tests/keyless.rs`).
+- Production networks use the **Aptos mainnet ceremony VK** (January 2025,
+  `aptos-keyless-trusted-setup-contributions-jan-2025`). The devnet test VK is
+  available only behind an explicit `allow_insecure_test_setup` genesis flag.
+- JWKs live in L2 state, keyed by issuer, seeded at genesis and rotated by
+  council governance (`SetJwk`). Whether a proof's JWK is current is checked
+  in the trace (`VerifyJwk`), so it is disputable.
+- Ephemeral-key expiry is judged against a per-batch timestamp that is part of
+  the batch data, not a node clock.
 
-Keyless is being rebuilt on the Aptos Keyless circom circuit and its ceremony
-verification key, with JWKs held in L2 state and the whole check adjudicable on
-L1. JWT claim parsing, issuer allowlisting, expiry and nonce-to-ephemeral-key
-binding (`sena-stf::keyless`) are unaffected and still tested.
+**What does not:**
+
+- **L1 cannot yet adjudicate a keyless transaction** (nor, today, any
+  transaction — see §2). The Move side needs Poseidon, the public-input hash and
+  Groth16 verification; that is the next piece of work.
+- No prover or pepper service ships with SENA. Wallets need an
+  Aptos-Keyless-compatible prover and a pepper source; client support is
+  tracked below.
+- Training-wheels signatures (Aptos's defence-in-depth against circuit bugs)
+  are not checked.
 
 ### Fixed: any key could spend from any Ed25519 account
 

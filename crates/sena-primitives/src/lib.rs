@@ -20,19 +20,15 @@
 //! ```
 //! use sena_primitives::{Channel, HashedIdentifier, L2Address, NetworkSalt};
 //!
-//! // An account derived from a Google sign-in, with no key material involved.
-//! let address = L2Address::derive_from_oidc(
-//!     "sena-wallet.example",   // aud: the application
-//!     "108241...",             // sub: the provider's subject identifier
-//!     b"user-specific-pepper", // pepper: held privately by the user
-//! );
+//! // A keyless account: an issuer hash and an identity commitment, both
+//! // Poseidon field elements computed by the wallet (see `sena_stf::keyless`).
+//! let address = L2Address::derive_keyless(&[7; 32], &[42; 32]);
 //!
 //! // The handle that resolves to it, stored as an opaque digest.
 //! let salt = NetworkSalt::new(*b"sena-mainnet-salt");
 //! let handle = HashedIdentifier::new(Channel::Handle, "@alice", &salt);
 //!
-//! assert_eq!(address, L2Address::derive_from_oidc(
-//!     "sena-wallet.example", "108241...", b"user-specific-pepper"));
+//! assert_eq!(address, L2Address::derive_keyless(&[7; 32], &[42; 32]));
 //! assert_eq!(handle, HashedIdentifier::new(Channel::Handle, "@ALICE", &salt));
 //! ```
 

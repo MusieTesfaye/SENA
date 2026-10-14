@@ -19,6 +19,7 @@ mod region {
     pub const ASSET: &[u8] = b"SENA:v1:state:asset";
     pub const PARAMETER: &[u8] = b"SENA:v1:state:parameter";
     pub const COUNCIL: &[u8] = b"SENA:v1:state:council";
+    pub const JWK: &[u8] = b"SENA:v1:state:jwk";
 }
 
 /// Key of an account's state.
@@ -63,6 +64,19 @@ pub fn parameter(name: &str) -> Hash256 {
 #[must_use]
 pub fn council() -> Hash256 {
     Hash256::commit(CanonicalEncoder::new(region::COUNCIL))
+}
+
+/// Key of a JWK's acceptance record, for one issuer (REQ-AUTH-003).
+///
+/// Keyed by both hashes so that a JWK accepted for one issuer can never
+/// authorise an account of another.
+#[must_use]
+pub fn jwk(iss_hash: &[u8; 32], jwk_hash: &[u8; 32]) -> Hash256 {
+    Hash256::commit(
+        CanonicalEncoder::new(region::JWK)
+            .field(iss_hash)
+            .field(jwk_hash),
+    )
 }
 
 #[cfg(test)]

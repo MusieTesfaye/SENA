@@ -19,8 +19,8 @@ use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::gas::fee_for;
 use sena_stf::{
-    apply, compile, keys, Account, Authenticator, ExecutionTrace, Instruction, MachineState,
-    Payload, Transaction, WhitelistedAsset, RATE_SCALE,
+    apply, compile, keys, Account, Authenticator, BatchContext, ExecutionTrace, Instruction,
+    MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
 
 use sena_fraudproof::{
@@ -29,6 +29,10 @@ use sena_fraudproof::{
 use sena_node::{Outcome, Sequencer, VerifierNode};
 
 const USDC: AssetId = AssetId(1);
+
+/// The demo uses only Ed25519 accounts, so the batch timestamp does not affect
+/// any outcome and keyless is off.
+const DEMO_CTX: BatchContext<'static> = BatchContext::without_keyless(0);
 const RATE: u128 = RATE_SCALE;
 const BOND: u128 = 1_000_000;
 
@@ -50,7 +54,7 @@ fn honest_operation() {
     let start = genesis(&[(address(&alice), 5_000_000), (address(&bob), 5_000_000)]);
 
     let mut sequencer = new_sequencer(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     println!("  genesis state root   {}", short(&sequencer.state.root()));
 
@@ -64,10 +68,7 @@ fn honest_operation() {
                 amount: 1_000,
             },
         );
-        sequencer
-            .mempool
-            .submit(&sequencer.state, tx)
-            .expect("admission should accept");
+        sequencer.submit(tx).expect("admission should accept");
     }
     println!("  {} transactions queued", sequencer.mempool.len());
 
@@ -136,12 +137,12 @@ fn fraud_is_caught() {
         .collect();
     let program: Vec<Instruction> = batch
         .iter()
-        .flat_map(|tx| compile(tx).expect("compiles"))
+        .flat_map(|tx| compile(tx, &DEMO_CTX).expect("compiles"))
         .collect();
 
     // The honest trace, which the verifier computes for itself.
     let mut honest_state = start.clone();
-    let honest = sena_stf::execute_batch(&mut honest_state, &batch).expect("executes");
+    let honest = sena_stf::execute_batch(&mut honest_state, &DEMO_CTX, &batch).expect("executes");
 
     // The sequencer's lie: it executes a debit of 1 where the batch says 1,000
     // and pockets the difference. The instruction list is unchanged -- only the
@@ -257,10 +258,7 @@ fn withdrawals_wait_for_finality() {
             amount: 500,
         },
     );
-    sequencer
-        .mempool
-        .submit(&sequencer.state, tx)
-        .expect("admission");
+    sequencer.submit(tx).expect("admission");
     let (_, id) = sequencer
         .produce(100)
         .expect("production")

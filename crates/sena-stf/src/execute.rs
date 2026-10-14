@@ -20,8 +20,9 @@ use crate::account::{Account, BalanceError};
 use crate::gas::{self, GasError, WhitelistedAsset};
 use crate::governance::{self, Council, GovernanceError, GovernanceUpdate};
 use crate::instruction::{Instruction, MachineState};
+use crate::keyless::{KeylessConfig, KeylessContext};
 use crate::social::SocialBinding;
-use crate::transaction::{AuthError, Payload, Transaction};
+use crate::transaction::{AuthError, Authenticator, Payload, Transaction};
 
 /// The system-controlled vault that collects fees (REQ-GAS-007).
 ///
@@ -95,6 +96,29 @@ pub enum StepError {
     /// A governance check failed.
     #[error("governance error: {0}")]
     Governance(#[from] GovernanceError),
+    /// The keyless proof was made against a JWK the network does not accept
+    /// for that issuer, or has retired.
+    #[error("JWK is not accepted for this issuer")]
+    JwkNotAccepted,
+}
+
+/// Encodes a JWK acceptance record: one byte, `1` accepted, `0` retired.
+#[must_use]
+pub fn encode_jwk_record(active: bool) -> Vec<u8> {
+    vec![u8::from(active)]
+}
+
+/// Decodes a JWK acceptance record, refusing anything but `0` or `1`.
+///
+/// # Errors
+///
+/// Returns [`StepError::MalformedSlot`] for any other encoding.
+pub fn decode_jwk_record(bytes: &[u8]) -> Result<bool, StepError> {
+    match bytes {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(StepError::MalformedSlot),
+    }
 }
 
 /// The complete semantics of the instruction set.
@@ -200,6 +224,14 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             .check_permitted()?;
             Ok(value.to_be_bytes().to_vec())
         }
+        Instruction::VerifyJwk { .. } => {
+            let bytes = current.ok_or(StepError::JwkNotAccepted)?;
+            if !decode_jwk_record(bytes)? {
+                return Err(StepError::JwkNotAccepted);
+            }
+            Ok(bytes.to_vec())
+        }
+        Instruction::SetJwk { active, .. } => Ok(encode_jwk_record(*active)),
     }
 }
 
@@ -323,6 +355,41 @@ pub enum CompileError {
     Governance(#[from] GovernanceError),
 }
 
+/// What a batch is executed against, besides state.
+///
+/// Both values are part of the published batch data: Aptos L1 compiles a
+/// disputed transaction with the same timestamp and the same keyless
+/// parameters, so they must be fixed per batch rather than read from a clock.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchContext<'a> {
+    /// The batch timestamp (Unix seconds), chosen by the sequencer and bounded
+    /// by L1 when the assertion is posted. Keyless ephemeral keys must not have
+    /// expired at this time.
+    pub timestamp: u64,
+    /// The network's keyless parameters, or `None` if keyless is disabled.
+    pub keyless: Option<&'a KeylessConfig>,
+}
+
+impl BatchContext<'_> {
+    /// A context with keyless accounts disabled.
+    #[must_use]
+    pub const fn without_keyless(timestamp: u64) -> Self {
+        BatchContext {
+            timestamp,
+            keyless: None,
+        }
+    }
+
+    /// The part of the context a keyless check reads.
+    #[must_use]
+    pub fn keyless_context(&self) -> KeylessContext<'_> {
+        KeylessContext {
+            config: self.keyless,
+            now: self.timestamp,
+        }
+    }
+}
+
 /// Turns an authorised transaction into the instructions that execute it.
 ///
 /// # This function must stay a pure function of the transaction
@@ -341,11 +408,17 @@ pub enum CompileError {
 /// and why council signatures are checked by [`Instruction::VerifyCouncil`]
 /// rather than during compilation.
 ///
+/// The context — batch timestamp and keyless parameters — is not state: it is
+/// fixed for the whole batch and published with it.
+///
 /// # Errors
 ///
 /// Returns [`CompileError`] if the transaction is unauthorised or malformed.
-pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileError> {
-    transaction.authenticate()?;
+pub fn compile(
+    transaction: &Transaction,
+    ctx: &BatchContext<'_>,
+) -> Result<Vec<Instruction>, CompileError> {
+    transaction.authenticate(&ctx.keyless_context())?;
 
     let fee = gas::fee_for(transaction.fee_rate)?;
     if transaction.max_fee < fee {
@@ -356,7 +429,15 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
     }
 
     let sender = transaction.sender;
-    let mut instructions = vec![
+    let mut instructions = Vec::new();
+    // The proof was checked above; whether its JWK is current is state.
+    if let Authenticator::Keyless(sig) = &transaction.authenticator {
+        instructions.push(Instruction::VerifyJwk {
+            iss_hash: sig.iss_hash,
+            jwk_hash: sig.jwk_hash,
+        });
+    }
+    instructions.extend([
         Instruction::ConsumeNonce {
             account: sender,
             expected: transaction.nonce,
@@ -377,7 +458,7 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
             asset: transaction.fee_asset,
             amount: fee,
         },
-    ];
+    ]);
 
     match &transaction.payload {
         Payload::Transfer { to, asset, amount } => {
@@ -424,6 +505,15 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
                 GovernanceUpdate::SetParameter { name, value } => Instruction::SetParameter {
                     name: name.clone(),
                     value: *value,
+                },
+                GovernanceUpdate::SetJwk {
+                    iss_hash,
+                    jwk_hash,
+                    active,
+                } => Instruction::SetJwk {
+                    iss_hash: *iss_hash,
+                    jwk_hash: *jwk_hash,
+                    active: *active,
                 },
             });
         }
@@ -538,6 +628,7 @@ pub enum BatchError {
 /// should execute against a clone.
 pub fn execute_batch(
     trie: &mut MerkleTrie,
+    ctx: &BatchContext<'_>,
     transactions: &[Transaction],
 ) -> Result<ExecutionTrace, BatchError> {
     let mut instructions = Vec::new();
@@ -545,7 +636,7 @@ pub fn execute_batch(
 
     for (index, transaction) in transactions.iter().enumerate() {
         let compiled =
-            compile(transaction).map_err(|source| BatchError::Compile { index, source })?;
+            compile(transaction, ctx).map_err(|source| BatchError::Compile { index, source })?;
 
         for instruction in compiled {
             let step = instructions.len();

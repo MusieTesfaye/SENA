@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, L2Address};
 use sena_stf::gas::fee_for;
-use sena_stf::{execute_batch, Authenticator, Payload, Transaction, RATE_SCALE};
+use sena_stf::{execute_batch, Authenticator, BatchContext, Payload, Transaction, RATE_SCALE};
 
 use sena_fraudproof::{AssertionChain, PartyId};
 use sena_node::genesis::{Allocation, GenesisConfig};
@@ -283,15 +283,22 @@ fn published_batch_data_reproduces_the_asserted_root() {
     }
     node.wait_for_height(1);
 
-    let (transactions, asserted_root, pre_root, trace_length) =
+    let (timestamp, transactions, asserted_root, pre_root, trace_length) =
         match call(&node.endpoint, &Request::GetBlock { height: 1 }) {
             Response::Block {
+                timestamp,
                 transactions,
                 post_state_root,
                 pre_state_root,
                 trace_length,
                 ..
-            } => (transactions, post_state_root, pre_state_root, trace_length),
+            } => (
+                timestamp,
+                transactions,
+                post_state_root,
+                pre_state_root,
+                trace_length,
+            ),
             other => panic!("unexpected response: {other:?}"),
         };
 
@@ -308,8 +315,12 @@ fn published_batch_data_reproduces_the_asserted_root() {
         "the block must start from genesis"
     );
 
-    let trace =
-        execute_batch(&mut independent, &transactions).expect("published batch must execute");
+    let trace = execute_batch(
+        &mut independent,
+        &BatchContext::without_keyless(timestamp),
+        &transactions,
+    )
+    .expect("published batch must execute");
 
     assert_eq!(
         independent.root(),
@@ -379,8 +390,13 @@ fn a_node_resumes_from_disk_with_the_same_state() {
     // And the retained batch data still reproduces the state, which is what a
     // verifier would need after the node restarts.
     let mut rebuilt = config.build_state().expect("genesis builds");
-    for batch in &batches {
-        execute_batch(&mut rebuilt, batch).expect("retained batch executes");
+    for (timestamp, batch) in &batches {
+        execute_batch(
+            &mut rebuilt,
+            &BatchContext::without_keyless(*timestamp),
+            batch,
+        )
+        .expect("retained batch executes");
     }
     assert_eq!(
         rebuilt.root(),

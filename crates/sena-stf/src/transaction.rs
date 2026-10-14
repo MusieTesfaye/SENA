@@ -9,6 +9,7 @@ use sena_primitives::{
 use serde::{Deserialize, Serialize};
 
 use crate::governance::{CouncilSignature, GovernanceUpdate};
+use crate::keyless::{self, KeylessContext, KeylessError, KeylessSignature};
 
 /// What a transaction asks the chain to do.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -67,30 +68,9 @@ pub enum Authenticator {
         #[serde(with = "bytes_64")]
         signature: [u8; 64],
     },
-    /// An OIDC keyless authorisation (REQ-AUTH-003, REQ-AUTH-004).
-    ///
-    /// # Not yet implemented
-    ///
-    /// The ephemeral key signature is checked, but the zero-knowledge proof that
-    /// binds that ephemeral key to a genuine Web2 JWT is **not**. Accepting this
-    /// scheme as-is would let anyone spend from any keyless account by
-    /// generating their own ephemeral key, so [`Transaction::authenticate`]
-    /// rejects it outright rather than verifying the part that is implemented
-    /// and quietly skipping the part that is not.
-    ///
-    /// The variant exists so that the wire format, address derivation and
-    /// transaction plumbing can be built and tested ahead of proof verification
-    /// landing. It is deliberately inert until then.
-    Keyless {
-        /// The ephemeral public key that signed this transaction.
-        #[serde(with = "bytes_32")]
-        ephemeral_public_key: [u8; 32],
-        /// The ephemeral key's signature over the transaction.
-        #[serde(with = "bytes_64")]
-        signature: [u8; 64],
-        /// The proof binding the ephemeral key to a JWT. Not yet verified.
-        zk_proof: Vec<u8>,
-    },
+    /// An OIDC keyless authorisation over the Aptos Keyless circuit
+    /// (REQ-AUTH-003, REQ-AUTH-004). See [`crate::keyless`].
+    Keyless(Box<KeylessSignature>),
 }
 
 /// A transaction as submitted to the sequencer.
@@ -229,17 +209,22 @@ impl Transaction {
     /// An Ed25519 account's address *is* its public key, so the key that signed
     /// must be the sender's own. Checking only that the signature matches the
     /// key carried alongside it would let any keypair spend from any account.
+    /// A keyless account's address is derived from the identity the proof
+    /// attests to, and [`keyless::verify`] checks the same binding.
     ///
-    /// Verification is strict (RFC 8032 with canonical `S` and no small-order
-    /// keys), because the Aptos one-step verifier uses
+    /// Signature verification is strict (canonical `S`, no small-order keys),
+    /// because the Aptos one-step verifier uses
     /// `ed25519::signature_verify_strict`. A lenient check here would accept
     /// signatures L1 refuses, and the two would decide disputes differently.
     ///
+    /// Stateless. A keyless transaction additionally needs its JWK to be
+    /// current, which [`crate::Instruction::VerifyJwk`] checks in the trace.
+    ///
     /// # Errors
     ///
-    /// Returns [`AuthError`] if the key is not the sender's, the signature is
-    /// malformed or does not verify, or the scheme is not yet supported.
-    pub fn authenticate(&self) -> Result<(), AuthError> {
+    /// Returns [`AuthError`] if the key is not the sender's, or a signature or
+    /// proof does not verify.
+    pub fn authenticate(&self, keyless_ctx: &KeylessContext<'_>) -> Result<(), AuthError> {
         match &self.authenticator {
             Authenticator::Ed25519 {
                 public_key,
@@ -248,15 +233,18 @@ impl Transaction {
                 if self.sender != L2Address::from_bytes(*public_key) {
                     return Err(AuthError::WrongSigner);
                 }
-                verify_ed25519(public_key, signature, &self.signing_digest())
+                verify_ed25519_strict(public_key, signature, &self.signing_digest())
             }
-            Authenticator::Keyless { .. } => Err(AuthError::KeylessNotImplemented),
+            Authenticator::Keyless(sig) => {
+                keyless::verify(sig, &self.sender, &self.signing_digest(), keyless_ctx)
+                    .map_err(AuthError::Keyless)
+            }
         }
     }
 }
 
 /// Strict Ed25519 verification of `digest`, as Aptos L1 performs it.
-fn verify_ed25519(
+pub(crate) fn verify_ed25519_strict(
     public_key: &[u8; 32],
     signature: &[u8; 64],
     digest: &Hash256,
@@ -271,7 +259,7 @@ fn verify_ed25519(
 }
 
 /// Why a transaction failed authentication.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 pub enum AuthError {
     /// The public key is not a valid Ed25519 point.
     #[error("malformed public key")]
@@ -282,11 +270,7 @@ pub enum AuthError {
     /// The signing key does not belong to the sender.
     #[error("the signing key is not the sender's")]
     WrongSigner,
-    /// Keyless authentication is not yet available.
-    #[error(
-        "keyless authentication is not implemented: the ZK proof binding the \
-             ephemeral key to a JWT is not yet verified, so the scheme is rejected \
-             rather than accepted unchecked"
-    )]
-    KeylessNotImplemented,
+    /// The keyless authorisation was refused.
+    #[error("keyless authorisation refused: {0}")]
+    Keyless(#[from] KeylessError),
 }

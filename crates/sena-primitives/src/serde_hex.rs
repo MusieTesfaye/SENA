@@ -55,6 +55,64 @@ pub mod bytes_64 {
     }
 }
 
+/// Serialises a `[u8; 128]` as a hex string (a compressed Groth16 proof).
+pub mod bytes_128 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the array as lowercase hex.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the serializer's error.
+    pub fn serialize<S: Serializer>(bytes: &[u8; 128], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    /// Reads a 256-character hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not hex or is not 128 bytes.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 128], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 128 bytes"))
+    }
+}
+
+/// Serialises an `Option<[u8; 32]>` as a hex string or `null`.
+pub mod opt_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the array as lowercase hex, or `null`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the serializer's error.
+    pub fn serialize<S: Serializer>(bytes: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => s.serialize_some(&hex::encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    /// Reads a 64-character hex string or `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not hex or is not 32 bytes.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let Some(s) = Option::<String>::deserialize(d)? else {
+            return Ok(None);
+        };
+        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+    }
+}
+
 /// Serialises a `u128` as a decimal string.
 ///
 /// JSON numbers are IEEE-754 doubles in most clients, JavaScript included, so a

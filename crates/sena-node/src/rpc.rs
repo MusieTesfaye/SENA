@@ -153,6 +153,10 @@ pub enum Response {
     Block {
         /// Its height.
         height: u64,
+        /// The batch timestamp, part of the batch data.
+        timestamp: u64,
+        /// The commitment the covering assertion carries.
+        batch_commitment: Hash256,
         /// State root before the block.
         pre_state_root: Hash256,
         /// State root after it.
@@ -382,12 +386,7 @@ fn da_blob(sequencer: &Sequencer, height: u64) -> Response {
             message: format!("no block at height {height}"),
         },
         Some(block) => Response::DaBlob {
-            blob: crate::da::DaBlob::new(
-                block.height,
-                block.pre_state_root,
-                block.post_state_root,
-                block.transactions.clone(),
-            ),
+            blob: crate::da::DaBlob::from_block(block),
         },
     }
 }
@@ -398,17 +397,15 @@ fn da_blob(sequencer: &Sequencer, height: u64) -> Response {
 /// talking to the network it thinks it is.
 pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Response {
     match request {
-        Request::SubmitTransaction(transaction) => {
-            match sequencer.mempool.submit(&sequencer.state, *transaction) {
-                Ok(hash) => Response::Submitted {
-                    hash,
-                    confirmation: Confirmation::Pending,
-                },
-                Err(reason) => Response::Error {
-                    message: reason.to_string(),
-                },
-            }
-        }
+        Request::SubmitTransaction(transaction) => match sequencer.submit(*transaction) {
+            Ok(hash) => Response::Submitted {
+                hash,
+                confirmation: Confirmation::Pending,
+            },
+            Err(reason) => Response::Error {
+                message: reason.to_string(),
+            },
+        },
 
         Request::GetAccount { address } => {
             let account = sequencer
@@ -468,8 +465,9 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
         }
 
         Request::GetBlock { height } => {
-            match usize::try_from(height.saturating_sub(1))
-                .ok()
+            match height
+                .checked_sub(1)
+                .and_then(|i| usize::try_from(i).ok())
                 .and_then(|i| sequencer.blocks.get(i))
             {
                 None => Response::Error {
@@ -477,6 +475,8 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
                 },
                 Some(block) => Response::Block {
                     height: block.height,
+                    timestamp: block.timestamp,
+                    batch_commitment: block.batch_commitment(),
                     pre_state_root: block.pre_state_root,
                     post_state_root: block.post_state_root,
                     transactions: block.transactions.clone(),

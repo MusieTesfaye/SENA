@@ -20,8 +20,8 @@ use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::gas::fee_for;
 use sena_stf::{
-    apply, compile, execute_batch, Authenticator, ExecutionTrace, Instruction, MachineState,
-    Payload, Transaction, WhitelistedAsset, RATE_SCALE,
+    apply, compile, execute_batch, Authenticator, BatchContext, ExecutionTrace, Instruction,
+    MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
 
 use sena_fraudproof::{
@@ -30,6 +30,8 @@ use sena_fraudproof::{
     VerdictReason, CHALLENGE_WINDOW_FLOOR, DEFAULT_CHALLENGE_WINDOW, MOVE_TIMEOUT,
 };
 
+/// These tests use Ed25519 accounts only; keyless is off.
+const CTX: BatchContext<'static> = BatchContext::without_keyless(0);
 const USDC: AssetId = AssetId(1);
 const RATE: u128 = RATE_SCALE;
 const BOND: u128 = 1_000_000;
@@ -130,7 +132,7 @@ fn sample_batch() -> (MerkleTrie, Vec<Transaction>) {
 fn program(batch: &[Transaction]) -> Vec<Instruction> {
     batch
         .iter()
-        .flat_map(|tx| compile(tx).expect("batch must compile"))
+        .flat_map(|tx| compile(tx, &CTX).expect("batch must compile"))
         .collect()
 }
 
@@ -247,7 +249,7 @@ fn an_honest_verifier_defeats_a_sequencer_who_inflates_a_balance() {
     let liar = fraudulent_trace(&pre, &instructions, fraud_step, &substitute);
 
     let mut honest_trie = pre.clone();
-    let honest = execute_batch(&mut honest_trie, &batch).unwrap();
+    let honest = execute_batch(&mut honest_trie, &CTX, &batch).unwrap();
 
     assert_ne!(
         liar.final_state().state_root,
@@ -295,7 +297,7 @@ fn the_verdict_names_the_reason_the_claim_failed() {
 
     let liar = fraudulent_trace(&pre, &instructions, fraud_step, &substitute);
     let mut honest_trie = pre.clone();
-    let honest = execute_batch(&mut honest_trie, &batch).unwrap();
+    let honest = execute_batch(&mut honest_trie, &CTX, &batch).unwrap();
 
     let defender = TracePlayer::new(liar.clone(), pre.clone());
     let challenger = TracePlayer::new(honest, pre);
@@ -328,7 +330,7 @@ fn an_honest_sequencer_defeats_a_frivolous_challenger() {
     let instructions = program(&batch);
 
     let mut honest_trie = pre.clone();
-    let honest = execute_batch(&mut honest_trie, &batch).unwrap();
+    let honest = execute_batch(&mut honest_trie, &CTX, &batch).unwrap();
 
     // The challenger invents a divergence that is not there.
     let victim = address_of(&signer(2));
@@ -377,7 +379,7 @@ fn bisection_converges_in_logarithmic_rounds() {
 
     let liar = fraudulent_trace(&pre, &instructions, fraud_step, &substitute);
     let mut honest_trie = pre.clone();
-    let honest = execute_batch(&mut honest_trie, &batch).unwrap();
+    let honest = execute_batch(&mut honest_trie, &CTX, &batch).unwrap();
 
     let defender = TracePlayer::new(liar.clone(), pre.clone());
     let challenger = TracePlayer::new(honest, pre);
@@ -410,7 +412,7 @@ fn bisection_converges_in_logarithmic_rounds() {
 fn a_party_that_stops_responding_forfeits() {
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
     let player = TracePlayer::new(honest.clone(), pre);
 
     let mut dispute = open_dispute(&player, &player, honest.len() as u64);
@@ -442,7 +444,7 @@ fn a_party_that_exhausts_its_total_budget_forfeits() {
     // the budget ran out -- which is the system working, not the clock failing.
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
     let player = TracePlayer::new(honest.clone(), pre);
     let mut dispute = open_dispute(&player, &player, honest.len() as u64);
 
@@ -467,7 +469,7 @@ fn a_party_that_exhausts_its_total_budget_forfeits() {
 fn moves_are_charged_against_the_mover_clock() {
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
     let player = TracePlayer::new(honest.clone(), pre);
     let mut dispute = open_dispute(&player, &player, honest.len() as u64);
 
@@ -508,7 +510,7 @@ fn a_single_move_can_never_consume_a_whole_budget() {
     // exceed the total budget, letting one stall end the dispute outright.
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
     let player = TracePlayer::new(honest.clone(), pre);
     let length = honest.len() as u64;
 
@@ -539,7 +541,7 @@ fn a_single_move_can_never_consume_a_whole_budget() {
 fn a_verifier_detects_a_divergent_root() {
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     let sound = Assertion {
         parent: AssertionId::GENESIS,
@@ -561,7 +563,7 @@ fn a_verifier_detects_a_divergent_root() {
 fn a_verifier_detects_an_overstated_trace_length() {
     let (pre, batch) = sample_batch();
     let mut trie = pre.clone();
-    let honest = execute_batch(&mut trie, &batch).unwrap();
+    let honest = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     let mut lying = Assertion {
         parent: AssertionId::GENESIS,
@@ -803,7 +805,7 @@ proptest! {
 
         let liar = fraudulent_trace(&pre, &instructions, fraud_step, &substitute);
         let mut honest_trie = pre.clone();
-        let honest = execute_batch(&mut honest_trie, &batch).unwrap();
+        let honest = execute_batch(&mut honest_trie, &CTX, &batch).unwrap();
 
         let defender = TracePlayer::new(liar.clone(), pre.clone());
         let challenger = TracePlayer::new(honest, pre);

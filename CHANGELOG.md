@@ -5,6 +5,18 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### Keyless accounts on the Aptos Keyless circuit
+
+- Keyless verification now targets the audited Aptos Keyless circom circuit
+  (`circuit-v1.0.1`) and the Aptos mainnet ceremony verification key. Poseidon,
+  the public-input hash and every client-side derivation match aptos-core, and
+  Aptos's sample proof verifies end to end.
+- JWKs are L2 state under council governance; `VerifyJwk` checks them in the
+  trace. Batches carry a timestamp, against which ephemeral-key expiry is judged.
+- Keyless addresses are `H(iss_hash, idc)`; the old `derive_from_oidc` is gone.
+- Council signatures are now verified strictly, as L1 will verify them.
+- Genesis gains an optional `keyless` section (setup name and initial JWKs).
+
 ### Security
 
 - **Fixed: any key could spend from any Ed25519 account.** Authentication now

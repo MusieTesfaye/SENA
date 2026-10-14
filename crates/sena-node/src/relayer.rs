@@ -169,12 +169,10 @@ impl AptosRelayer {
             Response::Block {
                 pre_state_root,
                 post_state_root,
-                transactions,
+                batch_commitment,
                 trace_length,
                 ..
             } => {
-                let batch_bytes = serde_json::to_vec(&transactions).unwrap_or_default();
-                let batch_commitment = Hash256::digest(&batch_bytes);
                 let effective_trace_length = trace_length.max(1);
                 Ok((
                     pre_state_root,

@@ -1734,9 +1734,7 @@ dependencies = [
  "ark-ec",
  "ark-ff",
  "ark-groth16",
- "ark-relations",
  "ark-serialize",
- "ark-snark",
  "base64 0.22.1",
  "ed25519-dalek",
  "hex",
@@ -1747,6 +1745,7 @@ dependencies = [
  "sena-state",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

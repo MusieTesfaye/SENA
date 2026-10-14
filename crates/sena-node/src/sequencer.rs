@@ -1,19 +1,43 @@
 //! Block production and assertion posting.
 
-use sena_primitives::Hash256;
+use std::sync::Arc;
+
+use sena_primitives::{domain, CanonicalEncoder, Hash256};
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, BatchError, ExecutionTrace, Transaction};
+use sena_stf::{
+    execute_batch, BatchContext, BatchError, ExecutionTrace, KeylessConfig, Transaction,
+};
 use serde::{Deserialize, Serialize};
 
 use sena_fraudproof::{Assertion, AssertionChain, AssertionId, ChainError, PartyId};
 
-use crate::mempool::Mempool;
+use crate::mempool::{Mempool, RejectReason};
+
+/// How far ahead of the clock mempool admission judges keyless expiry.
+///
+/// A transaction admitted at `t` is sealed a little later. Without a margin an
+/// ephemeral key expiring in between would make the whole batch fail.
+pub const ADMISSION_EXPIRY_MARGIN_SECS: u64 = 60;
+
+/// Seconds since the Unix epoch, from the system clock.
+///
+/// Only the sequencer reads a clock, to choose a batch timestamp; the state
+/// transition function never does (REQ-FRAUD-031).
+#[must_use]
+pub fn system_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// A produced L2 block.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
     /// Height, counting from one.
     pub height: u64,
+    /// The batch timestamp (Unix seconds). Part of the batch data: keyless
+    /// expiry is judged against it, and it never decreases.
+    pub timestamp: u64,
     /// The transactions, in the order they were executed.
     ///
     /// This *is* the published batch data (REQ-FRAUD-007). A verifier
@@ -37,10 +61,23 @@ impl Block {
     /// Panics only if serialisation fails, which cannot occur.
     #[must_use]
     pub fn batch_commitment(&self) -> Hash256 {
-        let encoded =
-            serde_json::to_vec(&self.transactions).expect("batch serialisation cannot fail");
-        Hash256::digest(&encoded)
+        batch_commitment(self.timestamp, &self.transactions)
     }
+}
+
+/// Commits to a batch: its timestamp and its transactions, in order.
+///
+/// # Panics
+///
+/// Panics only if serialisation fails, which cannot occur.
+#[must_use]
+pub fn batch_commitment(timestamp: u64, transactions: &[Transaction]) -> Hash256 {
+    let encoded = serde_json::to_vec(transactions).expect("batch serialisation cannot fail");
+    Hash256::commit(
+        CanonicalEncoder::new(domain::BATCH)
+            .u64(timestamp)
+            .field(&encoded),
+    )
 }
 
 /// A transaction's confirmation status.
@@ -102,6 +139,10 @@ pub struct Sequencer {
     assertions: Vec<AssertionId>,
     /// Most recent assertion, which the next one builds on.
     head: AssertionId,
+    /// The network's keyless parameters, or `None` if keyless is disabled.
+    keyless: Option<Arc<KeylessConfig>>,
+    /// Where batch timestamps come from.
+    clock: fn() -> u64,
 }
 
 impl Sequencer {
@@ -127,7 +168,55 @@ impl Sequencer {
             bond,
             assertions: Vec::new(),
             head,
+            keyless: None,
+            clock: system_clock,
         }
+    }
+
+    /// Enables keyless accounts with the network's parameters.
+    #[must_use]
+    pub fn with_keyless(mut self, keyless: Option<Arc<KeylessConfig>>) -> Self {
+        self.keyless = keyless;
+        self
+    }
+
+    /// Replaces the clock batch timestamps are read from (for tests).
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The network's keyless parameters.
+    #[must_use]
+    pub fn keyless(&self) -> Option<&Arc<KeylessConfig>> {
+        self.keyless.as_ref()
+    }
+
+    /// The timestamp the next batch will carry: the clock, but never earlier
+    /// than the previous batch.
+    #[must_use]
+    pub fn next_timestamp(&self) -> u64 {
+        let last = self.blocks.last().map_or(0, |b| b.timestamp);
+        (self.clock)().max(last)
+    }
+
+    /// Offers a transaction to the mempool.
+    ///
+    /// Admission executes it, after everything already queued, with a batch
+    /// time [`ADMISSION_EXPIRY_MARGIN_SECS`] ahead of the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`] if the mempool refuses it.
+    pub fn submit(&mut self, transaction: Transaction) -> Result<Hash256, RejectReason> {
+        let ctx = BatchContext {
+            timestamp: self
+                .next_timestamp()
+                .saturating_add(ADMISSION_EXPIRY_MARGIN_SECS),
+            keyless: self.keyless.as_deref(),
+        };
+        self.mempool.submit(&self.state, &ctx, transaction)
     }
 
     /// Produces a block from up to `limit` queued transactions and posts a
@@ -146,14 +235,38 @@ impl Sequencer {
         }
 
         let pre_state_root = self.state.root();
+        let timestamp = self.next_timestamp();
+        let ctx = BatchContext {
+            timestamp,
+            keyless: self.keyless.as_deref(),
+        };
 
         // Execute against a copy: on failure the canonical state must be left
         // untouched, since execute_batch leaves a partially applied trie behind.
-        let mut next = self.state.clone();
-        let trace = execute_batch(&mut next, &transactions)?;
+        //
+        // A transaction admitted earlier can stop compiling by sealing time —
+        // a keyless ephemeral key that expired despite the admission margin.
+        // Including it would make the whole batch invalid, so it is dropped
+        // and the rest retried. Any other failure is an admission bug and is
+        // reported rather than papered over.
+        let mut transactions = transactions;
+        let (next, trace) = loop {
+            let mut next = self.state.clone();
+            match execute_batch(&mut next, &ctx, &transactions) {
+                Ok(trace) => break (next, trace),
+                Err(BatchError::Compile { index, .. }) => {
+                    transactions.remove(index);
+                    if transactions.is_empty() {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         let block = Block {
             height: self.blocks.len() as u64 + 1,
+            timestamp,
             transactions,
             pre_state_root,
             post_state_root: next.root(),

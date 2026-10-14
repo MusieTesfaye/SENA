@@ -294,8 +294,13 @@ fn serve(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no genesis.json in {data_dir}; run `sena-node genesis` first"))?;
 
+    let keyless = config.keyless_config().map_err(|e| e.to_string())?;
+    match &keyless {
+        Some(k) => println!("keyless accounts enabled ({})", k.name),
+        None => println!("keyless accounts disabled (no `keyless` section in genesis)"),
+    }
     let loaded = store.load(&config).map_err(|e| e.to_string())?;
-    let mut sequencer = match loaded {
+    let sequencer = match loaded {
         Some((state, chain, batches)) => {
             println!("resuming from {} blocks of saved state", batches.len());
             let chain = sena_fraudproof::AssertionChain::restore(chain);
@@ -312,6 +317,7 @@ fn serve(
             Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
         }
     };
+    let mut sequencer = sequencer.with_keyless(keyless);
 
     // Warn rather than refuse: binding a public interface without a token is a
     // choice an operator can legitimately make behind their own proxy, but it
