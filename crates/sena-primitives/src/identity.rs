@@ -60,6 +60,17 @@ impl Channel {
         }
     }
 
+    /// The channel a discriminant names, if any.
+    #[must_use]
+    pub const fn from_discriminant(d: u8) -> Option<Self> {
+        match d {
+            0 => Some(Self::Email),
+            1 => Some(Self::Phone),
+            2 => Some(Self::Handle),
+            _ => None,
+        }
+    }
+
     /// The tag committed to in the identifier hash.
     #[must_use]
     pub const fn tag(self) -> &'static [u8] {

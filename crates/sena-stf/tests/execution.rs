@@ -97,11 +97,12 @@ fn whitelist(trie: &mut MerkleTrie, asset: AssetId, symbol: &str, rate: u128, en
     apply(trie, &Instruction::SetGasAsset { record }).unwrap();
 }
 
-/// Installs a council with the given members and threshold.
+/// Installs a council with the given members and threshold, at epoch 1.
 fn install_council(trie: &mut MerkleTrie, keys: &[SigningKey], threshold: u32) {
     let council = Council {
         members: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
         threshold,
+        epoch: 1,
     };
     trie.insert(keys::council(), council.encode());
 }
@@ -1075,6 +1076,48 @@ fn a_governance_payload_cannot_be_replayed_in_a_later_epoch() {
     assert!(execute_batch(&mut trie, &CTX, &[replayed]).is_err());
 }
 
+/// Regression test: the epoch was signed over but never checked against state,
+/// so an applied payload could be re-submitted indefinitely — re-enabling an
+/// asset the council had since disabled, for instance.
+#[test]
+fn an_applied_governance_payload_cannot_be_applied_again() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "gas.base_native".to_owned(),
+        value: 5,
+    };
+    let signatures = council_sign(&[(0, &m1)], &update, 1);
+    let payload = Payload::Governance {
+        epoch: 1,
+        update,
+        signatures,
+    };
+    execute_batch(&mut trie, &CTX, &[signed(&alice, 0, payload.clone())])
+        .expect("first application succeeds");
+
+    let council = Council::decode(trie.get(&keys::council()).unwrap()).unwrap();
+    assert_eq!(council.epoch, 2, "applying a payload consumes its epoch");
+
+    let err = execute_batch(&mut trie, &CTX, &[signed(&alice, 1, payload)]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::Governance(sena_stf::GovernanceError::WrongEpoch {
+                    expected: 2,
+                    signed: 1
+                }),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn the_council_cannot_reach_the_dispute_system() {
     // REQ-GOV-007. Even a unanimous, correctly signed council must not be able
@@ -1123,12 +1166,12 @@ fn governance_changes_are_covered_by_the_execution_trace() {
         name: "batch.max_transactions".to_owned(),
         value: 512,
     };
-    let signatures = council_sign(&[(0, &m1)], &update, 7);
+    let signatures = council_sign(&[(0, &m1)], &update, 1);
     let tx = signed(
         &alice,
         0,
         Payload::Governance {
-            epoch: 7,
+            epoch: 1,
             update,
             signatures,
         },

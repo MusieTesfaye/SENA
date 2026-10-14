@@ -200,11 +200,44 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             // like every other.
             Ok(bytes.to_vec())
         }
-        Instruction::VerifyCouncil { digest, signatures } => {
-            let bytes = current.ok_or(GovernanceError::MalformedCouncil)?;
-            let council = Council::decode(bytes)?;
-            governance::verify_council_signatures(&council, digest, signatures)?;
+        Instruction::VerifyCouncil { .. }
+        | Instruction::SetGasAsset { .. }
+        | Instruction::SetParameter { .. } => governance_transition(instruction, current),
+        Instruction::VerifyJwk { .. } => {
+            let bytes = current.ok_or(StepError::JwkNotAccepted)?;
+            if !decode_jwk_record(bytes)? {
+                return Err(StepError::JwkNotAccepted);
+            }
             Ok(bytes.to_vec())
+        }
+        Instruction::SetJwk { active, .. } => Ok(encode_jwk_record(*active)),
+    }
+}
+
+/// The governance half of [`transition`]: council verification and the two
+/// writes it authorises.
+fn governance_transition(
+    instruction: &Instruction,
+    current: Option<&[u8]>,
+) -> Result<Vec<u8>, StepError> {
+    match instruction {
+        Instruction::VerifyCouncil {
+            epoch,
+            digest,
+            signatures,
+        } => {
+            let bytes = current.ok_or(GovernanceError::MalformedCouncil)?;
+            let mut council = Council::decode(bytes)?;
+            if council.epoch != *epoch {
+                return Err(GovernanceError::WrongEpoch {
+                    expected: council.epoch,
+                    signed: *epoch,
+                }
+                .into());
+            }
+            governance::verify_council_signatures(&council, digest, signatures)?;
+            council.epoch = council.epoch.checked_add(1).ok_or(BalanceError::Overflow)?;
+            Ok(council.encode())
         }
         Instruction::SetGasAsset { record } => {
             GovernanceUpdate::SetGasAsset {
@@ -224,14 +257,7 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             .check_permitted()?;
             Ok(value.to_be_bytes().to_vec())
         }
-        Instruction::VerifyJwk { .. } => {
-            let bytes = current.ok_or(StepError::JwkNotAccepted)?;
-            if !decode_jwk_record(bytes)? {
-                return Err(StepError::JwkNotAccepted);
-            }
-            Ok(bytes.to_vec())
-        }
-        Instruction::SetJwk { active, .. } => Ok(encode_jwk_record(*active)),
+        _ => unreachable!("only governance instructions are routed here"),
     }
 }
 
@@ -353,6 +379,9 @@ pub enum CompileError {
     /// The governance update is not one the council may make.
     #[error("governance error: {0}")]
     Governance(#[from] GovernanceError),
+    /// The transaction exceeds the wire-format limits L1 can adjudicate.
+    #[error("transaction exceeds wire limits: {0}")]
+    Wire(#[from] crate::wire::WireError),
 }
 
 /// What a batch is executed against, besides state.
@@ -418,6 +447,17 @@ pub fn compile(
     transaction: &Transaction,
     ctx: &BatchContext<'_>,
 ) -> Result<Vec<Instruction>, CompileError> {
+    // Size limits first: Aptos L1 must be able to decode and compile anything
+    // a batch contains, and it refuses what is over these bounds.
+    let encoded_len = transaction.encode().len();
+    if encoded_len > crate::wire::MAX_TRANSACTION_BYTES {
+        return Err(crate::wire::WireError::TooLarge(encoded_len).into());
+    }
+    if let Payload::Governance { signatures, .. } = &transaction.payload {
+        if signatures.len() > crate::wire::MAX_COUNCIL_SIGNATURES {
+            return Err(crate::wire::WireError::TooManySignatures.into());
+        }
+    }
     transaction.authenticate(&ctx.keyless_context())?;
 
     let fee = gas::fee_for(transaction.fee_rate)?;
@@ -460,7 +500,17 @@ pub fn compile(
         },
     ]);
 
-    match &transaction.payload {
+    compile_payload(&transaction.payload, sender, &mut instructions)?;
+    Ok(instructions)
+}
+
+/// Appends the instructions a payload compiles to, after the fee steps.
+fn compile_payload(
+    payload: &Payload,
+    sender: L2Address,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    match payload {
         Payload::Transfer { to, asset, amount } => {
             if *to == sender {
                 return Err(CompileError::SelfTransfer);
@@ -495,6 +545,7 @@ pub fn compile(
         } => {
             update.check_permitted()?;
             instructions.push(Instruction::VerifyCouncil {
+                epoch: *epoch,
                 digest: update.signing_digest(*epoch),
                 signatures: signatures.clone(),
             });
@@ -519,7 +570,7 @@ pub fn compile(
         }
     }
 
-    Ok(instructions)
+    Ok(())
 }
 
 /// The full record of executing a batch, and the input to a fraud proof.
@@ -533,9 +584,35 @@ pub struct ExecutionTrace {
     /// `instructions[i]`, and the last entry is the state after the batch.
     /// Bisection indexes into this.
     pub states: Vec<MachineState>,
+    /// Where each transaction's instructions begin, one entry per transaction.
+    /// What the batch commitment's leaves record as `start_pc`.
+    pub tx_starts: Vec<u64>,
 }
 
 impl ExecutionTrace {
+    /// Builds the batch commitment tree for the transactions this trace
+    /// executed, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `transactions` is not the batch the trace was produced from
+    /// (a different count).
+    #[must_use]
+    pub fn batch_tree(&self, transactions: &[Transaction]) -> crate::batch::BatchTree {
+        assert_eq!(
+            transactions.len(),
+            self.tx_starts.len(),
+            "the trace and the batch must match"
+        );
+        let leaves: Vec<(u64, Vec<u8>)> = self
+            .tx_starts
+            .iter()
+            .zip(transactions)
+            .map(|(start, tx)| (*start, tx.encode()))
+            .collect();
+        crate::batch::BatchTree::build(&leaves)
+    }
+
     /// Returns the number of steps in the trace.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -633,8 +710,10 @@ pub fn execute_batch(
 ) -> Result<ExecutionTrace, BatchError> {
     let mut instructions = Vec::new();
     let mut states = vec![MachineState::start(trie.root())];
+    let mut tx_starts = Vec::with_capacity(transactions.len());
 
     for (index, transaction) in transactions.iter().enumerate() {
+        tx_starts.push(u64::try_from(instructions.len()).expect("trace length fits in u64"));
         let compiled =
             compile(transaction, ctx).map_err(|source| BatchError::Compile { index, source })?;
 
@@ -656,6 +735,7 @@ pub fn execute_batch(
     Ok(ExecutionTrace {
         instructions,
         states,
+        tx_starts,
     })
 }
 

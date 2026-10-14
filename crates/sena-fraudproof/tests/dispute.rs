@@ -165,6 +165,9 @@ fn fraudulent_trace(
     ExecutionTrace {
         instructions: instructions.to_vec(),
         states,
+        // A forged trace over the same program: transaction boundaries are
+        // irrelevant to these tests, which dispute instruction steps.
+        tx_starts: Vec::new(),
     }
 }
 

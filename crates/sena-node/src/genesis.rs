@@ -290,6 +290,7 @@ impl GenesisConfig {
             let council = Council {
                 members,
                 threshold: config.threshold,
+                epoch: 0,
             };
             trie.insert(sena_stf::keys::council(), council.encode());
         }

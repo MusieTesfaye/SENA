@@ -8,7 +8,9 @@ use sena_primitives::Hash256;
 use sena_state::MerkleTrie;
 use sena_stf::{execute_batch, BatchContext, KeylessConfig, Transaction};
 
-use crate::sequencer::{batch_commitment, Block};
+use sena_stf::batch::{header_commitment, BatchTree};
+
+use crate::sequencer::Block;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,9 @@ pub struct DaBlob {
     pub batch_commitment: Hash256,
     /// The transactions, in execution order.
     pub transactions: Vec<Transaction>,
+    /// Where each transaction's instructions begin in the trace — the
+    /// `start_pc` of each leaf of the batch commitment.
+    pub tx_starts: Vec<u64>,
 }
 
 impl DaBlob {
@@ -43,19 +48,28 @@ impl DaBlob {
             post_state_root: block.post_state_root,
             batch_commitment: block.batch_commitment(),
             transactions: block.transactions.clone(),
+            tx_starts: block.trace.tx_starts.clone(),
         }
     }
 
     /// The commitment these transactions and timestamp actually produce.
     #[must_use]
     pub fn computed_commitment(&self) -> Hash256 {
-        batch_commitment(self.timestamp, &self.transactions)
+        let leaves: Vec<(u64, Vec<u8>)> = self
+            .tx_starts
+            .iter()
+            .zip(&self.transactions)
+            .map(|(start, tx)| (*start, tx.encode()))
+            .collect();
+        let tree = BatchTree::build(&leaves);
+        header_commitment(self.timestamp, tree.tx_count(), &tree.root())
     }
 
     /// Whether the stated commitment matches the contents.
     #[must_use]
     pub fn verify_integrity(&self) -> bool {
-        self.computed_commitment() == self.batch_commitment
+        self.tx_starts.len() == self.transactions.len()
+            && self.computed_commitment() == self.batch_commitment
     }
 
     /// Re-executes the blob from `starting_state` and checks it reaches the
@@ -86,8 +100,11 @@ impl DaBlob {
             timestamp: self.timestamp,
             keyless,
         };
-        execute_batch(starting_state, &ctx, &self.transactions)
+        let trace = execute_batch(starting_state, &ctx, &self.transactions)
             .map_err(|e| format!("batch execution failed: {e}"))?;
+        if trace.tx_starts != self.tx_starts {
+            return Err("the committed transaction start positions are wrong".to_string());
+        }
 
         let final_root = starting_state.root();
         if final_root != self.post_state_root {
@@ -238,17 +255,19 @@ mod tests {
 
         let ctx = BatchContext::without_keyless(1_700_000_000);
         let mut exec_state = starting_state.clone();
-        execute_batch(&mut exec_state, &ctx, std::slice::from_ref(&tx)).unwrap();
+        let transactions = vec![tx];
+        let trace = execute_batch(&mut exec_state, &ctx, &transactions).unwrap();
         let post_root = exec_state.root();
 
-        let transactions = vec![tx];
+        let tree = trace.batch_tree(&transactions);
         let da_blob = DaBlob {
             height: 1,
             timestamp: ctx.timestamp,
             pre_state_root: pre_root,
             post_state_root: post_root,
-            batch_commitment: batch_commitment(ctx.timestamp, &transactions),
+            batch_commitment: header_commitment(ctx.timestamp, tree.tx_count(), &tree.root()),
             transactions,
+            tx_starts: trace.tx_starts.clone(),
         };
         assert!(da_blob.verify_integrity());
 

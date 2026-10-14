@@ -100,18 +100,6 @@ pub struct Transaction {
     pub authenticator: Authenticator,
 }
 
-/// Discriminants for the canonical payload encoding.
-///
-/// Fixed explicitly rather than derived from declaration order: the signing
-/// digest depends on them, so reordering the enum would invalidate every
-/// signature ever produced.
-mod payload_tag {
-    pub const TRANSFER: u8 = 0;
-    pub const BIND_IDENTIFIER: u8 = 1;
-    pub const UNBIND_IDENTIFIER: u8 = 2;
-    pub const GOVERNANCE: u8 = 3;
-}
-
 impl Payload {
     /// Encodes the payload canonically, for the signing digest.
     ///
@@ -127,43 +115,7 @@ impl Payload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        match self {
-            Self::Transfer { to, asset, amount } => {
-                w.u8(payload_tag::TRANSFER);
-                w.bytes32(to.as_bytes());
-                w.u32(asset.get());
-                w.u128(*amount);
-            }
-            Self::BindIdentifier {
-                channel,
-                identifier,
-            } => {
-                w.u8(payload_tag::BIND_IDENTIFIER);
-                w.u8(channel.discriminant());
-                w.bytes32(identifier.as_hash().as_bytes());
-            }
-            Self::UnbindIdentifier { identifier } => {
-                w.u8(payload_tag::UNBIND_IDENTIFIER);
-                w.bytes32(identifier.as_hash().as_bytes());
-            }
-            Self::Governance {
-                epoch,
-                update,
-                signatures,
-            } => {
-                w.u8(payload_tag::GOVERNANCE);
-                w.u64(*epoch);
-                w.bytes(&update.encode());
-                w.u32(
-                    u32::try_from(signatures.len())
-                        .expect("a payload cannot carry 2^32 signatures"),
-                );
-                for signature in signatures {
-                    w.u32(signature.index);
-                    w.bytes(&signature.signature);
-                }
-            }
-        }
+        crate::wire::write_payload(&mut w, self);
         w.finish()
     }
 }
@@ -193,15 +145,27 @@ impl Transaction {
         )
     }
 
-    /// Returns the transaction's identifier.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialising the transaction fails, which cannot occur.
+    /// Returns the transaction's identifier: the hash of its canonical
+    /// encoding, authenticator included.
     #[must_use]
     pub fn hash(&self) -> Hash256 {
-        let encoded = serde_json::to_vec(self).expect("transaction serialisation cannot fail");
-        Hash256::digest(&encoded)
+        Hash256::digest(&self.encode())
+    }
+
+    /// Encodes the transaction canonically, as batches publish it.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        crate::wire::encode(self)
+    }
+
+    /// Decodes a canonically encoded transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::wire::WireError`] unless `bytes` is exactly a canonical
+    /// encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode(bytes)
     }
 
     /// Checks that the transaction is authorised.

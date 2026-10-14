@@ -97,11 +97,16 @@ pub enum Instruction {
         /// The rate the transaction claimed applies.
         rate: u128,
     },
-    /// Check that the council authorised `digest` (REQ-GOV-004).
+    /// Check that the council authorised `digest` for `epoch`, and consume the
+    /// epoch (REQ-GOV-004).
     ///
-    /// Also a read-only step, for the same reason: the council roster lives in
-    /// state, so the check belongs in the trace.
+    /// The council record lives in state, so the check belongs in the trace.
+    /// The step requires `epoch` to be the council's current epoch and writes
+    /// the record back with the epoch advanced, so each signed payload applies
+    /// exactly once.
     VerifyCouncil {
+        /// The epoch the payload was signed for.
+        epoch: u64,
         /// The governance update digest that was signed.
         digest: Hash256,
         /// The signatures offered.
@@ -180,6 +185,96 @@ impl MachineState {
 }
 
 impl Instruction {
+    /// Encodes the instruction canonically.
+    ///
+    /// Not part of consensus — instructions are never published, only derived —
+    /// but `sena::osp::encode_instruction` implements the same encoding, so the
+    /// Rust and Move compilers can be compared byte for byte in conformance
+    /// tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics on more than `u32::MAX` council signatures, which the wire limits
+    /// rule out.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = sena_primitives::Writer::new();
+        match self {
+            Self::ConsumeNonce { account, expected } => {
+                w.u8(0).bytes32(account.as_bytes()).u64(*expected);
+            }
+            Self::Debit {
+                account,
+                asset,
+                amount,
+            } => {
+                w.u8(1)
+                    .bytes32(account.as_bytes())
+                    .u32(asset.get())
+                    .u128(*amount);
+            }
+            Self::Credit {
+                account,
+                asset,
+                amount,
+            } => {
+                w.u8(2)
+                    .bytes32(account.as_bytes())
+                    .u32(asset.get())
+                    .u128(*amount);
+            }
+            Self::BindIdentifier {
+                identifier,
+                address,
+            } => {
+                w.u8(3)
+                    .bytes32(identifier.as_hash().as_bytes())
+                    .bytes32(address.as_bytes());
+            }
+            Self::UnbindIdentifier {
+                identifier,
+                expected_owner,
+            } => {
+                w.u8(4)
+                    .bytes32(identifier.as_hash().as_bytes())
+                    .bytes32(expected_owner.as_bytes());
+            }
+            Self::VerifyGasAsset { asset, rate } => {
+                w.u8(5).u32(asset.get()).u128(*rate);
+            }
+            Self::VerifyCouncil {
+                epoch,
+                digest,
+                signatures,
+            } => {
+                w.u8(6)
+                    .u64(*epoch)
+                    .bytes32(digest.as_bytes())
+                    .u32(u32::try_from(signatures.len()).expect("bounded"));
+                for s in signatures {
+                    w.u32(s.index).raw(&s.signature);
+                }
+            }
+            Self::SetGasAsset { record } => {
+                w.u8(7).bytes(&record.encode());
+            }
+            Self::SetParameter { name, value } => {
+                w.u8(8).string(name).u128(*value);
+            }
+            Self::VerifyJwk { iss_hash, jwk_hash } => {
+                w.u8(9).bytes32(iss_hash).bytes32(jwk_hash);
+            }
+            Self::SetJwk {
+                iss_hash,
+                jwk_hash,
+                active,
+            } => {
+                w.u8(10).bytes32(iss_hash).bytes32(jwk_hash).bool(*active);
+            }
+        }
+        w.finish()
+    }
+
     /// Returns the single trie slot this instruction reads and writes.
     ///
     /// Every instruction touches exactly one slot. That restriction is what

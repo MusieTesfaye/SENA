@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use sena_primitives::{domain, CanonicalEncoder, Hash256};
+use sena_primitives::Hash256;
 use sena_state::MerkleTrie;
+use sena_stf::batch::{self, BatchTree};
 use sena_stf::{
     execute_batch, BatchContext, BatchError, ExecutionTrace, KeylessConfig, Transaction,
 };
@@ -54,30 +55,19 @@ pub struct Block {
 }
 
 impl Block {
-    /// Returns the commitment to this block's batch data.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// The batch commitment tree over this block's transactions.
+    #[must_use]
+    pub fn batch_tree(&self) -> BatchTree {
+        self.trace.batch_tree(&self.transactions)
+    }
+
+    /// Returns the commitment to this block's batch data, as the covering
+    /// assertion carries it and `sena::assertions::post` recomputes it.
     #[must_use]
     pub fn batch_commitment(&self) -> Hash256 {
-        batch_commitment(self.timestamp, &self.transactions)
+        let tree = self.batch_tree();
+        batch::header_commitment(self.timestamp, tree.tx_count(), &tree.root())
     }
-}
-
-/// Commits to a batch: its timestamp and its transactions, in order.
-///
-/// # Panics
-///
-/// Panics only if serialisation fails, which cannot occur.
-#[must_use]
-pub fn batch_commitment(timestamp: u64, transactions: &[Transaction]) -> Hash256 {
-    let encoded = serde_json::to_vec(transactions).expect("batch serialisation cannot fail");
-    Hash256::commit(
-        CanonicalEncoder::new(domain::BATCH)
-            .u64(timestamp)
-            .field(&encoded),
-    )
 }
 
 /// A transaction's confirmation status.

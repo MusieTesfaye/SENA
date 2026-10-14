@@ -11,11 +11,17 @@
 /// party entering correctly cannot lose. That is the property the entire
 /// security argument rests on.
 module sena::disputes {
+    use std::bcs;
     use std::signer;
     use std::vector;
     use aptos_std::table::{Self, Table};
     use aptos_framework::timestamp;
     use sena::assertions;
+    use sena::batch;
+    use sena::compiler;
+    use sena::keyless;
+    use sena::osp;
+    use sena::trie;
 
     /// The dispute is over.
     const E_RESOLVED: u64 = 50;
@@ -33,6 +39,20 @@ module sena::disputes {
     const E_NOT_A_PARTY: u64 = 56;
     /// The registry has already been created.
     const E_ALREADY_INITIALIZED: u64 = 57;
+    /// The caller holds no open challenge against the assertion.
+    const E_NOT_CHALLENGING: u64 = 58;
+    /// The assertion is not under challenge.
+    const E_NOT_CHALLENGED: u64 = 59;
+    /// The move came after the mover's deadline; claim the timeout instead.
+    const E_DEADLINE_PASSED: u64 = 60;
+    /// A batch leaf did not prove against the assertion's batch root.
+    const E_BAD_LEAF: u64 = 61;
+    /// The leaf does not cover the disputed step.
+    const E_LEAF_DOES_NOT_COVER_STEP: u64 = 62;
+    /// The structural fraud proof does not show any fraud.
+    const E_NOT_FRAUD: u64 = 63;
+    /// A trace of zero steps has nothing to bisect.
+    const E_EMPTY_TRACE: u64 = 64;
 
     const PARTY_DEFENDER: u8 = 0;
     const PARTY_CHALLENGER: u8 = 1;
@@ -80,19 +100,24 @@ module sena::disputes {
         disputes: Table<vector<u8>, Dispute>,
         /// The assertion chain whose outcomes this registry applies.
         chain: address,
+        /// The keyless parameter set L2 runs with (`sena::keyless` setup id).
+        /// Fixed here, once: a verification key that could be changed under a
+        /// live chain would let whoever changed it decide keyless disputes.
+        keyless_setup: u8,
     }
 
     /// Creates the dispute registry.
     ///
-    /// Without this nothing in the module works: every entry point borrows
-    /// `Registry`, and a resource that is never moved to an account cannot be
-    /// borrowed. Unit tests did not catch it because they call the functions
-    /// directly rather than through a transaction.
-    public entry fun initialize(admin: &signer, chain: address) {
+    /// `keyless_setup` must name the same parameter set as the L2 genesis
+    /// (`keyless.setup`), or L1 would judge honest keyless transactions
+    /// invalid.
+    public entry fun initialize(admin: &signer, chain: address, keyless_setup: u8) {
         assert!(!exists<Registry>(signer::address_of(admin)), E_ALREADY_INITIALIZED);
+        keyless::assert_known_setup(keyless_setup);
         move_to(admin, Registry {
             disputes: table::new<vector<u8>, Dispute>(),
             chain,
+            keyless_setup,
         });
     }
 
@@ -119,40 +144,53 @@ module sena::disputes {
         out
     }
 
-    /// Opens a dispute over a whole trace.
+    /// The id of the dispute a challenger plays over an assertion. One per
+    /// (assertion, challenger), so a challenger cannot open several games and
+    /// keep only the one it wins.
+    public fun dispute_id(assertion: vector<u8>, challenger: address): vector<u8> {
+        let id = assertion;
+        vector::append(&mut id, bcs::to_bytes(&challenger));
+        id
+    }
+
+    /// Opens a bisection game over an assertion the caller has challenged.
     ///
-    /// The challenger is the signer. Accepting it as a parameter would let one
-    /// account enrol another as a party to a dispute it never entered.
+    /// Everything about the game is read from the assertion record: the
+    /// defender is its proposer, the endpoints are its pre- and post-state at
+    /// positions 0 and `trace_length`, and the clocks follow the chain's
+    /// window. Taking any of it from the caller would let a challenger name a
+    /// defender who never answers, win by timeout, and reject a sound
+    /// assertion.
     public entry fun open(
         challenger: &signer,
         registry_addr: address,
-        id: vector<u8>,
         assertion: vector<u8>,
-        defender: address,
-        trace_length: u64,
-        lo_commitment: vector<u8>,
-        hi_commitment: vector<u8>,
-        challenge_window: u64,
     ) acquires Registry {
-        let budget = clock_budget(challenge_window);
+        let who = signer::address_of(challenger);
+        let chain_addr = borrow_global<Registry>(registry_addr).chain;
+        let (proposer, pre_root, post_root, _, _, _, trace_length, status) =
+            assertions::dispute_view(chain_addr, assertion);
+        assert!(status == assertions::status_challenged(), E_NOT_CHALLENGED);
+        assert!(assertions::has_open_challenge(chain_addr, assertion, who), E_NOT_CHALLENGING);
+        assert!(trace_length > 0, E_EMPTY_TRACE);
+
+        let budget = clock_budget(assertions::challenge_window(chain_addr));
         // A single move must never be given longer than the whole budget, or
         // one stall would exhaust it outright.
         let move_allowance = if (MOVE_TIMEOUT < budget) { MOVE_TIMEOUT } else { budget };
         let now = timestamp::now_seconds();
-
         let stage = if (trace_length == 1) { STAGE_ONE_STEP } else { STAGE_BISECTING };
         let turn = if (trace_length == 1) { PARTY_CHALLENGER } else { PARTY_DEFENDER };
-        let challenger_addr = signer::address_of(challenger);
 
         let registry = borrow_global_mut<Registry>(registry_addr);
-        table::add(&mut registry.disputes, id, Dispute {
+        table::add(&mut registry.disputes, dispute_id(assertion, who), Dispute {
             assertion,
-            defender,
-            challenger: challenger_addr,
+            defender: proposer,
+            challenger: who,
             lo: 0,
             hi: trace_length,
-            lo_commitment,
-            hi_commitment,
+            lo_commitment: osp::commit_machine_state(&osp::machine_state(pre_root, 0)),
+            hi_commitment: osp::commit_machine_state(&osp::machine_state(post_root, trace_length)),
             offered: vector::empty<vector<u8>>(),
             has_offer: false,
             stage,
@@ -181,35 +219,26 @@ module sena::disputes {
     }
 
     /// Charges the mover's clock and checks the turn.
+    ///
+    /// A late move is refused, not recorded as a forfeit: an abort would revert
+    /// any record of it anyway. The other party claims the forfeit with
+    /// `claim_timeout` (REQ-FRAUD-014).
     fun begin_move(d: &mut Dispute, party: u8) {
         assert!(d.stage != STAGE_RESOLVED, E_RESOLVED);
         assert!(d.turn == party, E_WRONG_TURN);
 
         let now = timestamp::now_seconds();
-        if (now > d.deadline) {
-            // Failing to move in time forfeits (REQ-FRAUD-014).
-            d.stage = STAGE_RESOLVED;
-            d.winner = if (party == PARTY_DEFENDER) { PARTY_CHALLENGER } else { PARTY_DEFENDER };
-            abort E_RESOLVED
-        };
+        assert!(now <= d.deadline, E_DEADLINE_PASSED);
 
         // A per-move deadline alone would let an adversary stretch a dispute by
         // always answering at the last permitted moment; the total budget is
         // what bounds it below the challenge window.
         let elapsed = now - d.last_move_at;
         if (party == PARTY_DEFENDER) {
-            if (elapsed > d.defender_clock) {
-                d.stage = STAGE_RESOLVED;
-                d.winner = PARTY_CHALLENGER;
-                abort E_RESOLVED
-            };
+            assert!(elapsed <= d.defender_clock, E_DEADLINE_PASSED);
             d.defender_clock = d.defender_clock - elapsed;
         } else {
-            if (elapsed > d.challenger_clock) {
-                d.stage = STAGE_RESOLVED;
-                d.winner = PARTY_DEFENDER;
-                abort E_RESOLVED
-            };
+            assert!(elapsed <= d.challenger_clock, E_DEADLINE_PASSED);
             d.challenger_clock = d.challenger_clock - elapsed;
         };
     }
@@ -293,11 +322,205 @@ module sena::disputes {
         enter_one_step_if_narrow(d);
     }
 
-    /// Records the outcome of one-step adjudication and applies it.
+    /// Settles a dispute that has narrowed to one step (REQ-FRAUD-017).
+    ///
+    /// The challenger proves which transaction covers step `lo` -- its bytes
+    /// as a leaf of the batch the assertion published -- and supplies a
+    /// witness for the slot it touches. L1 compiles the transaction itself to
+    /// find the instruction, executes it against the agreed pre-state, and
+    /// compares the result with the defender's claim.
+    ///
+    /// A transaction that does not compile at all means the batch is invalid,
+    /// and the challenger wins. A leaf that does not prove, does not cover the
+    /// step, or a witness that does not match the agreed state aborts: those are
+    /// the prover's errors, and the clock keeps running.
+    public entry fun one_step(
+        mover: &signer,
+        registry_addr: address,
+        id: vector<u8>,
+        leaf_index: u64,
+        start_pc: u64,
+        tx_bytes: vector<u8>,
+        leaf_siblings: vector<vector<u8>>,
+        pre_state_root: vector<u8>,
+        slot: vector<u8>,
+        present: bool,
+        value: vector<u8>,
+        trie_siblings: vector<vector<u8>>,
+        terminal_is_leaf: bool,
+        terminal_key: vector<u8>,
+        terminal_value_hash: vector<u8>,
+    ) acquires Registry {
+        let who = signer::address_of(mover);
+        let (chain_addr, keyless_setup) = {
+            let r = borrow_global<Registry>(registry_addr);
+            (r.chain, r.keyless_setup)
+        };
+        let (pc, lo_commitment, hi_commitment, assertion) = {
+            let registry = borrow_global_mut<Registry>(registry_addr);
+            assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
+            let d = table::borrow_mut(&mut registry.disputes, id);
+            assert!(party_of(d, who) == PARTY_CHALLENGER, E_WRONG_TURN);
+            begin_move(d, PARTY_CHALLENGER);
+            assert!(d.stage == STAGE_ONE_STEP, E_WRONG_STAGE);
+            (d.lo, d.lo_commitment, d.hi_commitment, d.assertion)
+        };
+
+        let (_, _, _, batch_time, tx_count, tx_root, _, _) =
+            assertions::dispute_view(chain_addr, assertion);
+        assert!(
+            batch::proves(tx_root, tx_count, leaf_index, start_pc, tx_bytes, &leaf_siblings),
+            E_BAD_LEAF
+        );
+
+        let (compiles, program) = compiler::compile(tx_bytes, batch_time, keyless_setup);
+        let winner = if (!compiles) {
+            PARTY_CHALLENGER
+        } else {
+            assert!(
+                start_pc <= pc && pc < start_pc + vector::length(&program),
+                E_LEAF_DOES_NOT_COVER_STEP
+            );
+            let instruction = vector::borrow(&program, pc - start_pc);
+            let terminal = if (terminal_is_leaf) {
+                trie::leaf_terminal(terminal_key, terminal_value_hash)
+            } else {
+                trie::empty_terminal()
+            };
+            let proof = trie::new_proof(trie_siblings, terminal);
+            let outcome = osp::adjudicate(
+                &osp::machine_state(pre_state_root, pc),
+                lo_commitment,
+                hi_commitment,
+                instruction,
+                slot,
+                present,
+                value,
+                &proof,
+            );
+            if (outcome == osp::challenger_wins()) { PARTY_CHALLENGER } else { PARTY_DEFENDER }
+        };
+        resolve_internal(registry_addr, id, winner);
+    }
+
+    // --- Batch-structure fraud proofs ----------------------------------------
+    //
+    // Bisection assumes every step is covered by exactly one transaction. A
+    // batch that breaks that -- a transaction that does not compile, start
+    // positions that skip or overlap steps, a trace longer or shorter than its
+    // transactions -- is fraud of its own, proven directly from the published
+    // data without a bisection game. Each proof requires an open challenge and
+    // rejects the assertion when it holds.
+
+    fun leaf_program(
+        tx_root: vector<u8>,
+        tx_count: u64,
+        batch_time: u64,
+        keyless_setup: u8,
+        index: u64,
+        start_pc: u64,
+        tx_bytes: vector<u8>,
+        siblings: &vector<vector<u8>>,
+    ): (bool, u64) {
+        assert!(batch::proves(tx_root, tx_count, index, start_pc, tx_bytes, siblings), E_BAD_LEAF);
+        let (ok, program) = compiler::compile(tx_bytes, batch_time, keyless_setup);
+        (ok, vector::length(&program))
+    }
+
+    fun apply_structural_win(registry_addr: address, chain_addr: address, assertion: vector<u8>, who: address) {
+        assert!(assertions::has_open_challenge(chain_addr, assertion, who), E_NOT_CHALLENGING);
+        assertions::challenger_won(chain_addr, assertion, who);
+        // A bisection game the same challenger had open is now moot.
+        let id = dispute_id(assertion, who);
+        let registry = borrow_global_mut<Registry>(registry_addr);
+        if (table::contains(&registry.disputes, id)) {
+            let d = table::borrow_mut(&mut registry.disputes, id);
+            d.stage = STAGE_RESOLVED;
+            d.winner = PARTY_CHALLENGER;
+        };
+    }
+
+    /// Proves that a published transaction does not compile.
+    public entry fun prove_uncompilable(
+        challenger: &signer,
+        registry_addr: address,
+        assertion: vector<u8>,
+        index: u64,
+        start_pc: u64,
+        tx_bytes: vector<u8>,
+        siblings: vector<vector<u8>>,
+    ) acquires Registry {
+        let who = signer::address_of(challenger);
+        let (chain_addr, keyless_setup) = {
+            let r = borrow_global<Registry>(registry_addr);
+            (r.chain, r.keyless_setup)
+        };
+        let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
+        let (ok, _) = leaf_program(tx_root, tx_count, batch_time, keyless_setup, index, start_pc, tx_bytes, &siblings);
+        assert!(!ok, E_NOT_FRAUD);
+        apply_structural_win(registry_addr, chain_addr, assertion, who);
+    }
+
+    /// Proves that transaction `index + 1` does not start where transaction
+    /// `index` ends.
+    public entry fun prove_start_gap(
+        challenger: &signer,
+        registry_addr: address,
+        assertion: vector<u8>,
+        index: u64,
+        start_a: u64,
+        tx_a: vector<u8>,
+        siblings_a: vector<vector<u8>>,
+        start_b: u64,
+        tx_b: vector<u8>,
+        siblings_b: vector<vector<u8>>,
+    ) acquires Registry {
+        let who = signer::address_of(challenger);
+        let (chain_addr, keyless_setup) = {
+            let r = borrow_global<Registry>(registry_addr);
+            (r.chain, r.keyless_setup)
+        };
+        let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
+        let (ok_a, len_a) = leaf_program(tx_root, tx_count, batch_time, keyless_setup, index, start_a, tx_a, &siblings_a);
+        assert!(
+            batch::proves(tx_root, tx_count, index + 1, start_b, tx_b, &siblings_b),
+            E_BAD_LEAF
+        );
+        // An uncompilable transaction is fraud in itself.
+        assert!(!ok_a || start_b != start_a + len_a, E_NOT_FRAUD);
+        apply_structural_win(registry_addr, chain_addr, assertion, who);
+    }
+
+    /// Proves that the last transaction does not end where the trace does.
+    public entry fun prove_trace_length(
+        challenger: &signer,
+        registry_addr: address,
+        assertion: vector<u8>,
+        start_pc: u64,
+        tx_bytes: vector<u8>,
+        siblings: vector<vector<u8>>,
+    ) acquires Registry {
+        let who = signer::address_of(challenger);
+        let (chain_addr, keyless_setup) = {
+            let r = borrow_global<Registry>(registry_addr);
+            (r.chain, r.keyless_setup)
+        };
+        let (_, _, _, batch_time, tx_count, tx_root, trace_length, _) = assertions::dispute_view(chain_addr, assertion);
+        assert!(tx_count > 0, E_NOT_FRAUD);
+        let (ok, len) = leaf_program(
+            tx_root, tx_count, batch_time, keyless_setup, tx_count - 1, start_pc, tx_bytes, &siblings
+        );
+        assert!(!ok || start_pc + len != trace_length, E_NOT_FRAUD);
+        apply_structural_win(registry_addr, chain_addr, assertion, who);
+    }
+
+    /// Records the outcome of a game and applies it.
     ///
     /// Recording the winner without applying it would leave the assertion chain
     /// unaware of the result -- a fraudulent assertion could lose its dispute
-    /// and still finalize. This is the link between adjudication and status.
+    /// and still finalize. If the assertion has meanwhile been rejected by
+    /// another challenger, the outcome is moot: every challenge bond on it was
+    /// already refunded.
     fun resolve_internal(
         registry_addr: address,
         id: vector<u8>,
@@ -313,8 +536,9 @@ module sena::disputes {
             (registry.chain, d.assertion, d.challenger)
         };
 
-        // The challenger is named either way: on a win they are paid, on a loss
-        // their bond is the one forfeited.
+        let (_, _, _, _, _, _, _, status) = assertions::dispute_view(chain, assertion);
+        if (status == assertions::status_rejected()) { return };
+
         if (winner == PARTY_CHALLENGER) {
             assertions::challenger_won(chain, assertion, challenger);
         } else {
@@ -336,7 +560,9 @@ module sena::disputes {
             assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
             let d = table::borrow(&registry.disputes, id);
             assert!(d.stage != STAGE_RESOLVED, E_RESOLVED);
-            assert!(timestamp::now_seconds() > d.deadline, E_WRONG_STAGE);
+            let now = timestamp::now_seconds();
+            let clock = if (d.turn == PARTY_DEFENDER) { d.defender_clock } else { d.challenger_clock };
+            assert!(now > d.deadline || now - d.last_move_at > clock, E_WRONG_STAGE);
             if (d.turn == PARTY_DEFENDER) { PARTY_CHALLENGER } else { PARTY_DEFENDER }
         };
         resolve_internal(registry_addr, id, winner);
@@ -349,6 +575,15 @@ module sena::disputes {
         let d = table::borrow(&registry.disputes, id);
         assert!(d.stage == STAGE_ONE_STEP, E_WRONG_STAGE);
         d.lo
+    }
+
+    #[view]
+    public fun winner(registry_addr: address, id: vector<u8>): u8 acquires Registry {
+        let registry = borrow_global<Registry>(registry_addr);
+        assert!(table::contains(&registry.disputes, id), E_NO_SUCH_DISPUTE);
+        let d = table::borrow(&registry.disputes, id);
+        assert!(d.stage == STAGE_RESOLVED, E_WRONG_STAGE);
+        d.winner
     }
 
     public fun party_defender(): u8 { PARTY_DEFENDER }

@@ -50,6 +50,13 @@ pub struct Council {
     pub members: Vec<[u8; 32]>,
     /// How many distinct members must sign for a payload to be accepted.
     pub threshold: u32,
+    /// The epoch the next governance payload must be signed for.
+    ///
+    /// Consumed by every applied payload, like an account nonce. Without it a
+    /// signed payload could be replayed indefinitely — re-enabling a gas asset
+    /// the council had since disabled, or reinstating a retired JWK.
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 impl Council {
@@ -70,6 +77,7 @@ impl Council {
             w.bytes32(member);
         }
         w.u32(self.threshold);
+        w.u64(self.epoch);
         w.finish()
     }
 
@@ -91,8 +99,13 @@ impl Council {
             members.push(r.bytes32()?);
         }
         let threshold = r.u32()?;
+        let epoch = r.u64()?;
         r.finish()?;
-        Ok(Self { members, threshold })
+        Ok(Self {
+            members,
+            threshold,
+            epoch,
+        })
     }
 }
 
@@ -140,14 +153,6 @@ pub enum GovernanceUpdate {
     },
 }
 
-/// Discriminants for the canonical update encoding, fixed explicitly because
-/// the council's signature commits to them.
-mod update_tag {
-    pub const SET_GAS_ASSET: u8 = 0;
-    pub const SET_PARAMETER: u8 = 1;
-    pub const SET_JWK: u8 = 2;
-}
-
 impl GovernanceUpdate {
     /// Encodes the update canonically.
     ///
@@ -157,45 +162,22 @@ impl GovernanceUpdate {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        match self {
-            Self::SetGasAsset { record } => {
-                w.u8(update_tag::SET_GAS_ASSET);
-                w.bytes(&record.encode());
-            }
-            Self::SetParameter { name, value } => {
-                w.u8(update_tag::SET_PARAMETER);
-                w.string(name);
-                w.u128(*value);
-            }
-            Self::SetJwk {
-                iss_hash,
-                jwk_hash,
-                active,
-            } => {
-                w.u8(update_tag::SET_JWK);
-                w.bytes32(iss_hash);
-                w.bytes32(jwk_hash);
-                w.bool(*active);
-            }
-        }
+        crate::wire::write_update(&mut w, self);
         w.finish()
     }
 
     /// Returns the digest the council signs.
     ///
-    /// `epoch` is included so that a signed payload cannot be replayed once it
-    /// has been applied, or applied twice by a relayer.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// `epoch` must equal the council's current epoch when the payload is
+    /// applied, and applying it advances the epoch, so a signed payload can be
+    /// applied exactly once. The update is encoded canonically so the Aptos L1
+    /// verifier can recompute this digest.
     #[must_use]
     pub fn signing_digest(&self, epoch: u64) -> Hash256 {
-        let body = serde_json::to_vec(self).expect("update serialisation cannot fail");
         Hash256::commit(
             CanonicalEncoder::new(GOVERNANCE_UPDATE)
                 .u64(epoch)
-                .field(&body),
+                .field(&self.encode()),
         )
     }
 
@@ -324,6 +306,15 @@ pub enum GovernanceError {
     /// The asset rate would make execution free.
     #[error("gas asset rate must be non-zero")]
     InvalidAssetRate,
+    /// The payload was signed for an epoch other than the council's current one:
+    /// a replay of an applied payload, or one signed out of order.
+    #[error("payload signed for epoch {signed}, but the council is at epoch {expected}")]
+    WrongEpoch {
+        /// The council's current epoch.
+        expected: u64,
+        /// The epoch the payload was signed for.
+        signed: u64,
+    },
 }
 
 #[cfg(test)]
@@ -341,6 +332,7 @@ mod tests {
         Council {
             members: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
             threshold,
+            epoch: 0,
         }
     }
 

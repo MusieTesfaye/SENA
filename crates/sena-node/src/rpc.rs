@@ -167,6 +167,9 @@ pub enum Response {
         assertion: Option<AssertionId>,
         /// Number of execution steps, which bisection searches over.
         trace_length: u64,
+        /// Where each transaction's instructions begin: the `start_pc` of each
+        /// batch leaf, which `sena::assertions::post` publishes with the data.
+        tx_starts: Vec<u64>,
     },
     /// Chain-level status.
     ChainInfo {
@@ -482,6 +485,7 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
                     transactions: block.transactions.clone(),
                     assertion: sequencer.assertion_for(block.height),
                     trace_length: block.trace.len() as u64,
+                    tx_starts: block.trace.tx_starts.clone(),
                 },
             }
         }

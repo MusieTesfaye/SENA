@@ -56,6 +56,12 @@ fn the_move_sources_are_present() {
         "trie.move",
         "osp.move",
         "assertions.move",
+        "batch.move",
+        "compiler.move",
+        "keyless.move",
+        "poseidon.move",
+        "poseidon_sparse.move",
+        "txcodec.move",
         "disputes.move",
         "bridge.move",
     ] {
@@ -199,6 +205,128 @@ fn the_dispute_arity_and_timeouts_match() {
         src.contains("const CLOCK_BUDGET_DIVISOR: u64 = 4;"),
         "clock budget divisor drifted"
     );
+}
+
+#[test]
+fn every_new_domain_tag_matches() {
+    // Each Move module declares its own tags; check each against Rust.
+    let pairs: [(&str, &[u8]); 6] = [
+        ("batch.move", domain::BATCH),
+        ("batch.move", b"SENA:v1:batch-leaf"),
+        ("batch.move", b"SENA:v1:batch-node"),
+        ("keyless.move", domain::KEYLESS_ADDRESS),
+        ("txcodec.move", domain::TRANSACTION),
+        ("txcodec.move", b"SENA:v1:governance-update"),
+    ];
+    for (file, tag) in pairs {
+        let literal = format!("b\"{}\"", std::str::from_utf8(tag).unwrap());
+        assert!(source(file).contains(&literal), "{file} lacks {literal}");
+    }
+}
+
+#[test]
+fn state_regions_match() {
+    // osp.move derives every slot itself; its region tags must be keys.rs's.
+    let src = source("osp.move");
+    for region in [
+        "SENA:v1:state:account",
+        "SENA:v1:state:social-by-identifier",
+        "SENA:v1:state:asset",
+        "SENA:v1:state:parameter",
+        "SENA:v1:state:council",
+        "SENA:v1:state:jwk",
+    ] {
+        assert!(
+            src.contains(&format!("b\"{region}\"")),
+            "osp.move lacks region {region}"
+        );
+    }
+}
+
+#[test]
+fn limits_and_gas_constants_match() {
+    let tx = source("txcodec.move");
+    assert!(tx.contains(&format!(
+        "const MAX_TRANSACTION_BYTES: u64 = {};",
+        sena_stf::wire::MAX_TRANSACTION_BYTES
+    )));
+    assert!(tx.contains(&format!(
+        "const MAX_COUNCIL_SIGNATURES: u64 = {};",
+        sena_stf::wire::MAX_COUNCIL_SIGNATURES
+    )));
+    let compiler = source("compiler.move");
+    assert!(compiler.contains(&format!(
+        "const BASE_GAS_NATIVE: u128 = {};",
+        sena_stf::BASE_GAS_NATIVE
+    )));
+    assert!(compiler.contains(&format!(
+        "const RATE_SCALE: u128 = {};",
+        sena_stf::RATE_SCALE
+    )));
+    assert!(compiler.contains(&format!(
+        "const FEE_VAULT: vector<u8> = x\"{}\";",
+        hex::encode(sena_stf::FEE_VAULT.as_bytes())
+    )));
+    let osp = source("osp.move");
+    for name in sena_stf::governance::GOVERNABLE_PARAMETERS {
+        assert!(
+            osp.contains(&format!("b\"{name}\"")),
+            "osp.move lacks governable {name}"
+        );
+    }
+}
+
+#[test]
+fn keyless_verification_keys_match() {
+    use ark_serialize::CanonicalSerialize;
+    let src = source("keyless.move");
+    for (config, prefix) in [
+        (sena_stf::KeylessConfig::aptos_mainnet(), "MAINNET"),
+        (sena_stf::KeylessConfig::aptos_devnet_insecure(), "DEVNET"),
+    ] {
+        let vk = &config.vk.vk;
+        let ser = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = Vec::new();
+            f(&mut b);
+            hex::encode(b)
+        };
+        assert_embeds(
+            &src,
+            "alpha",
+            &ser(&|b| vk.alpha_g1.serialize_compressed(b).unwrap()),
+        );
+        assert_embeds(
+            &src,
+            "beta",
+            &ser(&|b| vk.beta_g2.serialize_compressed(b).unwrap()),
+        );
+        assert_embeds(
+            &src,
+            "gamma",
+            &ser(&|b| vk.gamma_g2.serialize_compressed(b).unwrap()),
+        );
+        let delta = ser(&|b| vk.delta_g2.serialize_compressed(b).unwrap());
+        assert!(
+            src.contains(&format!(
+                "const {prefix}_DELTA_G2: vector<u8> = x\"{delta}\";"
+            )),
+            "{prefix} delta"
+        );
+        let ic0 = ser(&|b| vk.gamma_abc_g1[0].serialize_compressed(b).unwrap());
+        assert!(
+            src.contains(&format!("const {prefix}_IC0: vector<u8> = x\"{ic0}\";")),
+            "{prefix} ic0"
+        );
+        let ic1 = ser(&|b| vk.gamma_abc_g1[1].serialize_compressed(b).unwrap());
+        assert!(
+            src.contains(&format!("const {prefix}_IC1: vector<u8> = x\"{ic1}\";")),
+            "{prefix} ic1"
+        );
+        assert!(src.contains(&format!(
+            "const {prefix}_MAX_EXP_HORIZON_SECS: u64 = {};",
+            config.max_exp_horizon_secs
+        )));
+    }
 }
 
 #[test]

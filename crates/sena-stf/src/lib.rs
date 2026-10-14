@@ -36,6 +36,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod account;
+pub mod batch;
 pub mod execute;
 pub mod gas;
 pub mod governance;
@@ -45,6 +46,7 @@ pub mod keys;
 pub mod poseidon;
 pub mod social;
 pub mod transaction;
+pub mod wire;
 
 pub use account::{Account, BalanceError};
 pub use execute::{
