@@ -5,6 +5,47 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### Disputes settle on Aptos, keyless included
+
+- **Every instruction is adjudicable on L1.** `sena::compiler` decodes,
+  authenticates and compiles the disputed transaction from published batch
+  data, as the node does, so neither party's account of the step is trusted.
+  `VerifyGasAsset`, `VerifyCouncil`, `SetGasAsset` and `SetParameter` no
+  longer abort, and the new `VerifyJwk` and `SetJwk` are adjudicable too.
+- **Keyless on L1.** `sena::keyless` recomputes the circuit's public-input hash
+  with Poseidon-BN254 and verifies the Groth16 proof against the Aptos mainnet
+  ceremony key. One verification exceeds a transaction's execution budget, so
+  `sena::keyless_jobs` computes it across transactions.
+- **Batch data is published on L1** with each assertion, which now carries a
+  batch timestamp; L1 computes the batch root itself. Batch-structure fraud
+  proofs cover uncompilable transactions, start-position gaps and wrong trace
+  lengths without a bisection game.
+- **Bonds and bridge custody move real fungible assets.**
+- A full keyless fraud dispute runs on a local Aptos node to rejection, for
+  4,809 gas units from post to rejection (`scripts/localnet-dispute.sh`).
+
+### An operator's agents
+
+- `sena-node relay` posts blocks with their batch data, defends them in
+  disputes and finalizes them; `sena-node watch` re-executes every assertion
+  from L1 data alone and challenges fraud. Both replace the earlier `relay`
+  command, whose flags have changed.
+- `sena_node::keyless_client`: wallet sessions, OAuth nonces, authenticator
+  assembly with the prover's public-inputs hash cross-checked, and clients
+  for the Aptos pepper and prover services.
+- `scripts/localnet-agents.sh` runs both agents against a localnet; a CI job
+  runs it and the dispute on every change.
+
+### Fixed
+
+- Mempool admission re-executed the whole queue for each transaction
+  (quadratic in a 4096-slot pool); it now checks the candidate against the
+  state after the queue.
+- Blocks are cut to 48 KiB of transaction data, so every batch fits the single
+  Aptos transaction that publishes it.
+- `scripts/chain-lifecycle.sh` and `scripts/bridge-test.sh` use the current
+  contract interfaces and `--chunked-publish`.
+
 ### Keyless accounts on the Aptos Keyless circuit
 
 - Keyless verification now targets the audited Aptos Keyless circom circuit
@@ -25,9 +66,8 @@ while below 1.0 the protocol may change in breaking ways between releases.
 - **Withdrawn: the October 2026 keyless prototype.** Its Groth16 verifier used a
   forgeable verification key, its ceremony and prover were placeholders, its JWK
   check could be bypassed, and its pepper/ODIS services leaked peppers. The
-  code is quarantined in `attic/unsafe-keyless-2026-10/` and keyless
-  transactions are rejected again until the Aptos Keyless circuit integration
-  lands.
+  code is quarantined in `attic/unsafe-keyless-2026-10/`; keyless accounts are
+  now built on the Aptos Keyless circuit (above).
 - The relayer no longer records a block as relayed when the L1 post fails.
 
 ### The Move contracts compile
@@ -62,11 +102,8 @@ stronger check: `codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust` and
 against what Rust produced. Previously only the Rust side ran, comparing
 constants in two files.
 
-Still true: nothing is deployed to any network, nothing is audited, bond escrow
-is bookkeeping rather than custody, and four instructions
-(`VerifyGasAsset`, `VerifyCouncil`, `SetGasAsset`, `SetParameter`) abort rather
-than being adjudicated — so a dispute over a gas-rate or governance step has no
-L1 resolution path.
+At the time, bond escrow was bookkeeping and four instructions could not be
+adjudicated; both are fixed above.
 
 ### Beta planning baseline No protocol behaviour changed; the parameters were
 already what `sena-params` now freezes, and the binding tests prove it.

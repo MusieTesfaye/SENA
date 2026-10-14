@@ -1,12 +1,16 @@
 # Status
 
-**Version 0.2.0-beta** · 265 Rust tests + 53 Move tests passing · **deployed to Aptos devnet** · not audited
+**Unreleased (after 0.2.0-beta)** · 306 Rust tests + 76 Move tests passing · **verified on a local Aptos node; not deployed to any public network** · not audited
 
-> **Live on devnet.** The package is published and the assertion lifecycle runs
-> on chain. Aptos itself refuses to finalize an assertion inside its challenge
-> window, and refuses to finalize a challenged one —
-> [evidence with transaction hashes](docs/beta/evidence/03-devnet-deployment.md).
-> No bonds move yet, and nothing is audited.
+> **Fraud proofs work on a real Aptos node.** On a localnet, a batch whose
+> keyless transfer was forged a thousandfold was posted with its batch data,
+> challenged, bisected to one step, and rejected by Aptos after Aptos itself
+> verified the transaction's Groth16 proof against the Aptos Keyless circuit's
+> key. The relayer and watcher binaries posted and independently verified an
+> honest block from L1 data alone. CI repeats both on every change
+> (`.github/workflows/move.yml`, job *localnet dispute and agents*).
+>
+> Nothing is on devnet, testnet or mainnet, and nothing is audited.
 
 **Beta planning:** [`docs/beta/BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) ·
 [`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) ·
@@ -22,40 +26,52 @@ assumed not to work.
 
 ## Works today, and is tested
 
-These are exercised by the test suite on every run, and by
-`cargo run --bin sena-demo`.
-
 | Capability | Where | Evidence |
 |---|---|---|
-| Sparse Merkle state with inclusion and non-inclusion proofs | `sena-state` | 26 tests, incl. property tests over arbitrary key sets |
-| Proof-based root derivation (what L1 does in a dispute) | `sena-state` | Property test: agrees with direct application |
+| Sparse Merkle state with inclusion and non-inclusion proofs | `sena-state` | Property tests over arbitrary key sets |
 | Deterministic execution producing a disputable trace | `sena-stf` | Same batch, same root, order-independent |
-| Transfers, nonces, replay protection | `sena-stf` | Replay rejected; value conserved across batches |
+| Transfers, nonces, replay protection, strict Ed25519 | `sena-stf` | A key can spend only from its own account |
 | Social handles resolving to addresses | `sena-stf` | Binding, release, and theft-prevention tested |
 | Stablecoin gas with in-trace rate validation | `sena-stf` | Wrong rate rejected; rounding cannot make fees zero |
-| Governance bounded by an allowlist | `sena-stf` | Council cannot reach the dispute system |
-| Bonded assertions, challenge windows, finalization | `sena-fraudproof` | Descendants rejected on a successful challenge |
-| Interactive bisection to a single step | `sena-fraudproof` | Converges on the falsified step, logarithmic rounds |
-| One-step adjudication | `sena-fraudproof` | Honest party wins wherever fraud is placed (property test) |
-| Mempool admission that accounts for queued state | `sena-node` | Two individually-affordable transfers correctly rejected together |
-| Block production and assertion posting | `sena-node` | Blocks chain; roots continue |
-| JSON-RPC over HTTP | `sena-node` | End-to-end tests drive a live server |
-| Independent verification from published data | `sena-node` | `published_batch_data_reproduces_the_asserted_root` |
+| Governance bounded by an allowlist, council epochs | `sena-stf` | Council cannot reach the dispute system; replayed approvals refused |
+| **Keyless accounts on the Aptos Keyless circuit** | `sena-stf` | Aptos's sample proof verifies; every intermediate value matches aptos-core |
+| Keyless wallet flow: session, nonce, authenticator, signing | `sena-node::keyless_client` | Assembled sample sign-in verifies; a proof for other inputs is refused |
+| Bonded assertions, bisection, one-step adjudication (Rust) | `sena-fraudproof` | Honest party wins wherever fraud is placed (property test) |
+| **Every instruction adjudicable on L1**, keyless included | `move/sena` | Move recompiles each disputed transaction and agrees with Rust on every generated case |
+| **Batch data published on L1**; L1 computes the batch root | `move/sena` | A post whose data does not match its claim cannot be made |
+| Batch-structure fraud proofs (uncompilable tx, start gaps, trace length) | `move/sena` | Move tests; watcher mock-L1 tests |
+| **A full keyless fraud dispute on a real Aptos node** | `scripts/localnet-dispute.sh` | Assertion ends rejected; 4,809 gas units from post to rejection |
+| Bonds and bridge custody move real fungible assets | `move/sena` | Balances checked on reject, refund, groundless challenge, withdrawal |
+| Assertion lifecycle enforced by Aptos | `scripts/chain-lifecycle.sh` | 11/11 on a localnet: window, self-challenge and challenge all block as they must |
+| **Relayer**: post with batch data, defend, finalize | `sena-node relay` | Mock-L1 tests; posted a real block on a localnet |
+| **Watcher**: re-execute from L1 data, challenge, play to the end | `sena-node watch` | Mock-L1 tests: honest, forged, uncompilable, interrupted, wrong genesis; verified a real block on a localnet |
+| Mempool admission against queued state, in constant work per transaction | `sena-node` | Two individually-affordable transfers rejected together |
+| Blocks cut to fit one Aptos transaction (48 KiB of batch data) | `sena-node` | `blocks_are_cut_to_fit_one_l1_transaction` |
+| JSON-RPC over HTTP with auth, rate limits, body cap | `sena-node` | End-to-end tests drive a live server |
 | Persistence across restart, verified on load | `sena-node` | Corrupt state and cross-chain data both refused |
-| Keyless claim validation and ephemeral-key binding | `sena-stf` | Stolen-JWT and expiry-extension attacks rejected |
-| Move contracts compile and self-test | `move/sena` | 53/53 Move tests, including Rust conformance |
-| Bonds are escrowed, slashed and refunded | `move/sena` | Balances checked on reject, refund and groundless challenge |
-| Withdrawal proofs against finalized roots | `sena-node` | `sena_getWithdrawalProof`; historical roots provable |
-| Light-client account verification against a supplied root | `sena-light-client`, `sena-node` | `sena_getAccountProof` verified over HTTP; the caller must supply a trusted root |
-| RPC auth, rate limiting, body cap | `sena-node` | Unauthenticated, wrong-token, flood and oversized-body all refused |
-| Assertion lifecycle enforced by Aptos | `move/sena` | Devnet: window and challenge both block finalization |
+| Light-client account verification against a supplied root | `sena-light-client` | The caller must supply a trusted root |
 
 ### The claim that matters
 
-An honest verifier beats a dishonest sequencer. A property test places fraud at
-every `Credit` step in a trace and asserts the honest challenger wins each time,
-and that bisection lands on exactly the falsified step. The converse is tested
-too: a groundless challenge loses.
+An honest verifier beats a dishonest sequencer — and now on Aptos itself, not
+only in a Rust model. On a localnet the forged keyless credit was rejected by
+real transactions:
+
+```
+    1052  assertions::post            (batch data published, root computed on L1)
+     950  assertions::open_challenge
+     536  disputes::open
+     120  4 bisection moves
+    2093  keyless_jobs start, advance ×6, finish   (Groth16 verified on L1)
+    ----
+    4809  gas units from post to rejection (≈0.0048 APT at 100 octas per unit)
+      58  disputes::one_step          → assertion rejected
+```
+
+A keyless verdict is spread over several transactions because one Poseidon
+public-input hash plus a Groth16 check exceeds a single Aptos transaction's
+execution budget; `sena::keyless_jobs` computes it resumably and the one-step
+proof consumes it.
 
 ---
 
@@ -63,199 +79,140 @@ too: a groundless challenge loses.
 
 Listed in the order they block a real network.
 
-### 1. Keyless sign-in: verified on L2, not yet adjudicable on L1
+### 1. Nothing has been audited
 
-**What works (tested against Aptos's own vectors):**
+`sena::osp`, `sena::compiler`, `sena::keyless` and `sena::disputes` decide every
+dispute. If their semantics diverge from the Rust node, disputes are decided
+wrongly in one direction or the other, and nothing else can catch it. Generated
+conformance vectors make divergence on known cases a test failure; they are not
+a substitute for review. `SRS NFR-SEC-012` requires an independent audit before
+mainnet.
 
-- Keyless accounts use the audited **Aptos Keyless circom circuit**
-  (`circuit-v1.0.1`). The node recomputes the circuit's public-input hash
-  exactly as aptos-core does — Poseidon-BN254 (circomlib constants), the
-  identity commitment, issuer/header/JWK/extra-field hashes, and the OAuth
-  `nonce` — and every intermediate value matches aptos-core's output.
-- Aptos's published sample proof verifies end to end through SENA's verifier,
-  and a sample keyless transfer is admitted, sealed and independently verified
-  (`sena-stf/tests/keyless_aptos_vectors.rs`, `sena-node/tests/keyless.rs`).
-- Production networks use the **Aptos mainnet ceremony VK** (January 2025,
-  `aptos-keyless-trusted-setup-contributions-jan-2025`). The devnet test VK is
-  available only behind an explicit `allow_insecure_test_setup` genesis flag.
-- JWKs live in L2 state, keyed by issuer, seeded at genesis and rotated by
-  council governance (`SetJwk`). Whether a proof's JWK is current is checked
-  in the trace (`VerifyJwk`), so it is disputable.
-- Ephemeral-key expiry is judged against a per-batch timestamp that is part of
-  the batch data, not a node clock.
+### 2. Not deployed to a public network
 
-**What does not:**
+The current package has run only on a local Aptos node. An earlier contract
+version was published to devnet
+([evidence](docs/beta/evidence/03-devnet-deployment.md)); that deployment
+predates bonds, published batch data and keyless adjudication, and devnet has
+since reset. Testnet needs a funded account (no programmatic faucet) and one
+run of `scripts/chain-lifecycle.sh testnet` and `scripts/bridge-test.sh`.
 
-- **L1 cannot yet adjudicate a keyless transaction** (nor, today, any
-  transaction — see §2). The Move side needs Poseidon, the public-input hash and
-  Groth16 verification; that is the next piece of work.
-- No prover or pepper service ships with SENA. Wallets need an
-  Aptos-Keyless-compatible prover and a pepper source; client support is
-  tracked below.
-- Training-wheels signatures (Aptos's defence-in-depth against circuit bugs)
-  are not checked.
+The package is larger than one transaction and is published with
+`--chunked-publish`.
 
-### Fixed: any key could spend from any Ed25519 account
+### 3. Keyless depends on Aptos's services
 
-`Transaction::authenticate` checked that a signature matched the key carried in
-the transaction but never that the key was the sender's. It now requires
-`sender == public_key` and verifies strictly, matching Aptos's
-`ed25519::signature_verify_strict` (regression tests in `sena-stf/tests/execution.rs`).
+SENA verifies proofs for the Aptos Keyless circuit; it does not produce them.
+Wallets use the Aptos prover and pepper services through
+`sena_node::keyless_client`, whose request and response shapes follow the
+services' published API but have been exercised here only against fixtures —
+no live sign-in has been run. Consequences:
 
-### 2. The Aptos L1 contracts are deployed to devnet, not testnet
+- Proving availability is Aptos's. If the prover is down, new keyless sessions
+  cannot start (existing sessions keep working until their ephemeral keys
+  expire).
+- The pepper determines the address. A wallet must use one pepper source
+  consistently, or its user's address changes.
+- **Training-wheels signatures are not checked.** Aptos co-signs proofs as a
+  defence against circuit bugs; SENA relies on the circuit and the ceremony
+  alone.
+- JWK rotation is a council governance action. Nothing watches providers'
+  JWKS endpoints and proposes rotations automatically; until a rotation lands,
+  proofs over a new key are refused.
 
-**Resolved since the last revision.** All six modules compile, 45 of 45 Move
-tests pass, and the package is published to Aptos devnet with the assertion
-lifecycle verified on chain.
+The insecure devnet setup is usable only behind `allow_insecure_test_setup`,
+and exists because Aptos publishes a real proof for it.
 
-Two authorization holes were found and fixed in the process, both invisible to
-unit tests because those call Move functions directly rather than through a
-transaction:
+### 4. Operating the agents
 
-- `disputes::Registry` was never created by anything, so every dispute entry
-  point would have aborted on a real network.
-- Dispute moves took the acting party as a *parameter* rather than deriving it
-  from the signer, so any account could have moved as either side — making the
-  turn and clock checks decorative. `challenger_won` was also `public`, meaning
-  any module could reject a sound assertion.
-
-What remains open:
-
-- **Devnet only, and devnet resets.** Nothing is on testnet.
-- **The bridge and bonds are written but unproven on chain.** Both custody real
-  fungible assets — Circle USDC on testnet via `dispatchable_fungible_asset` —
-  and both compile and unit-test, but nothing has been deposited or bonded on a
-  live network: testnet funding is a manual faucet step.
-- **No dispute has been played to completion on chain.** Only that a challenge
-  blocks finalization.
-- **Four instructions are not adjudicable.** `VerifyGasAsset`, `VerifyCouncil`,
-  `SetGasAsset` and `SetParameter` abort, so a dispute over a gas-rate or
-  governance step cannot be settled on L1. That is a beta blocker.
-- **Nothing is audited.**
-
-The toolchain is narrow and deliberately pinned: CLI `7.9.0` with the framework
-at commit `46d871fa…`. Newer CLI releases abort on CPUs without AVX2, and newer
-framework revisions use syntax `7.9.0` cannot parse. See
-[`move/README.md`](move/README.md).
-
-### 3. Nothing has been audited
-
-`sena::osp` — the one-step verifier — is the highest-value target in the system.
-It is the final arbiter of every dispute, and if its semantics diverge from the
-Rust implementation it decides disputes wrongly in one direction or the other.
-Nothing else can catch that, because nothing else is appealed to.
-
-`SRS NFR-SEC-012` makes independent audit of the dispute contracts a named
-requirement before mainnet.
-
-### 4. No real L1 integration
-
-Assertions, bonds and withdrawals are modelled in Rust as a state machine. No
-transaction has ever been submitted to Aptos. Bond custody and slashing are
-bookkeeping, not coin movement.
+- **The relayer halts when an assertion is rejected.** That is the right
+  default — continuing would build on fraud — but recovering (rolling the
+  sequencer back to the last good assertion) is a manual operation.
+- **The watcher halts if a wrong assertion finalized before it saw it.** L1's
+  canonical chain would then contain fraud; nothing automatic can fix that.
+- The watcher finds batch data by scanning the proposer's transaction history
+  through the fullnode REST API. That needs a fullnode that keeps history, and
+  costs time proportional to that history; an indexer-backed lookup would not.
+- Both agents sign through the Aptos CLI and keep keys in its profile; there is
+  no HSM or remote-signer integration.
 
 ### 5. Single sequencer, no decentralisation
 
-By design for now, and stated in the SDD. Fraud proofs constrain *what state the
-sequencer can assert*; they do not constrain which transactions it includes or
-in what order. Forced inclusion is specified and present in the Move draft but
-not wired into the Rust node.
+By design for now. Fraud proofs constrain *what state the sequencer can
+assert*; they do not constrain which transactions it includes or in what order.
+Forced inclusion exists in `sena::bridge` but is not wired into the Rust node.
 
 ### 6. Operational gaps
 
 - Fees are flat per transaction; per-instruction gas metering is not implemented.
 - State is an in-memory trie snapshotted to disk. RocksDB and NOMT, as the SDD
   specifies, are not integrated.
-- No peer-to-peer layer. A verifier follows a sequencer over RPC.
-- No fraud-proof data availability layer; batch data is served by the node.
+- No peer-to-peer layer.
+- `scripts/bridge-test.sh withdraw` is not automated end to end on a live
+  network; withdrawals are tested in Move and in Rust.
 
 ---
 
 ## Known trade-offs, chosen deliberately
 
-These are not gaps. They are decisions, and they are the ones a reviewer should
-push on.
-
 **Withdrawal takes a challenge window.** Seven days by default, 24 hours as the
-hard floor. This is intrinsic to optimistic rollups, not an implementation
-shortcoming. Third-party fast-withdrawal liquidity can mask it; validity proofs
-would remove it.
+hard floor. This is intrinsic to optimistic rollups.
 
 **Security assumes one honest verifier.** The protocol reduces trust from "the
-sequencer is honest" to "someone is watching". That is a far weaker assumption,
-but it is not *no* assumption. A network where nobody runs a verifier is
-functionally custodial regardless of what the protocol permits.
+sequencer is honest" to "someone is watching". `sena-node watch` is that
+someone; a network where nobody runs one is functionally custodial.
 
-**Bisection is over state-machine instructions, not RV32IM.** The SDD specifies
-compiling the state transition function to RISC-V. Both implementations bisect a
-higher-level instruction set instead. The protocol structure is identical; the
-trade-off is that every new instruction must also be implemented in the L1
-verifier. Discussed in [`crates/sena-stf/src/instruction.rs`](crates/sena-stf/src/instruction.rs).
+**Batch data lives on L1.** Every batch is published in the transaction that
+asserts it, so availability is Aptos's rather than the sequencer's. The cost is
+L1 gas per byte and a 48 KiB cap per batch.
 
-**Salted identifier hashes resist disclosure, not enumeration.** A network-wide
-public salt defeats precomputed tables but not an attacker willing to hash a
-leaked email corpus. The property delivered is that the state does not publish
-anyone's contact details — not that a guess cannot be confirmed.
+**Bisection is over state-machine instructions, not RV32IM.** Every instruction
+must also be implemented in the L1 verifier; `sena::compiler` and `sena::osp`
+are that implementation. Discussed in
+[`crates/sena-stf/src/instruction.rs`](crates/sena-stf/src/instruction.rs).
+
+**Salted identifier hashes resist disclosure, not enumeration.** The state does
+not publish anyone's contact details, but a guess can be confirmed.
 
 ---
 
-## What beta testing changed
+## Fixed in this revision
 
-Running the system end-to-end over HTTP surfaced two real defects that unit
-tests had not:
-
-**`u128` amounts could not be represented in JSON.** `serde_json` refuses to
-encode `u128`, and any client whose JSON numbers are IEEE-754 doubles —
-JavaScript included — would have silently rounded a balance above 2^53. Amounts
-now travel as decimal strings, with a regression test.
-
-**The transaction signing digest hashed `serde_json` output.** What a user signs
-must be reproducible by anything that verifies the signature, including a Move
-contract. Payloads now use the canonical binary codec.
-
-An earlier round of work surfaced a third, from a test written against the spec:
-the dispute clock budget was a fixed 48 hours per party — 96 hours total, longer
-than the 24-hour window floor. A dispute could have outlived the window it exists
-to resolve within. The budget is now derived from the window.
+- **Any key could spend from any Ed25519 account.** Authentication now requires
+  `sender == public_key` and verifies strictly, as Aptos does.
+- **The October 2026 keyless prototype was unsound** (forgeable verification
+  key, placeholder ceremony and prover, bypassable JWK check, leaking pepper
+  service). It is quarantined in `attic/unsafe-keyless-2026-10/` and replaced by
+  the Aptos Keyless circuit.
+- **Four instructions could not be adjudicated** (`VerifyGasAsset`,
+  `VerifyCouncil`, `SetGasAsset`, `SetParameter`); now every instruction can,
+  and L1 compiles the disputed transaction itself rather than trusting either
+  party's account of it.
+- **Batch roots could commit to data nobody could open.** The data is now
+  published on L1 and the root computed there.
+- **Mempool admission was quadratic** in the queue, a cheap way to stall the
+  sequencer; it now does constant work per transaction.
 
 ---
 
 ## Where this sits against the beta gates
 
-Against the seven release gates in
-[`BETA_BUILD_PLAN.md`](docs/beta/BETA_BUILD_PLAN.md), the project is at
-**Gate A, in progress**. The scope freeze, parameter freeze and traceability
-matrix are done; the SRS/SDD amendment for the execution target is outstanding.
-
-Gate B — local end-to-end integration against an Aptos node — is now reachable:
-the Move package compiles and its tests pass, which was the item blocking it.
-What Gate B still needs is a local Aptos deployment and an assertion lifecycle
-run against it. Nothing has been deployed yet.
-
-[`BETA_EXECUTION_CHECKLIST.md`](docs/beta/BETA_EXECUTION_CHECKLIST.md) carries a
-status for every item.
+Against the release gates in [`BETA_BUILD_PLAN.md`](docs/beta/BETA_BUILD_PLAN.md):
+**Gate B — local end-to-end integration against an Aptos node — is met.** The
+honest lifecycle and an adversarial one (a forged keyless credit disputed to
+rejection) both run against a local node, in CI. Gate C (public testnet) is
+next and needs only funding and a deployment run.
 
 ## Roadmap
 
-In dependency order, following the build plan's critical path.
-
-1. **Local Aptos integration.** The honest and adversarial assertion lifecycles
-   against a local node — Gate B. The contracts compile, so this is the next
-   real step.
-2. **Adjudicate the remaining four instructions.** Until `VerifyGasAsset` and
-   `VerifyCouncil` can be settled on L1, disputes over gas and governance steps
-   have no resolution path.
-3. **Aptos settlement adapter.** Real signed transactions, real assertions.
-4. **Independent data availability.** Batch data currently comes from the same
-   node that produced the assertion, which is the weakest link in the security
-   claim.
-5. **Bridge with one test asset.** Deposits, withdrawals against finalized roots,
-   custody reconciliation.
-6. **Independent audit** of the dispute contracts and the one-step verifier.
-7. **Keyless proof verification** — Groth16 over BN254 against Aptos's
-   verification key, replacing `NoVerifier`. Deliberately after the settlement
-   path is real, per D-03.
-8. **Public verifier programme** — the security model is only as good as the
+1. **Testnet deployment** of the current package, bridge with Circle USDC.
+2. **Independent audit** of the dispute contracts, the L1 compiler and keyless
+   verification.
+3. **Live keyless sign-in** against the Aptos prover and pepper services, and
+   training-wheels checking.
+4. **Sequencer recovery** after a rejected assertion, and forced inclusion in
+   the node.
+5. **Public verifier programme** — the security model is only as good as the
    number of independent parties actually watching.
 
 ---

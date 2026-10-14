@@ -7,18 +7,19 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="devnet" src="https://img.shields.io/badge/aptos-devnet%20deployed-blue">
+<img alt="aptos" src="https://img.shields.io/badge/aptos-localnet%20verified-blue">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
 > ### Beta — read this before using it
 >
-> The Rust node runs, seals blocks, serves JSON-RPC, and survives restarts. A
-> verifier can rebuild the chain from published data and catch a lying sequencer.
-> That part is real and tested.
+> The node runs, seals blocks and posts them to Aptos with their batch data. An
+> independent watcher re-executes every assertion from L1 data and challenges
+> fraud, and on a real Aptos node a forged keyless transfer has been disputed
+> down to one step and rejected by Aptos itself, Groth16 proof and all.
 >
-> **It has not been audited. Nothing has been deployed to any network. Keyless
-> sign-in is not finished.** Do not put real funds anywhere near it.
+> **It has not been audited, and the current contracts are not deployed to any
+> public network.** Do not put real funds anywhere near it.
 >
 > [`STATUS.md`](STATUS.md) is the honest, line-by-line account of what works
 > today and what does not. Read it before forming a view.
@@ -50,13 +51,28 @@ Three scenarios, run against the real implementation with no mocks:
 3. A withdrawal is refused against a pending state root and honoured once the
    challenge window has elapsed.
 
-### 2. Keyless sign-in (in progress)
+### 2. Keyless sign-in
 
-Keyless accounts are being rebuilt on the audited
+Keyless accounts use the audited
 [Aptos Keyless](https://github.com/aptos-labs/keyless-zk-proofs) circom circuit
-and its ceremony verification key. Until that lands, the node **rejects every
-keyless transaction**. An earlier prototype (a self-made "Groth16 verifier",
-"ceremony", prover and pepper cluster) was unsound and has been moved to
+(`circuit-v1.0.1`) and the Aptos mainnet ceremony verification key (January
+2025). The node and the L1 contracts both verify the Groth16 proof, so a keyless
+transaction can be disputed like any other.
+
+Enable it in genesis:
+
+```json
+"keyless": {
+  "setup": "aptos-keyless-mainnet-2025-01",
+  "jwks": [{ "iss": "https://accounts.google.com", "kid": "…", "n": "<modulus, base64url>" }]
+}
+```
+
+Wallets sign in through the Aptos prover and pepper services;
+[`sena_node::keyless_client`](crates/sena-node/src/keyless_client.rs) builds the
+session nonce, assembles the authenticator from the JWT and proof (refusing a
+proof for other inputs), and signs transactions with the ephemeral key. An
+earlier, unsound prototype is quarantined in
 [`attic/`](attic/unsafe-keyless-2026-10/README.md); see `STATUS.md`.
 
 ### 3. Run your own devnet
@@ -125,29 +141,44 @@ nothing can be withdrawn against it. **Soft confirmation and L1 finality are
 different things**, and every response that touches a transaction keeps them
 apart.
 
-### 5. It runs on Aptos devnet
+### 5. Settle on Aptos: relay and watch
 
-The contracts are published and the lifecycle is verified on chain. Aptos itself
-rejects the two things it must:
+The sequencer's L1 agent posts each block as a bonded assertion with its batch
+data, answers bisection moves and finalizes:
 
+```sh
+./target/release/sena-node relay --rpc $RPC \
+    --aptos-url https://api.testnet.aptoslabs.com/v1 \
+    --contract 0xSENA_PACKAGE --profile proposer --account 0xPROPOSER
 ```
-assertions::finalize  (inside challenge window)  →  E_WINDOW_OPEN
-assertions::finalize  (while challenged)         →  E_WRONG_STATUS
+
+Anyone can run the other half. A watcher trusts only Aptos and its own copy of
+the genesis file: it re-executes every assertion from the batch data published
+on L1 and challenges anything wrong, playing the dispute to the end.
+
+```sh
+./target/release/sena-node watch --data-dir ./devnet \
+    --aptos-url https://api.testnet.aptoslabs.com/v1 \
+    --contract 0xSENA_PACKAGE --profile watcher --account 0xWATCHER
 ```
 
-Transaction hashes and a reproduction script are in
-[`docs/beta/evidence/03-devnet-deployment.md`](docs/beta/evidence/03-devnet-deployment.md).
-No bonds move yet — posting an assertion costs gas and nothing else.
+Signing goes through an [Aptos CLI](https://aptos.dev/tools/aptos-cli/) profile,
+so keys stay in its keystore.
 
 ### 6. Run it against Aptos yourself
 
+With `aptos node run-localnet` running:
+
 ```sh
-scripts/chain-lifecycle.sh devnet     # or testnet
+scripts/localnet-dispute.sh    # a forged keyless credit, disputed until Aptos rejects it
+scripts/localnet-agents.sh     # relay posts a real block; watch verifies it from L1 data
+scripts/chain-lifecycle.sh local   # or devnet, testnet
 ```
 
-Deploys to a fresh account and asserts an expected outcome at every step. The
-two that matter are failures — if a challenged assertion ever finalizes, the
-script fails loudly.
+The dispute script prints the gas of every move — 4,809 units from post to
+rejection. The lifecycle script asserts an expected outcome at every step; the
+ones that matter are failures — if a challenged assertion ever finalizes, it
+fails loudly. CI runs the first two on every change.
 
 Full guide: [`docs/TESTING.md`](docs/TESTING.md).
 
@@ -208,11 +239,11 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 |---|---|
 | [`sena-primitives`](crates/sena-primitives) | Hashes, OIDC address derivation, identifier hashing, canonical codec |
 | [`sena-state`](crates/sena-state) | Sparse Merkle trie, inclusion and non-inclusion proofs |
-| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless claim checks, execution traces |
+| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, Aptos Keyless verification, execution traces |
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
-| [`sena-node`](crates/sena-node) | Mempool, block production, RPC, verifier mode, CLI |
+| [`sena-node`](crates/sena-node) | Mempool, block production, RPC, L1 relayer and watcher, keyless wallet client, CLI |
 | [`sena-light-client`](crates/sena-light-client) | Ultralight mobile verification: sub-millisecond Sparse Merkle Proof checks |
-| [`move/sena`](move/sena) | Aptos L1 contracts — **deployed to devnet**, 53/53 tests, see [`move/README.md`](move/README.md) |
+| [`move/sena`](move/sena) | Aptos L1 contracts — every instruction adjudicable, keyless included; 76/76 tests, see [`move/README.md`](move/README.md) |
 
 ## Light client
 
@@ -241,7 +272,7 @@ processes and diffs the results.
 See [`docs/TESTING.md`](docs/TESTING.md) for what each layer actually proves.
 
 ```sh
-cargo test --workspace                                    # 265 tests
+cargo test --workspace                                    # 306 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
