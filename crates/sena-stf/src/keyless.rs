@@ -641,6 +641,17 @@ impl KeylessConfig {
             .into_iter()
             .find(|c| c.name == name)
     }
+
+    /// The id `sena::keyless` on Aptos L1 gives this parameter set; 0 means
+    /// keyless is disabled.
+    #[must_use]
+    pub fn l1_setup_id(config: Option<&Self>) -> u8 {
+        match config.map(|c| c.name) {
+            None => 0,
+            Some(n) if n == APTOS_MAINNET.name => 1,
+            Some(_) => 2,
+        }
+    }
 }
 
 /// Everything a keyless check needs that is not in the transaction.

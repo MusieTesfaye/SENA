@@ -214,6 +214,15 @@ pub const fn clock_budget(challenge_window: u64) -> u64 {
 /// limits.
 pub const DEFAULT_ARITY: u64 = 8;
 
+/// The segment boundaries of `[lo, hi]` divided `arity` ways, as both the Rust
+/// model and `sena::disputes::boundaries` on L1 compute them.
+#[must_use]
+pub fn boundaries(lo: u64, hi: u64, arity: u64) -> Vec<u64> {
+    let span = hi - lo;
+    let segments = arity.min(span).max(1);
+    (0..=segments).map(|i| lo + (span * i) / segments).collect()
+}
+
 impl Dispute {
     /// Opens a dispute over the whole trace.
     ///
@@ -272,11 +281,7 @@ impl Dispute {
     /// without it having to be transmitted.
     #[must_use]
     pub fn boundaries(&self) -> Vec<u64> {
-        let span = self.hi - self.lo;
-        let segments = self.arity.min(span).max(1);
-        (0..=segments)
-            .map(|i| self.lo + (span * i) / segments)
-            .collect()
+        boundaries(self.lo, self.hi, self.arity)
     }
 
     /// Returns how many interior commitments the defender must publish.

@@ -147,6 +147,14 @@ module sena::keyless {
     /// The circuit's single public input. `none` if any field element is not
     /// canonically encoded.
     public fun public_inputs_hash(sig: &Signature): option::Option<Element<Fr>> {
+        let scalars = public_input_scalars(sig);
+        if (option::is_none(&scalars)) { return option::none() };
+        option::some(poseidon::hash14(option::borrow(&scalars)))
+    }
+
+    /// The 14 scalars the public-input hash absorbs, in circuit order. `none`
+    /// if any field element is not canonically encoded.
+    public fun public_input_scalars(sig: &Signature): option::Option<vector<Element<Fr>>> {
         let idc = fr_canonical(&sig.idc);
         let iss = fr_canonical(&sig.iss_hash);
         let header = fr_canonical(&sig.jwt_header_hash);
@@ -173,7 +181,7 @@ module sena::keyless {
         vector::push_back(&mut s, option::extract(&mut jwk));
         vector::push_back(&mut s, option::extract(&mut fr_canonical(&EMPTY_OVERRIDE_AUD_HASH)));
         vector::push_back(&mut s, crypto_algebra::zero<Fr>()); // use_override_aud
-        option::some(poseidon::hash14(&s))
+        option::some(s)
     }
 
     fun g1(bytes: &vector<u8>): option::Option<Element<G1>> {
@@ -185,7 +193,7 @@ module sena::keyless {
     }
 
     /// Checks a Groth16 proof (A ‖ B ‖ C, compressed) against one public input.
-    fun groth16_verify(setup: u8, proof: &vector<u8>, x: &Element<Fr>): bool {
+    public fun groth16_verify(setup: u8, proof: &vector<u8>, x: &Element<Fr>): bool {
         if (vector::length(proof) != 128) { return false };
         let a_bytes = vector::empty<u8>();
         let b_bytes = vector::empty<u8>();
@@ -229,9 +237,10 @@ module sena::keyless {
         crypto_algebra::eq(&product, &crypto_algebra::zero<Gt>())
     }
 
-    /// Verifies a keyless authorisation of `digest` for `sender`, at batch time
-    /// `now`, under `setup`. Mirrors `sena_stf::keyless::verify`.
-    public fun verify(
+    /// The checks that need no Poseidon or pairing: setup, address binding,
+    /// expiry horizon, ephemeral-key expiry at `now`, and the ephemeral
+    /// signature over `digest`.
+    public fun precheck(
         setup: u8,
         sig: &Signature,
         sender: &vector<u8>,
@@ -247,13 +256,29 @@ module sena::keyless {
         };
         if (sig.exp_horizon_secs > max_horizon) { return false };
         if (now >= sig.exp_date_secs) { return false };
-        if (!verify_ed25519_strict(&sig.ephemeral_public_key, &sig.ephemeral_signature, digest)) {
-            return false
-        };
+        verify_ed25519_strict(&sig.ephemeral_public_key, &sig.ephemeral_signature, digest)
+    }
+
+    /// Verifies a keyless authorisation of `digest` for `sender`, at batch time
+    /// `now`, under `setup`, in one call. Mirrors `sena_stf::keyless::verify`.
+    ///
+    /// One call exceeds an Aptos transaction's execution budget, so disputes
+    /// use the resumable `sena::keyless_jobs` instead; this form serves tests
+    /// and anything else without a gas limit. Both compute the same verdict.
+    public fun verify(
+        setup: u8,
+        sig: &Signature,
+        sender: &vector<u8>,
+        digest: &vector<u8>,
+        now: u64,
+    ): bool {
+        if (!precheck(setup, sig, sender, digest, now)) { return false };
         let pih = public_inputs_hash(sig);
         if (option::is_none(&pih)) { return false };
         groth16_verify(setup, &sig.proof, &option::extract(&mut pih))
     }
+
+    public fun proof(sig: &Signature): vector<u8> { sig.proof }
 
     /// Strict Ed25519 verification, as the Rust node performs it.
     public fun verify_ed25519_strict(

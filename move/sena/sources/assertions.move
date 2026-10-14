@@ -609,6 +609,54 @@ module sena::assertions {
     }
 
     #[view]
+    /// How many assertions the chain holds, genesis included.
+    public fun assertion_count(chain_addr: address): u64 acquires Chain {
+        vector::length(&borrow_global<Chain>(chain_addr).order)
+    }
+
+    #[view]
+    /// The id of the `index`-th assertion, in posting order.
+    public fun assertion_at(chain_addr: address, index: u64): vector<u8> acquires Chain {
+        *vector::borrow(&borrow_global<Chain>(chain_addr).order, index)
+    }
+
+    #[view]
+    /// An assertion's record: (parent, proposer, pre-state root, post-state
+    /// root, batch timestamp, tx count, tx root, trace length, bond, posted at,
+    /// status).
+    public fun record(chain_addr: address, id: vector<u8>): (
+        vector<u8>, address, vector<u8>, vector<u8>, u64, u64, vector<u8>, u64, u128, u64, u8
+    ) acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        let r = table::borrow(&chain.assertions, id);
+        (
+            r.parent, r.proposer, r.pre_state_root, r.post_state_root, r.timestamp, r.tx_count,
+            r.tx_root, r.trace_length, r.bond, r.posted_at, r.status,
+        )
+    }
+
+    #[view]
+    /// Everyone with an open challenge against an assertion.
+    public fun challengers(chain_addr: address, id: vector<u8>): vector<address> acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        let out = vector::empty<address>();
+        if (!table::contains(&chain.challenges, id)) { return out };
+        let list = table::borrow(&chain.challenges, id);
+        let i = 0;
+        while (i < vector::length(list)) {
+            vector::push_back(&mut out, vector::borrow(list, i).challenger);
+            i = i + 1;
+        };
+        out
+    }
+
+    #[view]
+    public fun minimum_bond(chain_addr: address): u128 acquires Chain {
+        borrow_global<Chain>(chain_addr).minimum_bond
+    }
+
+    #[view]
     public fun status(chain_addr: address, id: vector<u8>): u8 acquires Chain {
         let chain = borrow_global<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);

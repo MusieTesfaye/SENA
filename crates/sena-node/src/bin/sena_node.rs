@@ -106,36 +106,82 @@ enum Command {
         #[command(subcommand)]
         what: Query,
     },
-    /// Run the automated Aptos L1 Relayer daemon.
+    /// Post this sequencer's blocks to Aptos L1 as bonded assertions,
+    /// defend them in disputes, and finalize them.
     Relay {
-        /// L2 RPC endpoint.
+        /// L2 RPC endpoint of the sequencer.
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
-        /// Aptos network (testnet, devnet, local).
-        #[arg(long, default_value = "testnet")]
-        network: String,
-        /// Aptos REST endpoint.
-        #[arg(long, default_value = "https://api.testnet.aptoslabs.com/v1")]
-        aptos_rpc: String,
-        /// Deployed rollup contract address on Aptos.
-        #[arg(long, default_value = "0x1")]
-        contract: String,
-        /// Aptos CLI profile to use.
-        #[arg(long, default_value = "default")]
-        profile: String,
-        /// Proposer address on Aptos L1.
-        #[arg(long, default_value = "0x1")]
-        proposer: String,
-        /// Bond per assertion in micro-units.
+        /// Bearer token for the L2 RPC.
+        #[arg(long)]
+        rpc_token: Option<String>,
+        #[command(flatten)]
+        aptos: AptosArgs,
+        /// Bond per assertion, in the bond asset's smallest unit.
         #[arg(long, default_value_t = 1_000_000)]
         bond: u128,
-        /// Seconds between polling checks.
-        #[arg(long, default_value_t = 2)]
-        poll_interval: u64,
-        /// Dry run mode.
-        #[arg(long)]
-        dry_run: bool,
+        /// Where progress is persisted.
+        #[arg(long, default_value = "./sena-data/relayer.json")]
+        state: String,
     },
+    /// Watch Aptos L1, re-execute every assertion from the batch data
+    /// published there, and challenge any that is wrong.
+    Watch {
+        /// Data directory holding the genesis to verify against.
+        #[arg(long, default_value = "./sena-data")]
+        data_dir: String,
+        #[command(flatten)]
+        aptos: AptosArgs,
+        /// Bond per challenge, in the bond asset's smallest unit.
+        #[arg(long, default_value_t = 1_000_000)]
+        bond: u128,
+        /// Where progress is persisted.
+        #[arg(long, default_value = "./sena-data/watcher.json")]
+        state: String,
+        /// Poseidon steps per keyless-verdict transaction. The most expensive
+        /// steps must fit one Aptos transaction's execution budget.
+        #[arg(long, default_value_t = 12)]
+        keyless_steps_per_tx: u64,
+    },
+}
+
+/// How to reach and sign for Aptos L1.
+#[derive(clap::Args)]
+struct AptosArgs {
+    /// Aptos fullnode REST endpoint.
+    #[arg(long, default_value = "https://api.testnet.aptoslabs.com/v1")]
+    aptos_url: String,
+    /// Address the SENA package is published at.
+    #[arg(long)]
+    contract: String,
+    /// Aptos CLI profile that signs (from `.aptos/config.yaml`).
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// The profile's account address.
+    #[arg(long)]
+    account: String,
+    /// Path to the `aptos` binary.
+    #[arg(long, default_value = "aptos")]
+    aptos_bin: String,
+    /// Most gas units one transaction may use.
+    #[arg(long, default_value_t = 2_000_000)]
+    max_gas: u64,
+    /// Seconds between rounds.
+    #[arg(long, default_value_t = 10)]
+    poll_interval: u64,
+}
+
+impl AptosArgs {
+    fn client(&self) -> sena_node::l1::AptosCli {
+        sena_node::l1::AptosCli {
+            binary: self.aptos_bin.clone(),
+            profile: self.profile.clone(),
+            rest_url: self.aptos_url.clone(),
+            contract: self.contract.clone(),
+            account: self.account.clone(),
+            max_gas: self.max_gas,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -206,31 +252,18 @@ fn main() {
         Command::Query { rpc, what } => query(&rpc, &what),
         Command::Relay {
             rpc,
-            network,
-            aptos_rpc,
-            contract,
-            profile,
-            proposer,
+            rpc_token,
+            aptos,
             bond,
-            poll_interval,
-            dry_run,
-        } => {
-            let config = sena_node::RelayerConfig {
-                sena_rpc_url: rpc,
-                aptos_network: network,
-                aptos_rest_url: aptos_rpc,
-                contract_address: contract,
-                profile,
-                proposer_address: proposer,
-                bond_amount: bond,
-                poll_interval_secs: poll_interval,
-                auto_finalize: true,
-                dry_run,
-            };
-            let mut relayer = sena_node::AptosRelayer::new(config);
-            let running = AtomicBool::new(true);
-            relayer.run_daemon(&running)
-        }
+            state,
+        } => relay(rpc, rpc_token, &aptos, bond, state),
+        Command::Watch {
+            data_dir,
+            aptos,
+            bond,
+            state,
+            keyless_steps_per_tx,
+        } => watch(&data_dir, &aptos, bond, state, keyless_steps_per_tx),
     };
 
     if let Err(message) = result {
@@ -367,6 +400,91 @@ fn verify(data_dir: &str, rpc: &str) -> Result<(), String> {
     println!("Fetch blocks with sena_getBlock and re-execute them; see");
     println!("`sena_node::VerifierNode` and the beta test script for a worked example.");
     Ok(())
+}
+
+/// Runs `step` every `poll_interval` seconds until interrupted. A failed round
+/// is reported and retried; L1 and the L2 node are expected to come and go.
+fn rounds<R: std::fmt::Debug, E: std::fmt::Display>(
+    poll_interval: u64,
+    mut step: impl FnMut() -> Result<R, E>,
+    quiet: impl Fn(&R) -> bool,
+) -> Result<(), String> {
+    loop {
+        match step() {
+            Ok(report) if quiet(&report) => {}
+            Ok(report) => println!("{report:?}"),
+            Err(e) => eprintln!("round failed: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(poll_interval));
+    }
+}
+
+fn relay(
+    rpc: String,
+    rpc_token: Option<String>,
+    aptos: &AptosArgs,
+    bond: u128,
+    state: String,
+) -> Result<(), String> {
+    let source = sena_node::RpcSource {
+        url: rpc,
+        auth_token: rpc_token,
+    };
+    let config = sena_node::RelayerConfig {
+        bond,
+        state_path: state.into(),
+    };
+    let mut relayer =
+        sena_node::Relayer::new(aptos.client(), source, config).map_err(|e| e.to_string())?;
+    println!("relaying to {} as {}", aptos.contract, aptos.account);
+    rounds(
+        aptos.poll_interval,
+        || match relayer.step() {
+            // A rejected assertion means this sequencer asserted something
+            // false; carrying on would only post more on top of it.
+            Err(sena_node::relayer::RelayError::Rejected(h)) => {
+                eprintln!("assertion for block {h} was rejected on L1; halting");
+                std::process::exit(2);
+            }
+            other => other,
+        },
+        |r| *r == sena_node::relayer::StepReport::default(),
+    )
+}
+
+fn watch(
+    data_dir: &str,
+    aptos: &AptosArgs,
+    bond: u128,
+    state: String,
+    keyless_steps_per_tx: u64,
+) -> Result<(), String> {
+    let store = Store::open(data_dir).map_err(|e| e.to_string())?;
+    let config = store
+        .load_genesis()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no genesis.json in {data_dir}"))?;
+    let keyless = config.keyless_config().map_err(|e| e.to_string())?;
+    let genesis = config.build_state().map_err(|e| e.to_string())?;
+    let watcher_config = sena_node::WatcherConfig {
+        bond,
+        state_path: state.into(),
+        keyless_setup: sena_stf::KeylessConfig::l1_setup_id(keyless.as_deref()),
+        keyless,
+        keyless_steps_per_tx: keyless_steps_per_tx.max(1),
+    };
+    let mut watcher = sena_node::Watcher::new(aptos.client(), watcher_config, genesis)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "watching {} from assertion {}",
+        aptos.contract,
+        watcher.state().cursor
+    );
+    rounds(
+        aptos.poll_interval,
+        || watcher.step(),
+        |r| *r == sena_node::WatchReport::default(),
+    )
 }
 
 fn keygen() {

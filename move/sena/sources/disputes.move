@@ -20,6 +20,7 @@ module sena::disputes {
     use sena::batch;
     use sena::compiler;
     use sena::keyless;
+    use sena::keyless_jobs;
     use sena::osp;
     use sena::trie;
 
@@ -53,6 +54,9 @@ module sena::disputes {
     const E_NOT_FRAUD: u64 = 63;
     /// A trace of zero steps has nothing to bisect.
     const E_EMPTY_TRACE: u64 = 64;
+    /// The leaf is a keyless transaction whose verdict has not been computed;
+    /// run `keyless_jobs::start`, `advance` and `finish` for it first.
+    const E_KEYLESS_NOT_VERIFIED: u64 = 65;
 
     const PARTY_DEFENDER: u8 = 0;
     const PARTY_CHALLENGER: u8 = 1;
@@ -114,6 +118,7 @@ module sena::disputes {
     public entry fun initialize(admin: &signer, chain: address, keyless_setup: u8) {
         assert!(!exists<Registry>(signer::address_of(admin)), E_ALREADY_INITIALIZED);
         keyless::assert_known_setup(keyless_setup);
+        keyless_jobs::create(admin);
         move_to(admin, Registry {
             disputes: table::new<vector<u8>, Dispute>(),
             chain,
@@ -373,7 +378,7 @@ module sena::disputes {
             E_BAD_LEAF
         );
 
-        let (compiles, program) = compiler::compile(tx_bytes, batch_time, keyless_setup);
+        let (compiles, program) = compile_leaf(registry_addr, tx_bytes, batch_time, keyless_setup);
         let winner = if (!compiles) {
             PARTY_CHALLENGER
         } else {
@@ -403,6 +408,25 @@ module sena::disputes {
         resolve_internal(registry_addr, id, winner);
     }
 
+    /// Compiles a published transaction for adjudication. A keyless one uses
+    /// the verdict `sena::keyless_jobs` computed for it at this batch time
+    /// under this registry's setup, which must already exist.
+    fun compile_leaf(
+        registry_addr: address,
+        tx_bytes: vector<u8>,
+        batch_time: u64,
+        keyless_setup: u8,
+    ): (bool, vector<osp::Instruction>) {
+        if (!compiler::is_keyless(tx_bytes)) {
+            return compiler::compile(tx_bytes, batch_time, keyless_setup)
+        };
+        let (done, verdict) = keyless_jobs::verdict(
+            registry_addr, keyless_jobs::job_id(tx_bytes, batch_time, keyless_setup)
+        );
+        assert!(done, E_KEYLESS_NOT_VERIFIED);
+        compiler::compile_with_keyless_verdict(tx_bytes, batch_time, keyless_setup, verdict)
+    }
+
     // --- Batch-structure fraud proofs ----------------------------------------
     //
     // Bisection assumes every step is covered by exactly one transaction. A
@@ -413,6 +437,7 @@ module sena::disputes {
     // rejects the assertion when it holds.
 
     fun leaf_program(
+        registry_addr: address,
         tx_root: vector<u8>,
         tx_count: u64,
         batch_time: u64,
@@ -423,7 +448,7 @@ module sena::disputes {
         siblings: &vector<vector<u8>>,
     ): (bool, u64) {
         assert!(batch::proves(tx_root, tx_count, index, start_pc, tx_bytes, siblings), E_BAD_LEAF);
-        let (ok, program) = compiler::compile(tx_bytes, batch_time, keyless_setup);
+        let (ok, program) = compile_leaf(registry_addr, tx_bytes, batch_time, keyless_setup);
         (ok, vector::length(&program))
     }
 
@@ -456,7 +481,7 @@ module sena::disputes {
             (r.chain, r.keyless_setup)
         };
         let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
-        let (ok, _) = leaf_program(tx_root, tx_count, batch_time, keyless_setup, index, start_pc, tx_bytes, &siblings);
+        let (ok, _) = leaf_program(registry_addr, tx_root, tx_count, batch_time, keyless_setup, index, start_pc, tx_bytes, &siblings);
         assert!(!ok, E_NOT_FRAUD);
         apply_structural_win(registry_addr, chain_addr, assertion, who);
     }
@@ -481,7 +506,7 @@ module sena::disputes {
             (r.chain, r.keyless_setup)
         };
         let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
-        let (ok_a, len_a) = leaf_program(tx_root, tx_count, batch_time, keyless_setup, index, start_a, tx_a, &siblings_a);
+        let (ok_a, len_a) = leaf_program(registry_addr, tx_root, tx_count, batch_time, keyless_setup, index, start_a, tx_a, &siblings_a);
         assert!(
             batch::proves(tx_root, tx_count, index + 1, start_b, tx_b, &siblings_b),
             E_BAD_LEAF
@@ -508,7 +533,7 @@ module sena::disputes {
         let (_, _, _, batch_time, tx_count, tx_root, trace_length, _) = assertions::dispute_view(chain_addr, assertion);
         assert!(tx_count > 0, E_NOT_FRAUD);
         let (ok, len) = leaf_program(
-            tx_root, tx_count, batch_time, keyless_setup, tx_count - 1, start_pc, tx_bytes, &siblings
+            registry_addr, tx_root, tx_count, batch_time, keyless_setup, tx_count - 1, start_pc, tx_bytes, &siblings
         );
         assert!(!ok || start_pc + len != trace_length, E_NOT_FRAUD);
         apply_structural_win(registry_addr, chain_addr, assertion, who);
@@ -566,6 +591,26 @@ module sena::disputes {
             if (d.turn == PARTY_DEFENDER) { PARTY_CHALLENGER } else { PARTY_DEFENDER }
         };
         resolve_internal(registry_addr, id, winner);
+    }
+
+    #[view]
+    /// A game's state, for the clients playing it: (exists, stage, turn, lo,
+    /// hi, has_offer, offered, deadline). Stage 0 bisecting, 1 one-step, 2
+    /// resolved; turn 0 defender, 1 challenger.
+    public fun dispute_state(registry_addr: address, id: vector<u8>): (
+        bool, u8, u8, u64, u64, bool, vector<vector<u8>>, u64
+    ) acquires Registry {
+        let registry = borrow_global<Registry>(registry_addr);
+        if (!table::contains(&registry.disputes, id)) {
+            return (false, 0, 0, 0, 0, false, vector::empty(), 0)
+        };
+        let d = table::borrow(&registry.disputes, id);
+        (true, d.stage, d.turn, d.lo, d.hi, d.has_offer, d.offered, d.deadline)
+    }
+
+    #[view]
+    public fun keyless_setup(registry_addr: address): u8 acquires Registry {
+        borrow_global<Registry>(registry_addr).keyless_setup
     }
 
     #[view]

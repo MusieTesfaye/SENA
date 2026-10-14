@@ -707,3 +707,37 @@ fn the_signing_digest_does_not_depend_on_json() {
         "the payload encoding must be binary"
     );
 }
+
+#[test]
+fn blocks_are_cut_to_fit_one_l1_transaction() {
+    let alice = signer(1);
+    let bob = address_of(&signer(2));
+    let mut sequencer = node(genesis(&[(address_of(&alice), 1_000_000_000)]));
+    let transfer = |nonce| {
+        signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1,
+            },
+        )
+    };
+    let per_tx = transfer(0).encode().len();
+    let count = sena_node::sequencer::MAX_BATCH_BYTES / per_tx + 10;
+    for nonce in 0..count as u64 {
+        sequencer.submit(transfer(nonce)).unwrap();
+    }
+
+    let (block, _) = sequencer.produce(usize::MAX).unwrap().unwrap();
+    let size: usize = block.transactions.iter().map(|t| t.encode().len()).sum();
+    assert!(size <= sena_node::sequencer::MAX_BATCH_BYTES);
+    assert_eq!(
+        block.transactions.len(),
+        sena_node::sequencer::MAX_BATCH_BYTES / per_tx
+    );
+    // The rest stays queued, in order, for the next block.
+    let (next, _) = sequencer.produce(usize::MAX).unwrap().unwrap();
+    assert_eq!(next.transactions[0].nonce, block.transactions.len() as u64);
+}

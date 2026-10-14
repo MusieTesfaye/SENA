@@ -91,6 +91,15 @@ pub enum Request {
         #[serde(default)]
         height: Option<u64>,
     },
+    /// Machine-state commitments of a block's trace at the given steps, for a
+    /// proposer defending its assertion in a bisection game.
+    #[serde(rename = "sena_getTraceCommitments")]
+    GetTraceCommitments {
+        /// The block.
+        height: u64,
+        /// The steps, each at most the trace length.
+        steps: Vec<u64>,
+    },
     /// Fetch canonical DA blob for a block (REQ-FRAUD-007, REQ-FRAUD-008).
     #[serde(rename = "sena_getDaBlob")]
     GetDaBlob {
@@ -232,6 +241,11 @@ pub enum Response {
     Error {
         /// A human-readable explanation.
         message: String,
+    },
+    /// Trace commitments, in the order requested.
+    TraceCommitments {
+        /// One per requested step.
+        commitments: Vec<Hash256>,
     },
     /// A canonical DA blob response.
     DaBlob {
@@ -376,6 +390,34 @@ fn account_proof(
     }
 }
 
+/// Commitments to a block's trace at `steps`.
+fn trace_commitments(sequencer: &Sequencer, height: u64, steps: &[u64]) -> Response {
+    let Some(block) = height
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| sequencer.blocks.get(i))
+    else {
+        return Response::Error {
+            message: format!("no block at height {height}"),
+        };
+    };
+    let mut commitments = Vec::with_capacity(steps.len());
+    for step in steps {
+        match usize::try_from(*step)
+            .ok()
+            .and_then(|i| block.trace.states.get(i))
+        {
+            Some(state) => commitments.push(state.commitment()),
+            None => {
+                return Response::Error {
+                    message: format!("step {step} is past the trace"),
+                }
+            }
+        }
+    }
+    Response::TraceCommitments { commitments }
+}
+
 /// Builds the data-availability blob for a sealed block.
 ///
 /// Heights count from 1; height 0 is genesis, which has no batch.
@@ -495,6 +537,10 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
         Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
 
         Request::GetDaBlob { height } => da_blob(sequencer, height),
+
+        Request::GetTraceCommitments { height, steps } => {
+            trace_commitments(sequencer, height, &steps)
+        }
 
         Request::GetChainInfo => Response::ChainInfo {
             chain_id: chain_id.to_owned(),

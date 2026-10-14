@@ -20,6 +20,14 @@ use crate::mempool::{Mempool, RejectReason};
 /// ephemeral key expiring in between would make the whole batch fail.
 pub const ADMISSION_EXPIRY_MARGIN_SECS: u64 = 60;
 
+/// The most transaction bytes one batch may carry.
+///
+/// A batch is published in full by a single `assertions::post` transaction,
+/// and Aptos refuses transactions over 64 KiB. A batch that cannot be posted
+/// can never be asserted, so blocks are cut to fit, with room left for the
+/// post's other arguments and per-element encoding overhead.
+pub const MAX_BATCH_BYTES: usize = 48 * 1024;
+
 /// Seconds since the Unix epoch, from the system clock.
 ///
 /// Only the sequencer reads a clock, to choose a batch timestamp; the state
@@ -219,7 +227,7 @@ impl Sequencer {
     /// Returns [`ProduceError`] if the batch fails to execute or the assertion
     /// is refused by the chain.
     pub fn produce(&mut self, limit: usize) -> Result<Option<(Block, AssertionId)>, ProduceError> {
-        let transactions = self.mempool.take_batch(limit);
+        let transactions = self.mempool.take_batch_within(limit, MAX_BATCH_BYTES);
         if transactions.is_empty() {
             return Ok(None);
         }

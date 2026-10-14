@@ -24,6 +24,7 @@ module sena::dispute_e2e_test {
     use sena::compiler;
     use sena::disputes;
     use sena::keyless;
+    use sena::keyless_jobs;
     use sena::osp;
     use sena::txcodec;
     use sena::vectors as v;
@@ -159,6 +160,18 @@ module sena::dispute_e2e_test {
         assertions::assertion_id(genesis_id(), 0, v::genesis_root(), post_root, commitment, trace_length, BOND)
     }
 
+    /// Runs a keyless verification job to completion, in three chunks, the way
+    /// a client spreads it over transactions on a real chain.
+    fun verify_keyless(caller: &signer, admin_addr: address, tx: vector<u8>) {
+        let setup = keyless::setup_aptos_devnet_insecure();
+        keyless_jobs::start(caller, admin_addr, tx, v::batch_timestamp(), setup);
+        let id = keyless_jobs::job_id(tx, v::batch_timestamp(), setup);
+        keyless_jobs::advance(caller, admin_addr, id, 25);
+        keyless_jobs::advance(caller, admin_addr, id, 25);
+        keyless_jobs::advance(caller, admin_addr, id, 25);
+        keyless_jobs::finish(caller, admin_addr, id);
+    }
+
     // --- The games --------------------------------------------------------------
 
     #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, challenger = @0xB0B)]
@@ -187,6 +200,9 @@ module sena::dispute_e2e_test {
         };
         assert!(disputes::disputed_step(admin_addr, did) == v::fraud_step(), 0);
 
+        // The disputed step is inside the keyless transaction: its verdict is
+        // computed first, over several transactions.
+        verify_keyless(challenger, admin_addr, v::fraud_leaf_tx());
         disputes::one_step(
             challenger, admin_addr, did,
             v::fraud_leaf_index(), v::fraud_leaf_start(), v::fraud_leaf_tx(), v::fraud_leaf_siblings(),
@@ -226,6 +242,7 @@ module sena::dispute_e2e_test {
             r = r + 1;
         };
 
+        verify_keyless(challenger, admin_addr, v::honest_leaf_tx());
         disputes::one_step(
             challenger, admin_addr, did,
             v::honest_leaf_index(), v::honest_leaf_start(), v::honest_leaf_tx(), v::honest_leaf_siblings(),
@@ -237,6 +254,58 @@ module sena::dispute_e2e_test {
         assert!(disputes::winner(admin_addr, did) == disputes::party_defender(), 0);
         assert!(assertions::status(admin_addr, id) == assertions::status_pending(), 1);
         assert!(balance(metadata, signer::address_of(challenger)) == FUNDING - (BOND as u64), 2);
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, challenger = @0xB0B)]
+    #[expected_failure(abort_code = 65, location = sena::disputes)]
+    fun a_keyless_step_needs_its_verdict_first(
+        aptos: &signer, admin: &signer, proposer: &signer, challenger: &signer,
+    ) {
+        setup(aptos, admin, proposer, challenger);
+        let admin_addr = signer::address_of(admin);
+        let id = post_batch(proposer, admin_addr, v::batch_txs(), v::batch_starts(), v::fraud_post_root(), v::trace_length());
+        assertions::open_challenge(challenger, admin_addr, id, BOND);
+        disputes::open(challenger, admin_addr, id);
+        let did = disputes::dispute_id(id, signer::address_of(challenger));
+        let selections = v::fraud_selections();
+        let r = 0;
+        while (r < v::fraud_rounds()) {
+            disputes::dissect(proposer, admin_addr, did, v::fraud_dissection(r));
+            disputes::select(challenger, admin_addr, did, *vector::borrow(&selections, r));
+            r = r + 1;
+        };
+        disputes::one_step(
+            challenger, admin_addr, did,
+            v::fraud_leaf_index(), v::fraud_leaf_start(), v::fraud_leaf_tx(), v::fraud_leaf_siblings(),
+            v::fraud_pre_root(), v::fraud_slot(), v::fraud_present(), v::fraud_value(),
+            v::fraud_trie_siblings(), v::fraud_terminal_is_leaf(), v::fraud_terminal_key(),
+            v::fraud_terminal_value_hash(),
+        );
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, challenger = @0xB0B)]
+    /// The resumable verdict is the one-call verdict, accepting and refusing.
+    fun the_job_verdict_is_the_one_call_verdict(
+        aptos: &signer, admin: &signer, proposer: &signer, challenger: &signer,
+    ) {
+        setup(aptos, admin, proposer, challenger);
+        let admin_addr = signer::address_of(admin);
+        let setup = keyless::setup_aptos_devnet_insecure();
+        let tx = v::fraud_leaf_tx();
+        verify_keyless(challenger, admin_addr, tx);
+        let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, v::batch_timestamp(), setup));
+        assert!(done && ok, 0);
+        let (inline_ok, _) = compiler::compile(tx, v::batch_timestamp(), setup);
+        assert!(inline_ok, 1);
+
+        // At a batch time past the ephemeral key's expiry, both refuse; the
+        // job finishes at `start` without running the permutation.
+        let late = 111111111111;
+        keyless_jobs::start(challenger, admin_addr, tx, late, setup);
+        let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, late, setup));
+        assert!(done && !ok, 2);
+        let (inline_ok, _) = compiler::compile(tx, late, setup);
+        assert!(!inline_ok, 3);
     }
 
     // --- Batch-structure fraud ----------------------------------------------------

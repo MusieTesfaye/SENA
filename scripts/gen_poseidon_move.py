@@ -24,6 +24,7 @@ import sys
 P_MOD = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 WIDTH = 15
 N = WIDTH - 1
+STEPS = 69
 
 
 def plain_constants(path):
@@ -149,6 +150,19 @@ module sena::poseidon_sparse {{
 /// than `crypto_algebra` allows in one transaction. The generator checks the
 /// optimised constants against the plain ones `sena_stf::poseidon` pins, and
 /// the test below pins the output to aptos-core's.
+///
+/// # Resumable
+///
+/// Even optimised, one permutation costs more than an Aptos transaction's
+/// execution budget, because every field operation pays for a generic native
+/// call. The permutation is therefore exposed as a schedule of
+/// {STEPS} steps that `run` executes a range of, so `sena::keyless` can spread one
+/// hash over several transactions, persisting the state between them.
+///
+/// Step 0 adds the first round constants; steps 1-3 are full rounds mixed
+/// by M; step 4 is a full round mixed by the pre-sparse matrix P; steps
+/// 5-64 are the partial rounds; steps 65-67 are full rounds; step 68 is the
+/// final full round without constants.
 module sena::poseidon {{
     use std::option;
     use std::vector;
@@ -158,10 +172,8 @@ module sena::poseidon {{
 
     /// Exactly 14 inputs are accepted.
     const E_WRONG_ARITY: u64 = 1;
-
-    const T: u64 = {WIDTH};
-    const HALF_FULL: u64 = 4;
-    const PARTIAL_ROUNDS: u64 = {partial};
+    /// A step range outside the schedule.
+    const E_BAD_STEPS: u64 = 2;
 
     /// Optimised round constants, little-endian.
     const C: vector<vector<u8>> = {vec(C)};
@@ -171,6 +183,9 @@ module sena::poseidon {{
 
     /// The pre-sparse matrix, transposed, row-major, little-endian.
     const P: vector<vector<u8>> = {vec(Pt)};
+
+    /// Number of steps in the schedule.
+    public fun steps(): u64 {{ {STEPS} }}
 
     fun fr(bytes: &vector<u8>): Element<Fr> {{
         option::extract(&mut crypto_algebra::deserialize<Fr, FormatFrLsb>(bytes))
@@ -184,7 +199,7 @@ module sena::poseidon {{
 
     fun pow5_all(state: &mut vector<Element<Fr>>) {{
         let i = 0;
-        while (i < T) {{
+        while (i < {WIDTH}) {{
             let s = vector::borrow_mut(state, i);
             *s = pow5(s);
             i = i + 1;
@@ -193,22 +208,23 @@ module sena::poseidon {{
 
     fun add_constants(state: &mut vector<Element<Fr>>, c: &vector<vector<u8>>, offset: u64) {{
         let i = 0;
-        while (i < T) {{
+        while (i < {WIDTH}) {{
             let s = vector::borrow_mut(state, i);
             *s = crypto_algebra::add(s, &fr(vector::borrow(c, offset + i)));
             i = i + 1;
         }};
     }}
 
-    /// state := matrix * state, for a row-major T x T matrix.
+    /// state := matrix * state, for a row-major {WIDTH} x {WIDTH} matrix.
     fun mix(state: &vector<Element<Fr>>, matrix: &vector<Element<Fr>>): vector<Element<Fr>> {{
         let out = vector::empty<Element<Fr>>();
         let row = 0;
-        while (row < T) {{
-            let acc = crypto_algebra::zero<Fr>();
-            let col = 0;
-            while (col < T) {{
-                let term = crypto_algebra::mul(vector::borrow(matrix, row * T + col), vector::borrow(state, col));
+        while (row < {WIDTH}) {{
+            let base = row * {WIDTH};
+            let acc = crypto_algebra::mul(vector::borrow(matrix, base), vector::borrow(state, 0));
+            let col = 1;
+            while (col < {WIDTH}) {{
+                let term = crypto_algebra::mul(vector::borrow(matrix, base + col), vector::borrow(state, col));
                 acc = crypto_algebra::add(&acc, &term);
                 col = col + 1;
             }};
@@ -229,64 +245,94 @@ module sena::poseidon {{
         out
     }}
 
-    /// Hashes exactly 14 field elements.
-    public fun hash14(inputs: &vector<Element<Fr>>): Element<Fr> {{
-        assert!(vector::length(inputs) == T - 1, E_WRONG_ARITY);
-        let c = C;
-        let m = load(&M);
-        let p = load(&P);
-        let s_bytes = poseidon_sparse::constants();
-
+    /// The state the permutation starts from: zero, then the 14 inputs.
+    public fun initial_state(inputs: &vector<Element<Fr>>): vector<Element<Fr>> {{
+        assert!(vector::length(inputs) == {N}, E_WRONG_ARITY);
         let state = vector::singleton(crypto_algebra::zero<Fr>());
         vector::append(&mut state, *inputs);
-        add_constants(&mut state, &c, 0);
+        state
+    }}
 
-        let r = 0;
-        while (r < HALF_FULL - 1) {{
-            pow5_all(&mut state);
-            add_constants(&mut state, &c, (r + 1) * T);
-            state = mix(&state, &m);
-            r = r + 1;
-        }};
-        pow5_all(&mut state);
-        add_constants(&mut state, &c, HALF_FULL * T);
-        state = mix(&state, &p);
-
-        let r = 0;
-        while (r < PARTIAL_ROUNDS) {{
-            let s0 = vector::borrow_mut(&mut state, 0);
-            *s0 = pow5(s0);
-            *s0 = crypto_algebra::add(s0, &fr(vector::borrow(&c, (HALF_FULL + 1) * T + r)));
-            let base = (2 * T - 1) * r;
-            let acc = crypto_algebra::zero<Fr>();
-            let j = 0;
-            while (j < T) {{
-                let term = crypto_algebra::mul(&fr(vector::borrow(&s_bytes, base + j)), vector::borrow(&state, j));
-                acc = crypto_algebra::add(&acc, &term);
-                j = j + 1;
+    /// Executes schedule steps `[from, to)` on `state`.
+    public fun run(state: &mut vector<Element<Fr>>, from: u64, to: u64) {{
+        assert!(from <= to && to <= {STEPS} && vector::length(state) == {WIDTH}, E_BAD_STEPS);
+        if (from == to) {{ return }};
+        let c = C;
+        let needs_m = from <= 3 || to > 65;
+        let m = if (needs_m) {{ load(&M) }} else {{ vector::empty() }};
+        let needs_s = from < 65 && to > 5;
+        let s_bytes = if (needs_s) {{ poseidon_sparse::constants() }} else {{ vector::empty() }};
+        let step = from;
+        while (step < to) {{
+            if (step == 0) {{
+                add_constants(state, &c, 0);
+            }} else if (step <= 3) {{
+                pow5_all(state);
+                add_constants(state, &c, step * {WIDTH});
+                *state = mix(state, &m);
+            }} else if (step == 4) {{
+                pow5_all(state);
+                add_constants(state, &c, 4 * {WIDTH});
+                *state = mix(state, &load(&P));
+            }} else if (step < 65) {{
+                partial_round(state, &c, &s_bytes, step - 5);
+            }} else if (step < 68) {{
+                pow5_all(state);
+                add_constants(state, &c, 5 * {WIDTH} + {partial} + (step - 65) * {WIDTH});
+                *state = mix(state, &m);
+            }} else {{
+                pow5_all(state);
+                *state = mix(state, &m);
             }};
-            let first = *vector::borrow(&state, 0);
-            let k = 1;
-            while (k < T) {{
-                let term = crypto_algebra::mul(&first, &fr(vector::borrow(&s_bytes, base + T + k - 1)));
-                let sk = vector::borrow_mut(&mut state, k);
-                *sk = crypto_algebra::add(sk, &term);
-                k = k + 1;
-            }};
-            *vector::borrow_mut(&mut state, 0) = acc;
-            r = r + 1;
+            step = step + 1;
         }};
+    }}
 
-        let r = 0;
-        while (r < HALF_FULL - 1) {{
-            pow5_all(&mut state);
-            add_constants(&mut state, &c, (HALF_FULL + 1) * T + PARTIAL_ROUNDS + r * T);
-            state = mix(&state, &m);
-            r = r + 1;
+    fun partial_round(state: &mut vector<Element<Fr>>, c: &vector<vector<u8>>, s_bytes: &vector<vector<u8>>, r: u64) {{
+        let s0 = vector::borrow_mut(state, 0);
+        *s0 = pow5(s0);
+        *s0 = crypto_algebra::add(s0, &fr(vector::borrow(c, 5 * {WIDTH} + r)));
+        let base = {2 * WIDTH - 1} * r;
+        let acc = crypto_algebra::mul(&fr(vector::borrow(s_bytes, base)), vector::borrow(state, 0));
+        let j = 1;
+        while (j < {WIDTH}) {{
+            let term = crypto_algebra::mul(&fr(vector::borrow(s_bytes, base + j)), vector::borrow(state, j));
+            acc = crypto_algebra::add(&acc, &term);
+            j = j + 1;
         }};
-        pow5_all(&mut state);
-        state = mix(&state, &m);
+        let first = *vector::borrow(state, 0);
+        let k = 1;
+        while (k < {WIDTH}) {{
+            let term = crypto_algebra::mul(&first, &fr(vector::borrow(s_bytes, base + {WIDTH} + k - 1)));
+            let sk = vector::borrow_mut(state, k);
+            *sk = crypto_algebra::add(sk, &term);
+            k = k + 1;
+        }};
+        *vector::borrow_mut(state, 0) = acc;
+    }}
+
+    /// Hashes exactly 14 field elements in one go (for callers without a
+    /// gas limit: tests, and views).
+    public fun hash14(inputs: &vector<Element<Fr>>): Element<Fr> {{
+        let state = initial_state(inputs);
+        run(&mut state, 0, {STEPS});
         *vector::borrow(&state, 0)
+    }}
+
+    /// Encodes a state for storage between transactions.
+    public fun encode_state(state: &vector<Element<Fr>>): vector<vector<u8>> {{
+        let out = vector::empty<vector<u8>>();
+        let i = 0;
+        while (i < vector::length(state)) {{
+            vector::push_back(&mut out, crypto_algebra::serialize<Fr, FormatFrLsb>(vector::borrow(state, i)));
+            i = i + 1;
+        }};
+        out
+    }}
+
+    /// Decodes a stored state.
+    public fun decode_state(bytes: &vector<vector<u8>>): vector<Element<Fr>> {{
+        load(bytes)
     }}
 
     #[test]
@@ -301,6 +347,27 @@ module sena::poseidon {{
         }};
         let expected = fr(&x"{le(expected_1_to_14)}");
         assert!(crypto_algebra::eq(&hash14(&inputs), &expected), 0);
+    }}
+
+    #[test]
+    /// Running the schedule in pieces, through stored states, gives the same
+    /// hash as running it at once.
+    fun resuming_gives_the_same_hash() {{
+        let inputs = vector::empty<Element<Fr>>();
+        let i = 1;
+        while (i <= 14) {{
+            vector::push_back(&mut inputs, crypto_algebra::from_u64<Fr>(i));
+            i = i + 1;
+        }};
+        let state = initial_state(&inputs);
+        let cuts = vector[0, 3, 4, 5, 30, 64, 65, 66, {STEPS}];
+        let k = 0;
+        while (k + 1 < vector::length(&cuts)) {{
+            run(&mut state, *vector::borrow(&cuts, k), *vector::borrow(&cuts, k + 1));
+            state = decode_state(&encode_state(&state));
+            k = k + 1;
+        }};
+        assert!(crypto_algebra::eq(vector::borrow(&state, 0), &hash14(&inputs)), 0);
     }}
 }}
 '''

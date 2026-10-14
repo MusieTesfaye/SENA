@@ -35,7 +35,7 @@ module sena::compiler {
         (true, (scaled + RATE_SCALE - 1) / RATE_SCALE)
     }
 
-    fun authenticate(tx: &Tx, timestamp: u64, keyless_setup: u8): bool {
+    fun authenticate(tx: &Tx, timestamp: u64, keyless_setup: u8, keyless_verdict: option::Option<bool>): bool {
         let digest = txcodec::signing_digest(tx);
         if (txcodec::is_ed25519(tx)) {
             // An Ed25519 account's address is its public key.
@@ -45,6 +45,9 @@ module sena::compiler {
         } else {
             let sig = txcodec::keyless_signature(tx);
             if (option::is_none(&sig)) { return false };
+            // A verdict computed in advance by `sena::keyless_jobs` for exactly
+            // these bytes, this time and this setup; otherwise compute it now.
+            if (option::is_some(&keyless_verdict)) { return *option::borrow(&keyless_verdict) };
             keyless::verify(keyless_setup, option::borrow(&sig), &txcodec::sender(tx), &digest, timestamp)
         }
     }
@@ -52,12 +55,39 @@ module sena::compiler {
     /// Compiles transaction bytes. `(false, _)` if they do not decode, do not
     /// authenticate, or describe a transaction the node would refuse.
     public fun compile(tx_bytes: vector<u8>, timestamp: u64, keyless_setup: u8): (bool, vector<Instruction>) {
+        compile_inner(tx_bytes, timestamp, keyless_setup, option::none())
+    }
+
+    /// `compile`, with a keyless transaction's authorisation verdict supplied
+    /// by `sena::keyless_jobs` (whose job id binds it to these bytes, this
+    /// timestamp and this setup) instead of recomputed in this transaction.
+    public fun compile_with_keyless_verdict(
+        tx_bytes: vector<u8>,
+        timestamp: u64,
+        keyless_setup: u8,
+        verdict: bool,
+    ): (bool, vector<Instruction>) {
+        compile_inner(tx_bytes, timestamp, keyless_setup, option::some(verdict))
+    }
+
+    /// Whether the bytes decode to a keyless transaction.
+    public fun is_keyless(tx_bytes: vector<u8>): bool {
+        let decoded = txcodec::decode(tx_bytes);
+        option::is_some(&decoded) && !txcodec::is_ed25519(option::borrow(&decoded))
+    }
+
+    fun compile_inner(
+        tx_bytes: vector<u8>,
+        timestamp: u64,
+        keyless_setup: u8,
+        keyless_verdict: option::Option<bool>,
+    ): (bool, vector<Instruction>) {
         let none = vector::empty<Instruction>();
         let decoded = txcodec::decode(tx_bytes);
         if (option::is_none(&decoded)) { return (false, none) };
         let tx = option::extract(&mut decoded);
 
-        if (!authenticate(&tx, timestamp, keyless_setup)) { return (false, none) };
+        if (!authenticate(&tx, timestamp, keyless_setup, keyless_verdict)) { return (false, none) };
 
         let (fee_ok, fee) = fee_for(txcodec::fee_rate(&tx));
         if (!fee_ok || txcodec::max_fee(&tx) < fee) { return (false, none) };
