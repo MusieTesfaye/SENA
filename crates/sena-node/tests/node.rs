@@ -6,7 +6,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
-use sena_stf::gas::fee_for;
 use sena_stf::{
     apply, Authenticator, Instruction, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
@@ -33,14 +32,18 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE).unwrap(),
-        fee_rate: RATE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -58,6 +61,7 @@ fn genesis(accounts: &[(L2Address, u128)]) -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".to_owned(),
                 rate: RATE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },
@@ -129,7 +133,20 @@ fn admission_accounts_for_what_is_already_queued() {
     // Checking the candidate in isolation would let the batch become invalid.
     let alice = signer(1);
     let bob = address_of(&signer(2));
-    let funds = fee_for(RATE).unwrap() * 2 + 1_500;
+    // Enough for two fees but only one of the two transfers.
+    let probe = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 1_000,
+        },
+    );
+    let hold = sena_stf::fee_charge(&probe, &sena_stf::BatchContext::without_keyless(0))
+        .unwrap()
+        .hold;
+    let funds = hold * 2 + 1_500;
     let mut seq = node(genesis(&[(address_of(&alice), funds)]));
 
     assert!(seq
@@ -740,4 +757,126 @@ fn blocks_are_cut_to_fit_one_l1_transaction() {
     // The rest stays queued, in order, for the next block.
     let (next, _) = sequencer.produce(usize::MAX).unwrap().unwrap();
     assert_eq!(next.transactions[0].nonce, block.transactions.len() as u64);
+}
+
+// --- Fees ----------------------------------------------------------------------
+
+fn transfer(key: &SigningKey, nonce: u64, amount: u128) -> Transaction {
+    signed(
+        key,
+        nonce,
+        Payload::Transfer {
+            to: address_of(&signer(77)),
+            asset: USDC,
+            amount,
+        },
+    )
+}
+
+fn balance(seq: &Sequencer, who: &L2Address) -> u128 {
+    seq.state
+        .get(&sena_stf::keys::account(who))
+        .map_or(0, |b| sena_stf::Account::decode(b).unwrap().balance(USDC))
+}
+
+#[test]
+fn tips_reach_the_sequencer_and_the_base_fee_the_vault() {
+    let alice = signer(1);
+    let operator = address_of(&signer(40));
+    let mut seq = node(genesis(&[(address_of(&alice), 10_000_000)])).with_fee_recipient(operator);
+    let mut tx = transfer(&alice, 0, 5);
+    tx.max_priority_fee_per_gas = sena_stf::PRICE_SCALE / 100;
+    let tx = {
+        let s = alice.sign(tx.signing_digest().as_bytes()).to_bytes();
+        tx.authenticator = Authenticator::Ed25519 {
+            public_key: alice.verifying_key().to_bytes(),
+            signature: s,
+        };
+        tx
+    };
+    let ctx = seq.batch_context(seq.next_timestamp());
+    let charge = sena_stf::fee_charge(&tx, &ctx).unwrap();
+    seq.submit(tx).unwrap();
+    let (block, _) = seq.produce(16).unwrap().unwrap();
+    assert_eq!(block.fee_recipient, operator);
+    assert!(charge.tip > 0);
+    assert_eq!(balance(&seq, &operator), charge.tip);
+    assert_eq!(balance(&seq, &sena_stf::FEE_VAULT), charge.base);
+    assert_eq!(
+        balance(&seq, &address_of(&alice)),
+        10_000_000 - 5 - charge.tip - charge.base
+    );
+}
+
+#[test]
+fn the_gas_price_rpc_quotes_the_next_batch() {
+    let mut seq = node(genesis(&[]));
+    let Response::GasPrice {
+        rate,
+        intrinsic_gas,
+        base_fee_native,
+        base_fee_per_gas,
+        suggested_max_fee_per_gas,
+        ..
+    } = handle(&mut seq, "test", Request::GasPrice { asset: USDC })
+    else {
+        panic!("expected a gas price");
+    };
+    assert_eq!(rate, RATE);
+    assert_eq!(intrinsic_gas, sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS);
+    assert_eq!(base_fee_native, sena_stf::gas::DEFAULT_BASE_FEE_FLOOR);
+    assert_eq!(base_fee_per_gas, base_fee_native); // one-to-one rate
+    assert_eq!(suggested_max_fee_per_gas, 2 * base_fee_per_gas);
+    assert!(matches!(
+        handle(&mut seq, "test", Request::GasPrice { asset: AssetId(9) }),
+        Response::Error { .. }
+    ));
+}
+
+#[test]
+fn a_batch_is_cut_to_the_fee_window() {
+    let alice = signer(1);
+    let mut state = genesis(&[(address_of(&alice), 10_000_000)]);
+    let per_tx = sena_stf::gas_required(&transfer(&alice, 0, 1)).unwrap();
+    // A window that fits five transfers: target 2.5, elastic limit 5.
+    apply(
+        &mut state,
+        &Instruction::SetFeeMarket {
+            floor: sena_stf::gas::DEFAULT_BASE_FEE_FLOOR,
+            target: per_tx * 5 / 2,
+        },
+    )
+    .unwrap();
+    let mut seq = node(state).with_clock(|| 100);
+    for nonce in 0..8 {
+        seq.submit(transfer(&alice, nonce, 1)).unwrap();
+    }
+    let (first, _) = seq.produce(64).unwrap().unwrap();
+    assert_eq!(first.transactions.len(), 5, "only a full window's worth");
+    // The same second's window is full: nothing more until the next second.
+    assert!(seq.produce(64).unwrap().is_none());
+    assert_eq!(seq.mempool.len(), 3);
+}
+
+#[test]
+fn a_fee_asset_cannot_take_more_than_its_share_of_a_window() {
+    let alice = signer(1);
+    let mut state = genesis(&[(address_of(&alice), 10_000_000)]);
+    let per_tx = sena_stf::gas_required(&transfer(&alice, 0, 1)).unwrap();
+    apply(
+        &mut state,
+        &Instruction::SetFeeMarket {
+            floor: sena_stf::gas::DEFAULT_BASE_FEE_FLOOR,
+            target: per_tx * 5,
+        },
+    )
+    .unwrap();
+    // USDC may use 30% of the 10-transfer window: three transfers.
+    let limits = std::iter::once((USDC, 300)).collect();
+    let mut seq = node(state).with_clock(|| 100).with_fee_asset_limits(limits);
+    for nonce in 0..6 {
+        seq.submit(transfer(&alice, nonce, 1)).unwrap();
+    }
+    let (block, _) = seq.produce(64).unwrap().unwrap();
+    assert_eq!(block.transactions.len(), 3);
 }

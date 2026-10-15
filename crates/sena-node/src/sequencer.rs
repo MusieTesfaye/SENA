@@ -1,12 +1,15 @@
 //! Block production and assertion posting.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sena_primitives::Hash256;
+use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::batch::{self, BatchTree};
+use sena_stf::gas::{DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET};
 use sena_stf::{
-    execute_batch, BatchContext, BatchError, ExecutionTrace, KeylessConfig, Transaction,
+    execute_batch, keys, BatchContext, BatchError, ExecutionTrace, FeeMarket, KeylessConfig,
+    Transaction, FEE_VAULT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +50,10 @@ pub struct Block {
     /// The batch timestamp (Unix seconds). Part of the batch data: keyless
     /// expiry is judged against it, and it never decreases.
     pub timestamp: u64,
+    /// The base fee per gas the batch paid (part of the batch header).
+    pub base_fee: u128,
+    /// Where the batch's tips went (part of the batch header).
+    pub fee_recipient: L2Address,
     /// The transactions, in the order they were executed.
     ///
     /// This *is* the published batch data (REQ-FRAUD-007). A verifier
@@ -74,7 +81,24 @@ impl Block {
     #[must_use]
     pub fn batch_commitment(&self) -> Hash256 {
         let tree = self.batch_tree();
-        batch::header_commitment(self.timestamp, tree.tx_count(), &tree.root())
+        batch::header_commitment(
+            self.timestamp,
+            self.base_fee,
+            &self.fee_recipient,
+            tree.tx_count(),
+            &tree.root(),
+        )
+    }
+
+    /// The context the block was executed in.
+    #[must_use]
+    pub fn context<'a>(&self, keyless: Option<&'a KeylessConfig>) -> BatchContext<'a> {
+        BatchContext {
+            timestamp: self.timestamp,
+            keyless,
+            base_fee: self.base_fee,
+            fee_recipient: self.fee_recipient,
+        }
     }
 }
 
@@ -141,6 +165,11 @@ pub struct Sequencer {
     keyless: Option<Arc<KeylessConfig>>,
     /// Where batch timestamps come from.
     clock: fn() -> u64,
+    /// Where tips go: this sequencer's L2 account.
+    fee_recipient: L2Address,
+    /// The share of a window's gas each fee asset may use, in permille
+    /// (Celo's `celo.feecurrency.limits`). Assets not listed may use it all.
+    fee_asset_limits: BTreeMap<AssetId, u32>,
 }
 
 impl Sequencer {
@@ -168,6 +197,46 @@ impl Sequencer {
             head,
             keyless: None,
             clock: system_clock,
+            fee_recipient: FEE_VAULT,
+            fee_asset_limits: BTreeMap::new(),
+        }
+    }
+
+    /// Sends tips to `account` instead of the fee vault.
+    #[must_use]
+    pub const fn with_fee_recipient(mut self, account: L2Address) -> Self {
+        self.fee_recipient = account;
+        self
+    }
+
+    /// Caps the share of each window's gas that transactions paying in an
+    /// asset may use, in permille.
+    #[must_use]
+    pub fn with_fee_asset_limits(mut self, limits: BTreeMap<AssetId, u32>) -> Self {
+        self.fee_asset_limits = limits;
+        self
+    }
+
+    /// The fee market as state holds it; absent, the genesis market.
+    #[must_use]
+    pub fn fee_market(&self) -> FeeMarket {
+        self.state
+            .get(&keys::fee_market())
+            .and_then(|b| FeeMarket::decode(b).ok())
+            .unwrap_or_else(|| FeeMarket::genesis(DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET))
+    }
+
+    /// The context a batch stamped `timestamp` executes in: the base fee the
+    /// fee market holds for it, and this sequencer as tip recipient.
+    #[must_use]
+    pub fn batch_context(&self, timestamp: u64) -> BatchContext<'_> {
+        let market = self.fee_market();
+        BatchContext {
+            timestamp,
+            keyless: self.keyless.as_deref(),
+            // Batch timestamps never fall behind the market's window.
+            base_fee: market.base_fee_at(timestamp).unwrap_or(market.base_fee),
+            fee_recipient: self.fee_recipient,
         }
     }
 
@@ -208,11 +277,13 @@ impl Sequencer {
     ///
     /// Returns [`RejectReason`] if the mempool refuses it.
     pub fn submit(&mut self, transaction: Transaction) -> Result<Hash256, RejectReason> {
+        let keyless = self.keyless.clone();
         let ctx = BatchContext {
-            timestamp: self
-                .next_timestamp()
-                .saturating_add(ADMISSION_EXPIRY_MARGIN_SECS),
-            keyless: self.keyless.as_deref(),
+            keyless: keyless.as_deref(),
+            ..self.batch_context(
+                self.next_timestamp()
+                    .saturating_add(ADMISSION_EXPIRY_MARGIN_SECS),
+            )
         };
         self.mempool.submit(&self.state, &ctx, transaction)
     }
@@ -227,17 +298,31 @@ impl Sequencer {
     /// Returns [`ProduceError`] if the batch fails to execute or the assertion
     /// is refused by the chain.
     pub fn produce(&mut self, limit: usize) -> Result<Option<(Block, AssertionId)>, ProduceError> {
-        let transactions = self.mempool.take_batch_within(limit, MAX_BATCH_BYTES);
+        let timestamp = self.next_timestamp();
+        // The window may already hold gas from an earlier batch with the same
+        // timestamp; only what is left of its limit is available.
+        let window = self
+            .fee_market()
+            .at(timestamp)
+            .unwrap_or_else(|_| self.fee_market());
+        let budget = window.window_limit().saturating_sub(window.window_gas);
+        let caps = |asset: AssetId| {
+            self.fee_asset_limits
+                .get(&asset)
+                .map_or(window.window_limit(), |permille| {
+                    window.window_limit() / 1_000 * u64::from(*permille)
+                })
+        };
+        let transactions = self
+            .mempool
+            .take_batch_fitting(limit, MAX_BATCH_BYTES, budget, caps);
         if transactions.is_empty() {
             return Ok(None);
         }
 
         let pre_state_root = self.state.root();
-        let timestamp = self.next_timestamp();
-        let ctx = BatchContext {
-            timestamp,
-            keyless: self.keyless.as_deref(),
-        };
+        let ctx = self.batch_context(timestamp);
+        let (base_fee, fee_recipient) = (ctx.base_fee, ctx.fee_recipient);
 
         // Execute against a copy: on failure the canonical state must be left
         // untouched, since execute_batch leaves a partially applied trie behind.
@@ -265,6 +350,8 @@ impl Sequencer {
         let block = Block {
             height: self.blocks.len() as u64 + 1,
             timestamp,
+            base_fee,
+            fee_recipient,
             transactions,
             pre_state_root,
             post_state_root: next.root(),

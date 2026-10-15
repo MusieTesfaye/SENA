@@ -28,8 +28,7 @@ use sena_node::{
 use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::batch::{header_commitment, BatchTree};
-use sena_stf::gas::fee_for;
-use sena_stf::{Authenticator, Payload, Transaction, RATE_SCALE};
+use sena_stf::{Authenticator, Payload, Transaction};
 use serde_json::{json, Value};
 
 const USDC: AssetId = AssetId(1);
@@ -144,13 +143,17 @@ impl L1 for MockL1 {
                 let parent = bytes(&args[1]);
                 let (pre, post) = (hash(&args[2]), hash(&args[3]));
                 let timestamp = num(&args[4]);
-                let Arg::BytesList(txs) = &args[5] else {
+                let Arg::U128(base_fee) = args[5] else {
                     panic!()
                 };
-                let Arg::U64List(starts) = &args[6] else {
+                let fee_recipient = L2Address::from_bytes(bytes(&args[6]).try_into().unwrap());
+                let Arg::BytesList(txs) = &args[7] else {
                     panic!()
                 };
-                let trace_length = num(&args[7]);
+                let Arg::U64List(starts) = &args[8] else {
+                    panic!()
+                };
+                let trace_length = num(&args[9]);
                 let Some(p) = c.records.get(&parent) else {
                     return Err(abort(function, 32));
                 };
@@ -160,7 +163,13 @@ impl L1 for MockL1 {
                 let leaves: Vec<(u64, Vec<u8>)> =
                     starts.iter().copied().zip(txs.iter().cloned()).collect();
                 let tree = BatchTree::build(&leaves);
-                let commitment = header_commitment(timestamp, tree.tx_count(), &tree.root());
+                let commitment = header_commitment(
+                    timestamp,
+                    base_fee,
+                    &fee_recipient,
+                    tree.tx_count(),
+                    &tree.root(),
+                );
                 let id = l1::assertion_id(
                     &parent.clone().try_into().unwrap(),
                     pre,
@@ -195,6 +204,8 @@ impl L1 for MockL1 {
                     PublishedBatch {
                         assertion: id,
                         timestamp,
+                        base_fee,
+                        fee_recipient,
                         tx_bytes: txs.clone(),
                         tx_starts: starts.clone(),
                     },
@@ -426,6 +437,8 @@ impl L2Source for Node {
             Response::Block {
                 height,
                 timestamp,
+                base_fee,
+                fee_recipient,
                 pre_state_root,
                 post_state_root,
                 transactions,
@@ -435,6 +448,8 @@ impl L2Source for Node {
             } => L2Block {
                 height,
                 timestamp,
+                base_fee,
+                fee_recipient,
                 pre_state_root,
                 post_state_root,
                 tx_bytes: transactions.iter().map(Transaction::encode).collect(),
@@ -480,8 +495,11 @@ fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Trans
         sender: address_of(from),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE_SCALE).unwrap(),
-        fee_rate: RATE_SCALE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload: Payload::Transfer {
             to,
             asset: USDC,
@@ -492,6 +510,7 @@ fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Trans
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = from.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: from.verifying_key().to_bytes(),

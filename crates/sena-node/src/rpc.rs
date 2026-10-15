@@ -13,9 +13,9 @@
 //! (REQ-FRAUD-027, REQ-CORE-005). An integrator should not have to go looking
 //! for whether a payment can still be reverted.
 
-use sena_primitives::serde_hex::balances;
-use sena_primitives::{Hash256, HashedIdentifier, L2Address};
-use sena_stf::{keys, Account, SocialBinding, Transaction};
+use sena_primitives::serde_hex::{balances, u128_string};
+use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address};
+use sena_stf::{gas, keys, Account, SocialBinding, Transaction, WhitelistedAsset};
 use serde::{Deserialize, Serialize};
 
 use sena_fraudproof::{AssertionId, Status};
@@ -59,6 +59,14 @@ pub enum Request {
     /// Report the current L2 state root.
     #[serde(rename = "sena_getStateRoot")]
     GetStateRoot,
+    /// Quote gas in a fee asset: the base fee converted at the asset's rate,
+    /// and what a transaction must declare to pay in it (Celo's
+    /// `eth_gasPrice` with a `feeCurrency`).
+    #[serde(rename = "sena_gasPrice")]
+    GasPrice {
+        /// The fee asset.
+        asset: AssetId,
+    },
     /// Fetch a block's published batch data (REQ-FRAUD-007).
     ///
     /// This is what makes independent verification possible: without it a
@@ -164,6 +172,11 @@ pub enum Response {
         height: u64,
         /// The batch timestamp, part of the batch data.
         timestamp: u64,
+        /// The base fee per gas the batch paid, part of the batch header.
+        #[serde(with = "u128_string")]
+        base_fee: u128,
+        /// Where the batch's tips went, part of the batch header.
+        fee_recipient: L2Address,
         /// The commitment the covering assertion carries.
         batch_commitment: Hash256,
         /// State root before the block.
@@ -179,6 +192,26 @@ pub enum Response {
         /// Where each transaction's instructions begin: the `start_pc` of each
         /// batch leaf, which `sena::assertions::post` publishes with the data.
         tx_starts: Vec<u64>,
+    },
+    /// A gas quote in one fee asset.
+    GasPrice {
+        /// The asset.
+        asset: AssetId,
+        /// Its whitelisted rate, to declare as `fee_rate`.
+        #[serde(with = "u128_string")]
+        rate: u128,
+        /// Its intrinsic gas, to declare as `fee_intrinsic_gas`.
+        intrinsic_gas: u64,
+        /// The base fee the next batch pays, in `PRICE_SCALE`ths of a native
+        /// unit per gas.
+        #[serde(with = "u128_string")]
+        base_fee_native: u128,
+        /// The same, in `PRICE_SCALE`ths of a unit of the asset per gas.
+        #[serde(with = "u128_string")]
+        base_fee_per_gas: u128,
+        /// A `max_fee_per_gas` with room for the base fee to double.
+        #[serde(with = "u128_string")]
+        suggested_max_fee_per_gas: u128,
     },
     /// Chain-level status.
     ChainInfo {
@@ -390,6 +423,64 @@ fn account_proof(
     }
 }
 
+/// A block's published batch data.
+fn block_response(sequencer: &Sequencer, height: u64) -> Response {
+    match height
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| sequencer.blocks.get(i))
+    {
+        None => Response::Error {
+            message: format!("no block at height {height}"),
+        },
+        Some(block) => Response::Block {
+            height: block.height,
+            timestamp: block.timestamp,
+            base_fee: block.base_fee,
+            fee_recipient: block.fee_recipient,
+            batch_commitment: block.batch_commitment(),
+            pre_state_root: block.pre_state_root,
+            post_state_root: block.post_state_root,
+            transactions: block.transactions.clone(),
+            assertion: sequencer.assertion_for(block.height),
+            trace_length: block.trace.len() as u64,
+            tx_starts: block.trace.tx_starts.clone(),
+        },
+    }
+}
+
+/// A gas quote in `asset` for the next batch.
+fn gas_price(sequencer: &Sequencer, asset: AssetId) -> Response {
+    let Some(record) = sequencer
+        .state
+        .get(&keys::asset(asset.get()))
+        .and_then(|b| WhitelistedAsset::decode(b).ok())
+    else {
+        return Response::Error {
+            message: format!("asset {} is not a fee asset", asset.get()),
+        };
+    };
+    if !record.enabled {
+        return Response::Error {
+            message: format!("asset {} is disabled for fees", asset.get()),
+        };
+    }
+    let base_fee_native = sequencer.batch_context(sequencer.next_timestamp()).base_fee;
+    match gas::native_to_asset(base_fee_native, record.rate) {
+        Ok(base_fee_per_gas) => Response::GasPrice {
+            asset,
+            rate: record.rate,
+            intrinsic_gas: record.intrinsic_gas,
+            base_fee_native,
+            base_fee_per_gas,
+            suggested_max_fee_per_gas: base_fee_per_gas.saturating_mul(2),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
 /// Commitments to a block's trace at `steps`.
 fn trace_commitments(sequencer: &Sequencer, height: u64, steps: &[u64]) -> Response {
     let Some(block) = height
@@ -509,34 +600,15 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
             }
         }
 
-        Request::GetBlock { height } => {
-            match height
-                .checked_sub(1)
-                .and_then(|i| usize::try_from(i).ok())
-                .and_then(|i| sequencer.blocks.get(i))
-            {
-                None => Response::Error {
-                    message: format!("no block at height {height}"),
-                },
-                Some(block) => Response::Block {
-                    height: block.height,
-                    timestamp: block.timestamp,
-                    batch_commitment: block.batch_commitment(),
-                    pre_state_root: block.pre_state_root,
-                    post_state_root: block.post_state_root,
-                    transactions: block.transactions.clone(),
-                    assertion: sequencer.assertion_for(block.height),
-                    trace_length: block.trace.len() as u64,
-                    tx_starts: block.trace.tx_starts.clone(),
-                },
-            }
-        }
+        Request::GetBlock { height } => block_response(sequencer, height),
 
         Request::GetWithdrawalProof { address } => withdrawal_proof(sequencer, address),
 
         Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
 
         Request::GetDaBlob { height } => da_blob(sequencer, height),
+
+        Request::GasPrice { asset } => gas_price(sequencer, asset),
 
         Request::GetTraceCommitments { height, steps } => {
             trace_commitments(sequencer, height, &steps)

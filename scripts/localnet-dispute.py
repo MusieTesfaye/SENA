@@ -119,7 +119,10 @@ def main():
     genesis_root = bytes.fromhex(plan["genesis_root"][2:])
     zero = bytes(32)
     genesis_id = assertion_id(zero, zero, genesis_root, zero, 0, 0)
-    commitment = commit(b"SENA:v1:batch", u64(plan["timestamp"]), u64(len(txs)), batch_root(txs, starts))
+    base_fee = int(plan["base_fee"])
+    fee_recipient = bytes.fromhex(plan["fee_recipient"][2:])
+    commitment = commit(b"SENA:v1:batch", u64(plan["timestamp"]), base_fee.to_bytes(16, "big"),
+                        fee_recipient, u64(len(txs)), batch_root(txs, starts))
     fraud_root = bytes.fromhex(plan["fraud_post_root"][2:])
     aid = assertion_id(genesis_id, genesis_root, fraud_root, commitment, plan["trace_length"], BOND)
 
@@ -129,6 +132,8 @@ def main():
         {"type": "hex", "value": plan["genesis_root"]},
         {"type": "hex", "value": plan["fraud_post_root"]},
         {"type": "u64", "value": str(plan["timestamp"])},
+        {"type": "u128", "value": str(base_fee)},
+        {"type": "hex", "value": plan["fee_recipient"]},
         {"type": "hex", "value": plan["txs"]},
         {"type": "u64", "value": [str(s) for s in starts]},
         {"type": "u64", "value": str(plan["trace_length"])},

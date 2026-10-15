@@ -92,6 +92,10 @@ pub struct PublishedBatch {
     pub assertion: Vec<u8>,
     /// The batch timestamp.
     pub timestamp: u64,
+    /// The base fee per gas the batch declared.
+    pub base_fee: u128,
+    /// Where the batch's tips go.
+    pub fee_recipient: sena_primitives::L2Address,
     /// The transactions, canonically encoded.
     pub tx_bytes: Vec<Vec<u8>>,
     /// Each transaction's start position in the trace.
@@ -316,6 +320,12 @@ pub fn parse_batch_event(data: &Value) -> Result<PublishedBatch, L1Error> {
     Ok(PublishedBatch {
         assertion: bytes_of(&data["assertion"])?,
         timestamp: u64_of(&data["timestamp"])?,
+        base_fee: u128_of(&data["base_fee"])?,
+        fee_recipient: sena_primitives::L2Address::from_bytes(
+            bytes_of(&data["fee_recipient"])?
+                .try_into()
+                .map_err(|_| L1Error::Malformed("fee_recipient".into()))?,
+        ),
         tx_bytes: list("tx_bytes")?
             .iter()
             .map(bytes_of)

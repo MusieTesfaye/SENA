@@ -50,10 +50,10 @@ pub mod wire;
 
 pub use account::{Account, BalanceError};
 pub use execute::{
-    apply, compile, execute_batch, transition, verify_step, BatchContext, BatchError, CompileError,
-    ExecutionTrace, StepError, StepWitness, BASE_GAS_NATIVE, FEE_VAULT,
+    apply, compile, execute_batch, fee_charge, gas_required, transition, verify_step, BatchContext,
+    BatchError, CompileError, ExecutionTrace, StepError, StepWitness, FEE_VAULT,
 };
-pub use gas::{GasError, WhitelistedAsset, RATE_SCALE};
+pub use gas::{FeeMarket, FeeSplit, GasError, WhitelistedAsset, PRICE_SCALE, RATE_SCALE};
 pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
 pub use instruction::{Instruction, MachineState};
 pub use keyless::{KeylessConfig, KeylessError, KeylessSignature};

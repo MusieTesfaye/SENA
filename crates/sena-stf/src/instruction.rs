@@ -29,7 +29,7 @@
 use sena_primitives::serde_hex::bytes_32;
 use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address};
 
-use crate::gas::WhitelistedAsset;
+use crate::gas::{FeeSplit, WhitelistedAsset};
 use crate::governance::CouncilSignature;
 use serde::{Deserialize, Serialize};
 
@@ -85,9 +85,10 @@ pub enum Instruction {
         /// The address that must currently hold it.
         expected_owner: L2Address,
     },
-    /// Check that `asset` is whitelisted for fees at exactly `rate` (REQ-GAS-005).
+    /// Check that `asset` is enabled for fees at exactly `rate` and
+    /// `intrinsic_gas` (REQ-GAS-005).
     ///
-    /// Writes its slot back unchanged. The step exists so that the rate a
+    /// Writes its slot back unchanged. The step exists so that what a
     /// transaction declared is validated against state *inside the trace*,
     /// where it is disputable, rather than during compilation, which must stay
     /// state-independent. See [`crate::gas`].
@@ -96,6 +97,48 @@ pub enum Instruction {
         asset: AssetId,
         /// The rate the transaction claimed applies.
         rate: u128,
+        /// The asset's intrinsic gas the transaction claimed applies.
+        intrinsic_gas: u64,
+    },
+    /// Charge `gas` against the fee market at `timestamp`, checking that the
+    /// base fee is `base_fee` (EIP-1559).
+    ///
+    /// Rolls the market into a new window first if `timestamp` is past the
+    /// current one, then requires the base fee the batch declared to be the
+    /// one in force, and adds `gas` to the window, refusing to exceed its
+    /// limit. An absent record is the genesis market.
+    ChargeBaseFee {
+        /// The batch timestamp.
+        timestamp: u64,
+        /// The base fee the batch declared, in `PRICE_SCALE`ths of a native
+        /// unit per gas.
+        base_fee: u128,
+        /// Gas the transaction uses.
+        gas: u64,
+    },
+    /// Check that the fee split in force is exactly `split`. Read-only.
+    VerifyFeeSplit {
+        /// The split a fee distribution declared.
+        split: FeeSplit,
+    },
+    /// Write the fee split (Celo's `FeeHandler` configuration).
+    SetFeeSplit {
+        /// The new split.
+        split: FeeSplit,
+    },
+    /// Set the fee market's floor and target, keeping its current window. The
+    /// base fee is raised to the new floor if it is below it.
+    SetFeeMarket {
+        /// The new base fee floor.
+        floor: u128,
+        /// The new gas target per window.
+        target: u64,
+    },
+    /// Disable a fee asset, keeping the rest of its record (the guardians'
+    /// circuit breaker). Fails if the asset has no record.
+    DisableGasAsset {
+        /// The asset to disable.
+        asset: AssetId,
     },
     /// Check that the council authorised `digest` for `epoch`, and consume the
     /// epoch (REQ-GOV-004).
@@ -111,6 +154,9 @@ pub enum Instruction {
         digest: Hash256,
         /// The signatures offered.
         signatures: Vec<CouncilSignature>,
+        /// Whether the guardian threshold suffices, which it does only for
+        /// disabling a fee asset.
+        guardian: bool,
     },
     /// Write a gas asset's whitelist record (REQ-GAS-003).
     SetGasAsset {
@@ -239,13 +285,18 @@ impl Instruction {
                     .bytes32(identifier.as_hash().as_bytes())
                     .bytes32(expected_owner.as_bytes());
             }
-            Self::VerifyGasAsset { asset, rate } => {
-                w.u8(5).u32(asset.get()).u128(*rate);
+            Self::VerifyGasAsset {
+                asset,
+                rate,
+                intrinsic_gas,
+            } => {
+                w.u8(5).u32(asset.get()).u128(*rate).u64(*intrinsic_gas);
             }
             Self::VerifyCouncil {
                 epoch,
                 digest,
                 signatures,
+                guardian,
             } => {
                 w.u8(6)
                     .u64(*epoch)
@@ -254,6 +305,7 @@ impl Instruction {
                 for s in signatures {
                     w.u32(s.index).raw(&s.signature);
                 }
+                w.bool(*guardian);
             }
             Self::SetGasAsset { record } => {
                 w.u8(7).bytes(&record.encode());
@@ -270,6 +322,25 @@ impl Instruction {
                 active,
             } => {
                 w.u8(10).bytes32(iss_hash).bytes32(jwk_hash).bool(*active);
+            }
+            Self::ChargeBaseFee {
+                timestamp,
+                base_fee,
+                gas,
+            } => {
+                w.u8(11).u64(*timestamp).u128(*base_fee).u64(*gas);
+            }
+            Self::VerifyFeeSplit { split } => {
+                w.u8(12).bytes(&split.encode());
+            }
+            Self::SetFeeSplit { split } => {
+                w.u8(13).bytes(&split.encode());
+            }
+            Self::SetFeeMarket { floor, target } => {
+                w.u8(14).u128(*floor).u64(*target);
+            }
+            Self::DisableGasAsset { asset } => {
+                w.u8(15).u32(asset.get());
             }
         }
         w.finish()
@@ -299,7 +370,11 @@ impl Instruction {
             Self::BindIdentifier { identifier, .. } | Self::UnbindIdentifier { identifier, .. } => {
                 keys::social_by_identifier(identifier)
             }
-            Self::VerifyGasAsset { asset, .. } => keys::asset(asset.get()),
+            Self::VerifyGasAsset { asset, .. } | Self::DisableGasAsset { asset } => {
+                keys::asset(asset.get())
+            }
+            Self::ChargeBaseFee { .. } | Self::SetFeeMarket { .. } => keys::fee_market(),
+            Self::VerifyFeeSplit { .. } | Self::SetFeeSplit { .. } => keys::fee_split(),
             Self::SetGasAsset { record } => keys::asset(record.asset.get()),
             Self::VerifyCouncil { .. } => keys::council(),
             Self::SetParameter { name, .. } => keys::parameter(name),

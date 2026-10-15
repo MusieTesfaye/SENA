@@ -27,10 +27,17 @@ module sena::txcodec {
     const PAYLOAD_BIND_IDENTIFIER: u8 = 1;
     const PAYLOAD_UNBIND_IDENTIFIER: u8 = 2;
     const PAYLOAD_GOVERNANCE: u8 = 3;
+    const PAYLOAD_DISTRIBUTE_FEES: u8 = 4;
 
     const UPDATE_SET_GAS_ASSET: u8 = 0;
     const UPDATE_SET_PARAMETER: u8 = 1;
     const UPDATE_SET_JWK: u8 = 2;
+    const UPDATE_SET_FEE_MARKET: u8 = 3;
+    const UPDATE_SET_FEE_SPLIT: u8 = 4;
+    const UPDATE_DISABLE_GAS_ASSET: u8 = 5;
+
+    /// `gas::MAX_FEE_BENEFICIARIES`.
+    const MAX_FEE_BENEFICIARIES: u64 = 8;
 
     const DOMAIN_TRANSACTION: vector<u8> = b"SENA:v1:transaction";
     const DOMAIN_GOVERNANCE_UPDATE: vector<u8> = b"SENA:v1:governance-update";
@@ -40,8 +47,11 @@ module sena::txcodec {
         sender: vector<u8>,
         nonce: u64,
         fee_asset: u32,
-        max_fee: u128,
         fee_rate: u128,
+        fee_intrinsic_gas: u64,
+        gas_limit: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
         /// The payload's canonical bytes, which the signing digest commits to.
         payload_bytes: vector<u8>,
         payload: Payload,
@@ -68,7 +78,11 @@ module sena::txcodec {
         record_asset: u32,
         text: vector<u8>,
         rate_or_value: u128,
+        /// SetGasAsset: the intrinsic gas. SetFeeMarket: the target.
+        gas: u64,
         flag: bool,
+        /// DistributeFees/SetFeeSplit: the split's canonical bytes.
+        split: vector<u8>,
         iss_hash: vector<u8>,
         jwk_hash: vector<u8>,
         signer_indices: vector<u32>,
@@ -166,7 +180,9 @@ module sena::txcodec {
             record_asset: 0,
             text: vector::empty(),
             rate_or_value: 0,
+            gas: 0,
             flag: false,
+            split: vector::empty(),
             iss_hash: vector::empty(),
             jwk_hash: vector::empty(),
             signer_indices: vector::empty(),
@@ -185,6 +201,7 @@ module sena::txcodec {
             p.record_asset = take_u32(&mut r);
             p.text = take_string(&mut r);
             p.rate_or_value = take_u128(&mut r);
+            p.gas = take_u64(&mut r);
             p.flag = take_bool(&mut r);
             if (!done(&r)) { return false };
         } else if (kind == UPDATE_SET_PARAMETER) {
@@ -194,9 +211,34 @@ module sena::txcodec {
             p.iss_hash = take_bytes(&mut c, 32);
             p.jwk_hash = take_bytes(&mut c, 32);
             p.flag = take_bool(&mut c);
+        } else if (kind == UPDATE_SET_FEE_MARKET) {
+            p.rate_or_value = take_u128(&mut c);
+            p.gas = take_u64(&mut c);
+        } else if (kind == UPDATE_SET_FEE_SPLIT) {
+            p.split = take_field(&mut c);
+            if (!c.ok || !split_is_well_formed(p.split)) { return false };
+        } else if (kind == UPDATE_DISABLE_GAS_ASSET) {
+            p.record_asset = take_u32(&mut c);
         } else {
             return false
         };
+        done(&c)
+    }
+
+    /// Whether `bytes` is a fee split's encoding (`FeeSplit::decode`): at most
+    /// `MAX_FEE_BENEFICIARIES` (address, share) pairs and a burn share. Every
+    /// field is fixed-width, so any encoding that parses is the canonical one.
+    fun split_is_well_formed(bytes: vector<u8>): bool {
+        let c = cursor(bytes);
+        let count = (take_u32(&mut c) as u64);
+        if (count > MAX_FEE_BENEFICIARIES) { return false };
+        let i = 0;
+        while (i < count) {
+            take_bytes(&mut c, 32);
+            take_u32(&mut c);
+            i = i + 1;
+        };
+        take_u32(&mut c);
         done(&c)
     }
 
@@ -228,6 +270,11 @@ module sena::txcodec {
                 vector::push_back(&mut p.signatures, sig);
                 i = i + 1;
             };
+        } else if (kind == PAYLOAD_DISTRIBUTE_FEES) {
+            p.asset = take_u32(&mut c);
+            p.amount = take_u128(&mut c);
+            p.split = take_field(&mut c);
+            if (!c.ok || !split_is_well_formed(p.split)) { return option::none() };
         } else {
             return option::none()
         };
@@ -243,8 +290,11 @@ module sena::txcodec {
         let sender = take_bytes(&mut c, 32);
         let nonce = take_u64(&mut c);
         let fee_asset = take_u32(&mut c);
-        let max_fee = take_u128(&mut c);
         let fee_rate = take_u128(&mut c);
+        let fee_intrinsic_gas = take_u64(&mut c);
+        let gas_limit = take_u64(&mut c);
+        let max_fee_per_gas = take_u128(&mut c);
+        let max_priority_fee_per_gas = take_u128(&mut c);
         let payload_bytes = take_field(&mut c);
         if (!c.ok) { return option::none() };
         let payload = decode_payload(payload_bytes);
@@ -281,8 +331,11 @@ module sena::txcodec {
             sender,
             nonce,
             fee_asset,
-            max_fee,
             fee_rate,
+            fee_intrinsic_gas,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
             payload_bytes,
             payload: option::extract(&mut payload),
             auth_kind,
@@ -299,8 +352,11 @@ module sena::txcodec {
         codec::put_field(&mut buf, tx.sender);
         codec::put_field_u64(&mut buf, tx.nonce);
         codec::put_field_u64(&mut buf, (tx.fee_asset as u64));
-        codec::put_field_u128(&mut buf, tx.max_fee);
         codec::put_field_u128(&mut buf, tx.fee_rate);
+        codec::put_field_u64(&mut buf, tx.fee_intrinsic_gas);
+        codec::put_field_u64(&mut buf, tx.gas_limit);
+        codec::put_field_u128(&mut buf, tx.max_fee_per_gas);
+        codec::put_field_u128(&mut buf, tx.max_priority_fee_per_gas);
         codec::put_field(&mut buf, tx.payload_bytes);
         codec::commit(buf)
     }
@@ -319,8 +375,11 @@ module sena::txcodec {
     public fun sender(tx: &Tx): vector<u8> { tx.sender }
     public fun nonce(tx: &Tx): u64 { tx.nonce }
     public fun fee_asset(tx: &Tx): u32 { tx.fee_asset }
-    public fun max_fee(tx: &Tx): u128 { tx.max_fee }
     public fun fee_rate(tx: &Tx): u128 { tx.fee_rate }
+    public fun fee_intrinsic_gas(tx: &Tx): u64 { tx.fee_intrinsic_gas }
+    public fun gas_limit(tx: &Tx): u64 { tx.gas_limit }
+    public fun max_fee_per_gas(tx: &Tx): u128 { tx.max_fee_per_gas }
+    public fun max_priority_fee_per_gas(tx: &Tx): u128 { tx.max_priority_fee_per_gas }
     public fun payload(tx: &Tx): &Payload { &tx.payload }
     public fun is_ed25519(tx: &Tx): bool { tx.auth_kind == AUTH_ED25519 }
     public fun ed25519_public_key(tx: &Tx): vector<u8> { tx.ed25519_public_key }
@@ -333,6 +392,7 @@ module sena::txcodec {
     public fun is_bind(p: &Payload): bool { p.kind == PAYLOAD_BIND_IDENTIFIER }
     public fun is_unbind(p: &Payload): bool { p.kind == PAYLOAD_UNBIND_IDENTIFIER }
     public fun is_governance(p: &Payload): bool { p.kind == PAYLOAD_GOVERNANCE }
+    public fun is_distribute_fees(p: &Payload): bool { p.kind == PAYLOAD_DISTRIBUTE_FEES }
     public fun to(p: &Payload): vector<u8> { p.to }
     public fun asset(p: &Payload): u32 { p.asset }
     public fun amount(p: &Payload): u128 { p.amount }
@@ -342,10 +402,15 @@ module sena::txcodec {
     public fun is_set_gas_asset(p: &Payload): bool { p.update_kind == UPDATE_SET_GAS_ASSET }
     public fun is_set_parameter(p: &Payload): bool { p.update_kind == UPDATE_SET_PARAMETER }
     public fun is_set_jwk(p: &Payload): bool { p.update_kind == UPDATE_SET_JWK }
+    public fun is_set_fee_market(p: &Payload): bool { p.update_kind == UPDATE_SET_FEE_MARKET }
+    public fun is_set_fee_split(p: &Payload): bool { p.update_kind == UPDATE_SET_FEE_SPLIT }
+    public fun is_disable_gas_asset(p: &Payload): bool { p.update_kind == UPDATE_DISABLE_GAS_ASSET }
     public fun record_asset(p: &Payload): u32 { p.record_asset }
     public fun text(p: &Payload): vector<u8> { p.text }
     public fun rate_or_value(p: &Payload): u128 { p.rate_or_value }
     public fun flag(p: &Payload): bool { p.flag }
+    public fun gas(p: &Payload): u64 { p.gas }
+    public fun split(p: &Payload): vector<u8> { p.split }
     public fun iss_hash(p: &Payload): vector<u8> { p.iss_hash }
     public fun jwk_hash(p: &Payload): vector<u8> { p.jwk_hash }
     public fun signer_indices(p: &Payload): vector<u32> { p.signer_indices }

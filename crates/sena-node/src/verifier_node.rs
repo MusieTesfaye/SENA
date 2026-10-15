@@ -13,7 +13,7 @@
 use sena_state::MerkleTrie;
 use std::sync::Arc;
 
-use sena_stf::{execute_batch, BatchContext, BatchError, KeylessConfig};
+use sena_stf::{execute_batch, BatchError, KeylessConfig};
 
 use sena_fraudproof::{
     check_assertion, Assertion, AssertionId, Dispute, Finding, Opening, PartyId, TracePlayer,
@@ -90,10 +90,7 @@ impl VerifierNode {
         let pre_state = self.state.clone();
         let mut next = self.state.clone();
 
-        let ctx = BatchContext {
-            timestamp: block.timestamp,
-            keyless: self.keyless.as_deref(),
-        };
+        let ctx = block.context(self.keyless.as_deref());
         let trace = match execute_batch(&mut next, &ctx, &block.transactions) {
             Ok(trace) => trace,
             Err(BatchError::Compile { index, source }) => {

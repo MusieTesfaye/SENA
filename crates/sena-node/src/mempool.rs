@@ -13,13 +13,20 @@
 //! The pool keeps the state after its whole queue (the *tip*) and checks a
 //! candidate against that alone, so admission costs one transaction's
 //! execution rather than the queue's. Executing a batch is executing its
-//! transactions in order, so this is the same check.
+//! transactions in order, so this is the same check -- with one exception:
+//! the fee market. A queue can hold more gas than one window, spread over
+//! later batches, so each candidate is charged against the window as the
+//! canonical state has it, not as the queue ahead of it would leave it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sena_primitives::AssetId;
 use sena_primitives::{Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, BatchContext, Transaction};
+use sena_stf::gas::{DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET};
+use sena_stf::{
+    execute_batch, gas_required, keys, BatchContext, BatchError, FeeMarket, Transaction,
+};
 
 /// Why a transaction was not admitted.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
@@ -132,13 +139,11 @@ impl Mempool {
         // invalid because of what is queued -- a sender spending the same
         // balance twice, for instance.
         let tip = self.tip_over(state, ctx);
-        let mut speculative = tip.state.clone();
-        if let Err(error) = execute_batch(&mut speculative, ctx, std::slice::from_ref(&transaction))
-        {
-            return Err(RejectReason::WouldNotExecute {
+        let speculative = admit(state, &tip.state, ctx, &transaction).map_err(|error| {
+            RejectReason::WouldNotExecute {
                 reason: error.to_string(),
-            });
-        }
+            }
+        })?;
         tip.roots.push(speculative.root());
         tip.state = speculative;
         self.hashes.insert(hash);
@@ -165,8 +170,7 @@ impl Mempool {
             };
             let mut kept = Vec::with_capacity(self.queued.len());
             for transaction in std::mem::take(&mut self.queued) {
-                let mut next = tip.state.clone();
-                if execute_batch(&mut next, ctx, std::slice::from_ref(&transaction)).is_ok() {
+                if let Ok(next) = admit(state, &tip.state, ctx, &transaction) {
                     tip.roots.push(next.root());
                     tip.state = next;
                     kept.push(transaction);
@@ -191,6 +195,41 @@ impl Mempool {
     /// Removes and returns up to `limit` transactions for inclusion in a batch.
     pub fn take_batch(&mut self, limit: usize) -> Vec<Transaction> {
         self.take_batch_within(limit, usize::MAX)
+    }
+
+    /// Removes and returns the longest prefix of the queue that fits in
+    /// `limit` transactions, `max_bytes` of encoding and `gas_budget` gas,
+    /// with transactions paying in each asset using at most `asset_cap(asset)`
+    /// gas between them.
+    ///
+    /// Stops at the first transaction that does not fit rather than skipping
+    /// it: anything after it may depend on it (a later nonce, a balance it
+    /// creates), so only a prefix of the queue is known to execute.
+    pub fn take_batch_fitting(
+        &mut self,
+        limit: usize,
+        max_bytes: usize,
+        gas_budget: u64,
+        asset_cap: impl Fn(AssetId) -> u64,
+    ) -> Vec<Transaction> {
+        let mut gas = 0u64;
+        let mut per_asset: BTreeMap<AssetId, u64> = BTreeMap::new();
+        let mut fitting = 0;
+        for transaction in self.queued.iter().take(limit) {
+            let need = gas_required(transaction).unwrap_or(u64::MAX);
+            let asset_gas = per_asset.get(&transaction.fee_asset).copied().unwrap_or(0);
+            let fits = gas.checked_add(need).is_some_and(|g| g <= gas_budget)
+                && asset_gas
+                    .checked_add(need)
+                    .is_some_and(|g| g <= asset_cap(transaction.fee_asset));
+            if !fits {
+                break;
+            }
+            gas += need;
+            per_asset.insert(transaction.fee_asset, asset_gas + need);
+            fitting += 1;
+        }
+        self.take_batch_within(fitting, max_bytes)
     }
 
     /// Removes and returns the longest prefix of the queue of at most `limit`
@@ -234,4 +273,25 @@ impl Mempool {
         self.tip = None;
         self.claimed.clear();
     }
+}
+
+/// Executes `transaction` on top of `tip`, charging its gas against the fee
+/// market window as `base` -- the canonical state -- has it.
+fn admit(
+    base: &MerkleTrie,
+    tip: &MerkleTrie,
+    ctx: &BatchContext<'_>,
+    transaction: &Transaction,
+) -> Result<MerkleTrie, BatchError> {
+    let mut next = tip.clone();
+    let slot = keys::fee_market();
+    let market = base.get(&slot).map_or_else(
+        || FeeMarket::genesis(DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET).encode(),
+        <[u8]>::to_vec,
+    );
+    if next.get(&slot) != Some(market.as_slice()) {
+        next.insert(slot, market);
+    }
+    execute_batch(&mut next, ctx, std::slice::from_ref(transaction))?;
+    Ok(next)
 }

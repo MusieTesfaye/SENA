@@ -40,6 +40,10 @@ POST_ROOT="0x2222222222222222222222222222222222222222222222222222222222222222"
 # One published transaction. Posting does not compile it -- that is what a
 # dispute is for -- so any bytes do; their Merkle root is computed on chain.
 TX="0x5e4a"
+# The batch header's base fee and tip recipient. Posting does not check them
+# against the trace -- a dispute does -- so these are placeholders too.
+BASE_FEE=25000000000
+TIPS="0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 WINDOW=604800   # 7 days
 BOND=1000000
 TRACE_LEN=10
@@ -213,7 +217,7 @@ expect_ok "dispute registry initialised (keyless setup $KEYLESS_SETUP)" \
 step "4. Derive assertion ids independently"
 # Computed from the canonical encoding rather than read back from the chain, so
 # a mismatch between the Move and Rust hashing shows up as a rejected argument.
-read -r GENESIS_ID CHILD_ID < <(python3 - "$GENESIS_ROOT" "$POST_ROOT" "$TX" "$TRACE_LEN" "$BOND" "$BATCH_TIME" <<'PY'
+read -r GENESIS_ID CHILD_ID < <(python3 - "$GENESIS_ROOT" "$POST_ROOT" "$TX" "$TRACE_LEN" "$BOND" "$BATCH_TIME" "$BASE_FEE" "$TIPS" <<'PY'
 import hashlib, struct, sys
 def framed(b): return struct.pack(">I", len(b)) + b
 def commit(domain, *fields): return hashlib.sha256(framed(domain) + b"".join(framed(f) for f in fields)).digest()
@@ -222,9 +226,10 @@ def aid(parent, pre, post, batch, tl, bond):
     return commit(b"SENA:v1:assertion", parent, u64(0), pre, post, batch, u64(tl), bond.to_bytes(16, "big"))
 g_root = bytes.fromhex(sys.argv[1][2:]); post = bytes.fromhex(sys.argv[2][2:])
 tx = bytes.fromhex(sys.argv[3][2:]); tl = int(sys.argv[4]); bond = int(sys.argv[5]); ts = int(sys.argv[6])
+base_fee = int(sys.argv[7]).to_bytes(16, "big"); tips = bytes.fromhex(sys.argv[8][2:])
 # A one-leaf batch tree: the root is the leaf.
 root = commit(b"SENA:v1:batch-leaf", u64(0), u64(0), tx)
-batch = commit(b"SENA:v1:batch", u64(ts), u64(1), root)
+batch = commit(b"SENA:v1:batch", u64(ts), base_fee, tips, u64(1), root)
 Z = bytes(32)
 g = aid(Z, Z, g_root, Z, 0, 0)
 c = aid(g, g_root, post, batch, tl, bond)
@@ -237,7 +242,7 @@ echo "  child   $CHILD_ID"
 step "5. Post a bonded assertion"
 expect_ok "assertion accepted (ids agree with the contract)" \
   "${ADDR}::assertions::post" "address:$ADDR" "hex:$GENESIS_ID" "hex:$PRE_ROOT" \
-  "hex:$POST_ROOT" "u64:$BATCH_TIME" "hex:[\"$TX\"]" "u64:[\"0\"]" "u64:$TRACE_LEN" "u128:$BOND"
+  "hex:$POST_ROOT" "u64:$BATCH_TIME" "u128:$BASE_FEE" "hex:$TIPS" "hex:[\"$TX\"]" "u64:[\"0\"]" "u64:$TRACE_LEN" "u128:$BOND"
 
 status() {
   aptos move view --function-id "${ADDR}::assertions::status" \
@@ -251,7 +256,7 @@ except Exception: print("?")'
 step "6. Underbonded assertion must be refused"
 expect_abort "underbonded assertion rejected" "E_BOND_TOO_SMALL" \
   "${ADDR}::assertions::post" "address:$ADDR" "hex:$GENESIS_ID" "hex:$PRE_ROOT" \
-  "hex:$POST_ROOT" "u64:$BATCH_TIME" "hex:[\"$TX\"]" "u64:[\"0\"]" "u64:$TRACE_LEN" "u128:$((BOND-1))"
+  "hex:$POST_ROOT" "u64:$BATCH_TIME" "u128:$BASE_FEE" "hex:$TIPS" "hex:[\"$TX\"]" "u64:[\"0\"]" "u64:$TRACE_LEN" "u128:$((BOND-1))"
 
 step "7. Safety: finalization must fail inside the challenge window"
 expect_abort "early finalization refused (E_WINDOW_OPEN)" "E_WINDOW_OPEN" \

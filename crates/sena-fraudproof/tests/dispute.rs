@@ -18,7 +18,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::gas::fee_for;
 use sena_stf::{
     apply, compile, execute_batch, Authenticator, BatchContext, ExecutionTrace, Instruction,
     MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
@@ -49,14 +48,18 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE).unwrap(),
-        fee_rate: RATE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -74,6 +77,7 @@ fn genesis(accounts: &[(L2Address, u128)]) -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".to_owned(),
                 rate: RATE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },

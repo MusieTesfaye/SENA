@@ -235,6 +235,8 @@ fn state_regions_match() {
         "SENA:v1:state:parameter",
         "SENA:v1:state:council",
         "SENA:v1:state:jwk",
+        "SENA:v1:state:fee-market",
+        "SENA:v1:state:fee-split",
     ] {
         assert!(
             src.contains(&format!("b\"{region}\"")),
@@ -256,17 +258,45 @@ fn limits_and_gas_constants_match() {
     )));
     let compiler = source("compiler.move");
     assert!(compiler.contains(&format!(
-        "const BASE_GAS_NATIVE: u128 = {};",
-        sena_stf::BASE_GAS_NATIVE
-    )));
-    assert!(compiler.contains(&format!(
-        "const RATE_SCALE: u128 = {};",
-        sena_stf::RATE_SCALE
-    )));
-    assert!(compiler.contains(&format!(
         "const FEE_VAULT: vector<u8> = x\"{}\";",
         hex::encode(sena_stf::FEE_VAULT.as_bytes())
     )));
+    use sena_stf::gas;
+    let g = source("gas.move");
+    for (name, ty, value) in [
+        ("RATE_SCALE", "u128", gas::RATE_SCALE.to_string()),
+        ("PRICE_SCALE", "u128", gas::PRICE_SCALE.to_string()),
+        ("INTRINSIC_GAS", "u64", gas::INTRINSIC_GAS.to_string()),
+        ("KEYLESS_GAS", "u64", gas::KEYLESS_GAS.to_string()),
+        ("MAX_GAS_LIMIT", "u64", gas::MAX_GAS_LIMIT.to_string()),
+        ("ELASTICITY", "u64", gas::ELASTICITY.to_string()),
+        (
+            "BASE_FEE_CHANGE_DENOMINATOR",
+            "u128",
+            gas::BASE_FEE_CHANGE_DENOMINATOR.to_string(),
+        ),
+        (
+            "DEFAULT_BASE_FEE_FLOOR",
+            "u128",
+            gas::DEFAULT_BASE_FEE_FLOOR.to_string(),
+        ),
+        (
+            "DEFAULT_GAS_TARGET",
+            "u64",
+            gas::DEFAULT_GAS_TARGET.to_string(),
+        ),
+        ("SHARE_SCALE", "u64", gas::SHARE_SCALE.to_string()),
+        (
+            "MAX_FEE_BENEFICIARIES",
+            "u64",
+            gas::MAX_FEE_BENEFICIARIES.to_string(),
+        ),
+    ] {
+        assert!(
+            g.contains(&format!("const {name}: {ty} = {value};")),
+            "gas.move lacks {name} = {value}"
+        );
+    }
     let osp = source("osp.move");
     for name in sena_stf::governance::GOVERNABLE_PARAMETERS {
         assert!(

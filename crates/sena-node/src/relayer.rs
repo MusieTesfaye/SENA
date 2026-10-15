@@ -37,6 +37,10 @@ pub struct L2Block {
     pub height: u64,
     /// Batch timestamp.
     pub timestamp: u64,
+    /// The base fee per gas the batch paid.
+    pub base_fee: u128,
+    /// Where its tips went.
+    pub fee_recipient: sena_primitives::L2Address,
     /// State root before.
     pub pre_state_root: Hash256,
     /// State root after.
@@ -94,6 +98,8 @@ impl L2Source for RpcSource {
             Response::Block {
                 height,
                 timestamp,
+                base_fee,
+                fee_recipient,
                 pre_state_root,
                 post_state_root,
                 transactions,
@@ -103,6 +109,8 @@ impl L2Source for RpcSource {
             } => Ok(Some(L2Block {
                 height,
                 timestamp,
+                base_fee,
+                fee_recipient,
                 pre_state_root,
                 post_state_root,
                 tx_bytes: transactions
@@ -293,7 +301,13 @@ impl<C: L1, S: L2Source> Relayer<C, S> {
                 .zip(block.tx_bytes.iter().cloned())
                 .collect();
             let tree = BatchTree::build(&leaves);
-            let commitment = header_commitment(block.timestamp, tree.tx_count(), &tree.root());
+            let commitment = header_commitment(
+                block.timestamp,
+                block.base_fee,
+                &block.fee_recipient,
+                tree.tx_count(),
+                &tree.root(),
+            );
             let id = l1::assertion_id(
                 &parent,
                 block.pre_state_root,
@@ -321,6 +335,8 @@ impl<C: L1, S: L2Source> Relayer<C, S> {
                         Arg::Bytes(block.pre_state_root.as_bytes().to_vec()),
                         Arg::Bytes(block.post_state_root.as_bytes().to_vec()),
                         Arg::U64(block.timestamp),
+                        Arg::U128(block.base_fee),
+                        Arg::Bytes(block.fee_recipient.as_bytes().to_vec()),
                         Arg::BytesList(block.tx_bytes.clone()),
                         Arg::U64List(block.tx_starts.clone()),
                         Arg::U64(block.trace_length),

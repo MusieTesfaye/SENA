@@ -15,8 +15,11 @@ use sena_primitives::{AssetId, Hash256, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use std::sync::Arc;
 
+use sena_stf::gas::{
+    DEFAULT_ASSET_INTRINSIC_GAS, DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET, SHARE_SCALE,
+};
 use sena_stf::keyless::{self, KeylessConfig};
-use sena_stf::{apply, Council, Instruction, WhitelistedAsset};
+use sena_stf::{apply, Council, FeeSplit, Instruction, WhitelistedAsset};
 use serde::{Deserialize, Serialize};
 
 /// An initial balance.
@@ -41,8 +44,53 @@ pub struct GasAsset {
     /// Units per `RATE_SCALE` native units.
     #[serde(with = "u128_string")]
     pub rate: u128,
+    /// Gas a transaction paying in it pays on top of the 21,000 intrinsic.
+    #[serde(default = "default_intrinsic_gas")]
+    pub intrinsic_gas: u64,
     /// Whether it may be used for fees.
     pub enabled: bool,
+}
+
+const fn default_intrinsic_gas() -> u64 {
+    DEFAULT_ASSET_INTRINSIC_GAS
+}
+
+/// The fee market at genesis.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FeeMarketConfig {
+    /// The base fee floor, in `PRICE_SCALE`ths of a native unit per gas.
+    #[serde(with = "u128_string")]
+    pub base_fee_floor: u128,
+    /// The gas target per one-second window.
+    pub gas_target: u64,
+}
+
+impl Default for FeeMarketConfig {
+    fn default() -> Self {
+        Self {
+            base_fee_floor: DEFAULT_BASE_FEE_FLOOR,
+            gas_target: DEFAULT_GAS_TARGET,
+        }
+    }
+}
+
+/// One beneficiary of collected fees.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FeeShare {
+    /// Who is paid.
+    pub address: L2Address,
+    /// Their share, in parts per million.
+    pub share: u32,
+}
+
+/// How collected fees are split at genesis.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FeeSplitConfig {
+    /// The beneficiaries.
+    pub beneficiaries: Vec<FeeShare>,
+    /// The share burned, in parts per million.
+    #[serde(default)]
+    pub burn: u32,
 }
 
 /// The governance council at genesis.
@@ -52,6 +100,10 @@ pub struct CouncilConfig {
     pub members: Vec<String>,
     /// How many must sign.
     pub threshold: u32,
+    /// How many may disable a fee asset on their own (the circuit breaker's
+    /// fast path). Zero, the default, gives guardians no fast path.
+    #[serde(default)]
+    pub guardian_threshold: u32,
 }
 
 /// An `(iss_hash, jwk_hash)` pair, as stored in state.
@@ -107,6 +159,13 @@ pub struct GenesisConfig {
     /// rejected.
     #[serde(default)]
     pub keyless: Option<KeylessGenesis>,
+    /// The fee market's floor and target; the defaults if absent.
+    #[serde(default)]
+    pub fee_market: Option<FeeMarketConfig>,
+    /// How collected fees are split; none, so nothing can be distributed, if
+    /// absent.
+    #[serde(default)]
+    pub fee_split: Option<FeeSplitConfig>,
 }
 
 /// Why a genesis configuration could not be applied.
@@ -144,6 +203,12 @@ pub enum GenesisError {
          allow_insecure_test_setup to use it on a network that holds nothing"
     )]
     InsecureKeylessSetup(String),
+    /// The fee split's shares do not add up.
+    #[error("fee split shares must be distinct, non-zero and sum to {0}")]
+    BadFeeSplit(u32),
+    /// The fee market's floor or target is zero.
+    #[error("the fee market's base fee floor and gas target must be non-zero")]
+    BadFeeMarket,
     /// A genesis JWK could not be hashed.
     #[error("JWK {index} is invalid: {reason}")]
     BadJwk {
@@ -172,11 +237,14 @@ impl GenesisConfig {
                 asset: 1,
                 symbol: "USDC".to_owned(),
                 rate: sena_stf::RATE_SCALE,
+                intrinsic_gas: DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             }],
             allocations,
             council: None,
             keyless: None,
+            fee_market: None,
+            fee_split: None,
         }
     }
 
@@ -251,7 +319,19 @@ impl GenesisConfig {
             for (index, member) in council.members.iter().enumerate() {
                 decode_key(member).ok_or(GenesisError::BadCouncilKey { index })?;
             }
+            if council.guardian_threshold > council.threshold {
+                return Err(GenesisError::ImpossibleThreshold {
+                    threshold: council.guardian_threshold,
+                    members: council.threshold as usize,
+                });
+            }
         }
+        if let Some(m) = &self.fee_market {
+            if m.base_fee_floor == 0 || m.gas_target == 0 {
+                return Err(GenesisError::BadFeeMarket);
+            }
+        }
+        self.fee_split()?;
         self.keyless_config()?;
         self.jwk_hashes()?;
         Ok(())
@@ -260,8 +340,8 @@ impl GenesisConfig {
     /// Builds the genesis state.
     ///
     /// Order is fixed and documented because the resulting root is consensus:
-    /// gas assets, then the council, then JWKs, then allocations, each in the
-    /// order written.
+    /// gas assets, then the council, the fee market and fee split, then JWKs,
+    /// then allocations, each in the order written.
     ///
     /// # Errors
     ///
@@ -276,6 +356,7 @@ impl GenesisConfig {
                 asset: AssetId(asset.asset),
                 symbol: asset.symbol.clone(),
                 rate: asset.rate,
+                intrinsic_gas: asset.intrinsic_gas,
                 enabled: asset.enabled,
             };
             apply(&mut trie, &Instruction::SetGasAsset { record })
@@ -291,8 +372,24 @@ impl GenesisConfig {
                 members,
                 threshold: config.threshold,
                 epoch: 0,
+                guardian_threshold: config.guardian_threshold,
             };
             trie.insert(sena_stf::keys::council(), council.encode());
+        }
+
+        let market = self.fee_market.clone().unwrap_or_default();
+        apply(
+            &mut trie,
+            &Instruction::SetFeeMarket {
+                floor: market.base_fee_floor,
+                target: market.gas_target,
+            },
+        )
+        .map_err(|e| GenesisError::Apply(e.to_string()))?;
+
+        if let Some(split) = self.fee_split()? {
+            apply(&mut trie, &Instruction::SetFeeSplit { split })
+                .map_err(|e| GenesisError::Apply(e.to_string()))?;
         }
 
         for (iss_hash, jwk_hash) in self.jwk_hashes()? {
@@ -320,6 +417,30 @@ impl GenesisConfig {
         }
 
         Ok(trie)
+    }
+
+    /// The genesis fee split, if one is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError::BadFeeSplit`] if its shares do not add up to
+    /// one million parts per million.
+    pub fn fee_split(&self) -> Result<Option<FeeSplit>, GenesisError> {
+        let Some(config) = &self.fee_split else {
+            return Ok(None);
+        };
+        let split = FeeSplit {
+            beneficiaries: config
+                .beneficiaries
+                .iter()
+                .map(|b| (b.address, b.share))
+                .collect(),
+            burn: config.burn,
+        };
+        split
+            .check()
+            .map_err(|_| GenesisError::BadFeeSplit(SHARE_SCALE))?;
+        Ok(Some(split))
     }
 
     /// Returns the state root this configuration produces.

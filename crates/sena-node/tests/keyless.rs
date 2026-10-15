@@ -3,9 +3,8 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use sena_primitives::{AssetId, L2Address};
-use sena_stf::gas::fee_for;
 use sena_stf::keyless::{aptos_sample, KeylessConfig};
-use sena_stf::{Authenticator, Payload, Transaction, RATE_SCALE};
+use sena_stf::{Authenticator, Payload, Transaction};
 
 use sena_fraudproof::{AssertionChain, PartyId};
 use sena_node::genesis::{Allocation, GenesisConfig, GenesisError, JwkConfig, KeylessGenesis};
@@ -63,8 +62,11 @@ fn keyless_transfer(amount: u128) -> Transaction {
         sender: aptos_sample::signature().address(),
         nonce: 0,
         fee_asset: USDC,
-        max_fee: fee_for(RATE_SCALE).unwrap(),
-        fee_rate: RATE_SCALE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload: Payload::Transfer {
             to: RECIPIENT,
             asset: USDC,
@@ -72,6 +74,7 @@ fn keyless_transfer(amount: u128) -> Transaction {
         },
         authenticator: Authenticator::Keyless(Box::new(aptos_sample::signature())),
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let esk = SigningKey::from_bytes(&aptos_sample::ephemeral_secret_key());
     let signature = esk.sign(tx.signing_digest().as_bytes()).to_bytes();
     if let Authenticator::Keyless(sig) = &mut tx.authenticator {

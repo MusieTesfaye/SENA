@@ -19,7 +19,7 @@
 //! from two adjacent leaves and is itself fraud; see the batch-structure proofs
 //! in `move/sena/sources/disputes.move`.
 
-use sena_primitives::{domain, CanonicalEncoder, Hash256};
+use sena_primitives::{domain, CanonicalEncoder, Hash256, L2Address};
 use serde::{Deserialize, Serialize};
 
 /// Domain tag for a batch leaf.
@@ -47,11 +47,23 @@ fn node_hash(left: &Hash256, right: &Hash256) -> Hash256 {
 }
 
 /// The batch header commitment, as `sena::assertions::post` recomputes it.
+///
+/// Everything a transaction compiles against besides itself is in here — the
+/// timestamp, the base fee and the tip recipient — so Aptos L1 compiles a
+/// disputed transaction against exactly what the sequencer did.
 #[must_use]
-pub fn header_commitment(timestamp: u64, tx_count: u64, tx_root: &Hash256) -> Hash256 {
+pub fn header_commitment(
+    timestamp: u64,
+    base_fee: u128,
+    fee_recipient: &L2Address,
+    tx_count: u64,
+    tx_root: &Hash256,
+) -> Hash256 {
     Hash256::commit(
         CanonicalEncoder::new(domain::BATCH)
             .u64(timestamp)
+            .u128(base_fee)
+            .field(fee_recipient.as_bytes())
             .u64(tx_count)
             .field(tx_root.as_bytes()),
     )

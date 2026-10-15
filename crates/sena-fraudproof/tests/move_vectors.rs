@@ -24,16 +24,24 @@ use sena_fraudproof::{AssertionId, PartyId, TracePlayer};
 use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::{MerkleTrie, Terminal};
 use sena_stf::batch::BatchTree;
-use sena_stf::gas::fee_for;
+use sena_stf::gas::{
+    DEFAULT_ASSET_INTRINSIC_GAS, DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET, PRICE_SCALE,
+};
 use sena_stf::governance::{Council, CouncilSignature, GovernanceUpdate};
 use sena_stf::keyless::{aptos_sample, KeylessConfig, KeylessSignature};
 use sena_stf::{
-    apply, compile, execute_batch, keys, Authenticator, BatchContext, ExecutionTrace, Instruction,
-    MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
+    apply, compile, execute_batch, keys, Authenticator, BatchContext, ExecutionTrace, FeeMarket,
+    FeeSplit, Instruction, MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
 
 const USDC: AssetId = AssetId(1);
 const TIMESTAMP: u64 = 1_700_000_000;
+/// The batch's base fee: the floor, which a fresh market rolls to.
+const BASE_FEE: u128 = DEFAULT_BASE_FEE_FLOOR;
+/// The sequencer that collects the batch's tips.
+fn sequencer() -> L2Address {
+    L2Address::from_bytes([0x5e; 32])
+}
 const WINDOW: u64 = 604_800;
 /// `sena::keyless` setup ids.
 const SETUP_DISABLED: u8 = 0;
@@ -90,6 +98,9 @@ impl Module {
     fn boolean(&mut self, name: &str, v: bool) {
         writeln!(self.0, "    public fun {name}(): bool {{ {v} }}").unwrap();
     }
+    fn u128(&mut self, name: &str, v: u128) {
+        writeln!(self.0, "    public fun {name}(): u128 {{ {v} }}").unwrap();
+    }
 }
 
 // --- The fixture -------------------------------------------------------------
@@ -112,18 +123,23 @@ fn sign_ed25519(k: &SigningKey, mut tx: Transaction) -> Transaction {
 }
 
 fn base(sender: L2Address, nonce: u64, payload: Payload) -> Transaction {
-    Transaction {
+    let mut tx = Transaction {
         sender,
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE_SCALE).unwrap(),
-        fee_rate: RATE_SCALE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: [0; 32],
             signature: [0; 64],
         },
-    }
+    };
+    sena_stf::gas::fill_default_fees(&mut tx);
+    tx
 }
 
 fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
@@ -153,6 +169,8 @@ fn keyless_transfer(to: L2Address, amount: u128) -> Transaction {
         },
     );
     tx.authenticator = Authenticator::Keyless(Box::new(sig));
+    // Keyless verification costs gas of its own.
+    sena_stf::gas::fill_default_fees(&mut tx);
     let esk = SigningKey::from_bytes(&aptos_sample::ephemeral_secret_key());
     let s = esk.sign(tx.signing_digest().as_bytes()).to_bytes();
     if let Authenticator::Keyless(k) = &mut tx.authenticator {
@@ -207,6 +225,7 @@ fn genesis() -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".into(),
                 rate: RATE_SCALE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },
@@ -243,8 +262,17 @@ fn genesis() -> MerkleTrie {
             .collect(),
         threshold: 2,
         epoch: 0,
+        guardian_threshold: 1,
     };
     trie.insert(keys::council(), council.encode());
+    apply(
+        &mut trie,
+        &Instruction::SetFeeMarket {
+            floor: DEFAULT_BASE_FEE_FLOOR,
+            target: DEFAULT_GAS_TARGET,
+        },
+    )
+    .unwrap();
     trie
 }
 
@@ -252,6 +280,8 @@ fn devnet_ctx(config: &KeylessConfig) -> BatchContext<'_> {
     BatchContext {
         timestamp: TIMESTAMP,
         keyless: Some(config),
+        base_fee: BASE_FEE,
+        fee_recipient: sequencer(),
     }
 }
 
@@ -377,12 +407,25 @@ struct CompileCase {
     bytes: Vec<u8>,
     timestamp: u64,
     setup: u8,
+    base_fee: u128,
+}
+
+impl CompileCase {
+    fn at(name: &'static str, tx: &Transaction) -> Self {
+        Self {
+            name,
+            bytes: tx.encode(),
+            timestamp: TIMESTAMP,
+            setup: SETUP_DEVNET,
+            base_fee: BASE_FEE,
+        }
+    }
 }
 
 fn generate() -> String {
     let devnet = KeylessConfig::aptos_devnet_insecure();
     let mainnet = KeylessConfig::aptos_mainnet();
-    let ctx_for = |setup: u8, timestamp: u64| -> BatchContext<'_> {
+    let ctx_for = |setup: u8, timestamp: u64, base_fee: u128| -> BatchContext<'_> {
         BatchContext {
             timestamp,
             keyless: match setup {
@@ -390,6 +433,8 @@ fn generate() -> String {
                 SETUP_DEVNET => Some(&*devnet),
                 _ => None,
             },
+            base_fee,
+            fee_recipient: sequencer(),
         }
     };
 
@@ -413,6 +458,8 @@ fn generate() -> String {
 
     m.hash("genesis_root", &pre.root());
     m.u64("batch_timestamp", TIMESTAMP);
+    m.u128("batch_base_fee", BASE_FEE);
+    m.bytes("batch_fee_recipient", sequencer().as_bytes());
     m.list(
         "batch_txs",
         &txs.iter().map(Transaction::encode).collect::<Vec<_>>(),
@@ -513,36 +560,42 @@ fn generate() -> String {
             bytes: txs[0].encode(),
             timestamp: TIMESTAMP,
             setup: SETUP_DEVNET,
+            base_fee: BASE_FEE,
         },
         CompileCase {
             name: "keyless_transfer",
             bytes: txs[1].encode(),
             timestamp: TIMESTAMP,
             setup: SETUP_DEVNET,
+            base_fee: BASE_FEE,
         },
         CompileCase {
             name: "keyless_expired",
             bytes: txs[1].encode(),
             timestamp: aptos_sample::EXP_DATE_SECS,
             setup: SETUP_DEVNET,
+            base_fee: BASE_FEE,
         },
         CompileCase {
             name: "keyless_wrong_setup",
             bytes: txs[1].encode(),
             timestamp: TIMESTAMP,
             setup: SETUP_MAINNET,
+            base_fee: BASE_FEE,
         },
         CompileCase {
             name: "keyless_disabled",
             bytes: txs[1].encode(),
             timestamp: TIMESTAMP,
             setup: SETUP_DISABLED,
+            base_fee: BASE_FEE,
         },
         CompileCase {
             name: "bad_signature",
             bytes: bad.encode(),
             timestamp: TIMESTAMP,
             setup: SETUP_DEVNET,
+            base_fee: BASE_FEE,
         },
     ];
     let mut wrong_signer = base(
@@ -568,29 +621,176 @@ fn generate() -> String {
         bytes: wrong_signer.encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     cases.push(CompileCase {
         name: "self_transfer",
         bytes: transfer(&alice, 0, addr(&alice), 1).encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
-    let mut low_fee = base(
-        addr(&alice),
-        0,
-        Payload::Transfer {
-            to: bob,
-            asset: USDC,
-            amount: 1,
-        },
-    );
-    low_fee.max_fee = fee_for(RATE_SCALE).unwrap() - 1;
+    let plain = || {
+        base(
+            addr(&alice),
+            0,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1,
+            },
+        )
+    };
+    let mut low_fee = plain();
+    low_fee.max_fee_per_gas = BASE_FEE - 1;
+    cases.push(CompileCase::at(
+        "fee_below_base_fee",
+        &sign_ed25519(&alice, low_fee),
+    ));
+    let mut low_limit = plain();
+    low_limit.gas_limit -= 1;
+    cases.push(CompileCase::at(
+        "gas_limit_too_low",
+        &sign_ed25519(&alice, low_limit),
+    ));
+    let mut zero = plain();
+    zero.max_fee_per_gas = 0;
+    let zero = sign_ed25519(&alice, zero);
     cases.push(CompileCase {
-        name: "fee_too_low",
-        bytes: sign_ed25519(&alice, low_fee).encode(),
-        timestamp: TIMESTAMP,
-        setup: SETUP_DEVNET,
+        base_fee: 0,
+        ..CompileCase::at("fee_rounds_to_zero", &zero)
     });
+    let mut tipped = plain();
+    tipped.gas_limit += 12_345;
+    tipped.max_fee_per_gas = 3 * BASE_FEE + 7;
+    tipped.max_priority_fee_per_gas = PRICE_SCALE / 3;
+    cases.push(CompileCase::at(
+        "tip_and_refund",
+        &sign_ed25519(&alice, tipped.clone()),
+    ));
+    // The same transaction in a busier window: the base fee eats into the tip.
+    cases.push(CompileCase {
+        base_fee: 3 * BASE_FEE,
+        ..CompileCase::at("tip_capped_by_max_fee", &sign_ed25519(&alice, tipped))
+    });
+    // Every part of this one rounds, so the remainder the base fee absorbs is
+    // non-zero: a tip of a seventh of a unit per gas, at an asset worth 2/3
+    // of a native unit, three gas over what it uses.
+    let mut rounding = plain();
+    sena_stf::gas::fill_fees(&mut rounding, RATE_SCALE * 3 / 2, 7_001, 10 * BASE_FEE);
+    rounding.gas_limit += 3;
+    rounding.max_priority_fee_per_gas = PRICE_SCALE / 7;
+    let rounding = sign_ed25519(&alice, rounding);
+    let c = sena_stf::fee_charge(&rounding, &ctx_for(SETUP_DEVNET, TIMESTAMP, BASE_FEE)).unwrap();
+    let exact_base = u128::from(c.gas_used) * (BASE_FEE * 3 / 2) / PRICE_SCALE;
+    assert!(
+        c.base > exact_base,
+        "the case must leave a remainder for the base fee"
+    );
+    cases.push(CompileCase::at("rounding_remainder", &rounding));
+    let mut eurc = plain();
+    eurc.fee_asset = AssetId(2);
+    sena_stf::gas::fill_fees(&mut eurc, RATE_SCALE * 3 / 2, 7_000, 2 * BASE_FEE);
+    cases.push(CompileCase::at(
+        "other_asset_rate",
+        &sign_ed25519(&alice, eurc),
+    ));
+    let split = FeeSplit {
+        beneficiaries: vec![(bob, 600_000), (carol, 300_001)],
+        burn: 99_999,
+    };
+    cases.push(CompileCase::at(
+        "distribute_fees",
+        &sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::DistributeFees {
+                    asset: USDC,
+                    amount: 1_000_003,
+                    split: split.clone(),
+                },
+            ),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "distribute_nothing",
+        &sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::DistributeFees {
+                    asset: USDC,
+                    amount: 0,
+                    split: split.clone(),
+                },
+            ),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "distribute_bad_split",
+        &sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::DistributeFees {
+                    asset: USDC,
+                    amount: 5,
+                    split: FeeSplit {
+                        beneficiaries: vec![(bob, 1)],
+                        burn: 0,
+                    },
+                },
+            ),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "governance_set_fee_market",
+        &governance(
+            0,
+            GovernanceUpdate::SetFeeMarket {
+                floor: 2 * DEFAULT_BASE_FEE_FLOOR,
+                target: 1_234_567,
+            },
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "governance_bad_fee_market",
+        &governance(
+            0,
+            GovernanceUpdate::SetFeeMarket {
+                floor: 0,
+                target: 1,
+            },
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "governance_set_fee_split",
+        &governance(
+            0,
+            GovernanceUpdate::SetFeeSplit {
+                split: split.clone(),
+            },
+        ),
+    ));
+    let disable = GovernanceUpdate::DisableGasAsset { asset: USDC };
+    let one = council_members()[1]
+        .sign(disable.signing_digest(0).as_bytes())
+        .to_bytes();
+    cases.push(CompileCase::at(
+        "guardian_disable",
+        &transfer_like_governance(
+            0,
+            disable,
+            vec![CouncilSignature {
+                index: 1,
+                signature: one,
+            }],
+        ),
+    ));
     let identifier =
         HashedIdentifier::new(Channel::Handle, "@alice", &NetworkSalt::new(*b"vectors"));
     cases.push(CompileCase {
@@ -609,6 +809,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     cases.push(CompileCase {
         name: "unbind_identifier",
@@ -619,6 +820,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     let sample = aptos_sample::signature();
     cases.push(CompileCase {
@@ -634,6 +836,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     cases.push(CompileCase {
         name: "governance_disable_asset",
@@ -644,6 +847,7 @@ fn generate() -> String {
                     asset: USDC,
                     symbol: "USDC".into(),
                     rate: RATE_SCALE,
+                    intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                     enabled: false,
                 },
             },
@@ -651,6 +855,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     cases.push(CompileCase {
         name: "governance_set_parameter",
@@ -664,6 +869,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     cases.push(CompileCase {
         name: "governance_ungovernable",
@@ -677,6 +883,7 @@ fn generate() -> String {
         .encode(),
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     let mut truncated = txs[0].encode();
     truncated.pop();
@@ -685,6 +892,7 @@ fn generate() -> String {
         bytes: truncated,
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     let mut trailing = txs[0].encode();
     trailing.push(0);
@@ -693,6 +901,7 @@ fn generate() -> String {
         bytes: trailing,
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
     let mut bad_flag = txs[1].encode();
     let flag = bad_flag.len() - 128 - 32 - 1;
@@ -702,16 +911,25 @@ fn generate() -> String {
         bytes: bad_flag,
         timestamp: TIMESTAMP,
         setup: SETUP_DEVNET,
+        base_fee: BASE_FEE,
     });
 
     m.u64("compile_case_count", cases.len() as u64);
+    m.u64(
+        "council_case",
+        cases
+            .iter()
+            .position(|c| c.name == "governance_set_jwk")
+            .unwrap() as u64,
+    );
     for (i, case) in cases.iter().enumerate() {
         let rust = Transaction::decode(&case.bytes)
             .ok()
-            .and_then(|tx| compile(&tx, &ctx_for(case.setup, case.timestamp)).ok());
+            .and_then(|tx| compile(&tx, &ctx_for(case.setup, case.timestamp, case.base_fee)).ok());
         writeln!(m.0, "    // case {i}: {}", case.name).unwrap();
         m.bytes(&format!("compile_bytes_{i}"), &case.bytes);
         m.u64(&format!("compile_timestamp_{i}"), case.timestamp);
+        m.u128(&format!("compile_base_fee_{i}"), case.base_fee);
         m.u8(&format!("compile_setup_{i}"), case.setup);
         m.boolean(&format!("compile_ok_{i}"), rust.is_some());
         let encoded: Vec<Vec<u8>> = rust
@@ -731,13 +949,13 @@ fn generate() -> String {
         .map(|i| {
             format!(
                 "if (i == {i}) {{ return (compile_bytes_{i}(), compile_timestamp_{i}(), compile_setup_{i}(), \
-                 compile_ok_{i}(), compile_program_{i}(), compile_digest_{i}()) }};"
+                 compile_ok_{i}(), compile_program_{i}(), compile_digest_{i}(), compile_base_fee_{i}()) }};"
             )
         })
         .collect();
     writeln!(
         m.0,
-        "    public fun compile_case(i: u64): (vector<u8>, u64, u8, bool, vector<vector<u8>>, vector<u8>) {{\n        {}\n        abort 0\n    }}",
+        "    public fun compile_case(i: u64): (vector<u8>, u64, u8, bool, vector<vector<u8>>, vector<u8>, u128) {{\n        {}\n        abort 0\n    }}",
         arms.join("\n        ")
     )
     .unwrap();
@@ -754,6 +972,7 @@ fn generate() -> String {
     )
     .unwrap();
     let program = compile(&gov, &devnet_ctx(&devnet)).unwrap();
+    emit_transitions(&mut m, &split);
     let verify = program
         .iter()
         .find(|i| matches!(i, Instruction::VerifyCouncil { .. }))
@@ -772,6 +991,269 @@ fn generate() -> String {
     out.push_str(&m.0);
     out.push_str("}\n");
     out
+}
+
+/// One step's semantics against concrete slot contents.
+struct TransitionCase {
+    name: &'static str,
+    instruction: Instruction,
+    current: Option<Vec<u8>>,
+}
+
+/// Emits every fee-related transition the Move one-step verifier must agree
+/// on, as `(instruction, present, current, ok, updated)`.
+fn emit_transitions(m: &mut Module, split: &FeeSplit) {
+    let market = |base_fee, window_ts, window_gas| {
+        FeeMarket {
+            base_fee,
+            floor: DEFAULT_BASE_FEE_FLOOR,
+            target: 1_000_000,
+            window_ts,
+            window_gas,
+        }
+        .encode()
+    };
+    let charge = |timestamp, base_fee, gas| Instruction::ChargeBaseFee {
+        timestamp,
+        base_fee,
+        gas,
+    };
+    let floor = DEFAULT_BASE_FEE_FLOOR;
+    let asset = |intrinsic_gas, enabled| {
+        WhitelistedAsset {
+            asset: USDC,
+            symbol: "USDC".into(),
+            rate: RATE_SCALE,
+            intrinsic_gas,
+            enabled,
+        }
+        .encode()
+    };
+    let council = |guardian_threshold| {
+        Council {
+            members: council_members()
+                .iter()
+                .map(|k| k.verifying_key().to_bytes())
+                .collect(),
+            threshold: 2,
+            epoch: 4,
+            guardian_threshold,
+        }
+        .encode()
+    };
+    let disable = GovernanceUpdate::DisableGasAsset { asset: USDC };
+    let digest = disable.signing_digest(4);
+    let one = vec![CouncilSignature {
+        index: 0,
+        signature: council_members()[0].sign(digest.as_bytes()).to_bytes(),
+    }];
+    let guardian = |guardian| Instruction::VerifyCouncil {
+        epoch: 4,
+        digest,
+        signatures: one.clone(),
+        guardian,
+    };
+    let cases = vec![
+        TransitionCase {
+            name: "charge_same_window",
+            instruction: charge(10, 3 * floor, 7),
+            current: Some(market(3 * floor, 10, 5)),
+        },
+        TransitionCase {
+            name: "charge_rolls_up",
+            instruction: charge(11, 3 * floor + 3 * floor / 8, 1),
+            current: Some(market(3 * floor, 10, 2_000_000)),
+        },
+        TransitionCase {
+            name: "charge_rolls_partway_up",
+            instruction: charge(11, 3 * floor + 3 * floor / 16, 1),
+            current: Some(market(3 * floor, 10, 1_500_000)),
+        },
+        TransitionCase {
+            name: "charge_rolls_down",
+            instruction: charge(12, 3 * floor - 3 * floor / 8, 1),
+            current: Some(market(3 * floor, 10, 0)),
+        },
+        TransitionCase {
+            name: "charge_floors",
+            instruction: charge(12, floor, 1),
+            current: Some(market(floor + 1, 10, 0)),
+        },
+        TransitionCase {
+            name: "charge_mismatch",
+            instruction: charge(11, 3 * floor, 1),
+            current: Some(market(3 * floor, 10, 2_000_000)),
+        },
+        TransitionCase {
+            name: "charge_window_full",
+            instruction: charge(10, floor, 2),
+            current: Some(market(floor, 10, 1_999_999)),
+        },
+        TransitionCase {
+            name: "charge_fills_window",
+            instruction: charge(10, floor, 1),
+            current: Some(market(floor, 10, 1_999_999)),
+        },
+        TransitionCase {
+            name: "charge_regressed",
+            instruction: charge(9, floor, 1),
+            current: Some(market(floor, 10, 0)),
+        },
+        TransitionCase {
+            name: "charge_genesis_market",
+            instruction: charge(TIMESTAMP, floor, 21_000),
+            current: None,
+        },
+        TransitionCase {
+            name: "set_fee_market_absent",
+            instruction: Instruction::SetFeeMarket {
+                floor: 2 * floor,
+                target: 9,
+            },
+            current: None,
+        },
+        TransitionCase {
+            name: "set_fee_market_keeps_window",
+            instruction: Instruction::SetFeeMarket {
+                floor: floor / 2,
+                target: 9,
+            },
+            current: Some(market(3 * floor, 10, 77)),
+        },
+        TransitionCase {
+            name: "set_fee_market_zero",
+            instruction: Instruction::SetFeeMarket {
+                floor: 0,
+                target: 9,
+            },
+            current: None,
+        },
+        TransitionCase {
+            name: "verify_asset_ok",
+            instruction: Instruction::VerifyGasAsset {
+                asset: USDC,
+                rate: RATE_SCALE,
+                intrinsic_gas: 10_000,
+            },
+            current: Some(asset(10_000, true)),
+        },
+        TransitionCase {
+            name: "verify_asset_intrinsic_mismatch",
+            instruction: Instruction::VerifyGasAsset {
+                asset: USDC,
+                rate: RATE_SCALE,
+                intrinsic_gas: 9_999,
+            },
+            current: Some(asset(10_000, true)),
+        },
+        TransitionCase {
+            name: "verify_asset_disabled",
+            instruction: Instruction::VerifyGasAsset {
+                asset: USDC,
+                rate: RATE_SCALE,
+                intrinsic_gas: 10_000,
+            },
+            current: Some(asset(10_000, false)),
+        },
+        TransitionCase {
+            name: "disable_asset",
+            instruction: Instruction::DisableGasAsset { asset: USDC },
+            current: Some(asset(10_000, true)),
+        },
+        TransitionCase {
+            name: "disable_absent_asset",
+            instruction: Instruction::DisableGasAsset { asset: USDC },
+            current: None,
+        },
+        TransitionCase {
+            name: "verify_split_ok",
+            instruction: Instruction::VerifyFeeSplit {
+                split: split.clone(),
+            },
+            current: Some(split.encode()),
+        },
+        TransitionCase {
+            name: "verify_split_absent",
+            instruction: Instruction::VerifyFeeSplit {
+                split: split.clone(),
+            },
+            current: None,
+        },
+        TransitionCase {
+            name: "verify_split_other",
+            instruction: Instruction::VerifyFeeSplit {
+                split: FeeSplit {
+                    beneficiaries: vec![],
+                    burn: 1_000_000,
+                },
+            },
+            current: Some(split.encode()),
+        },
+        TransitionCase {
+            name: "set_split",
+            instruction: Instruction::SetFeeSplit {
+                split: split.clone(),
+            },
+            current: None,
+        },
+        TransitionCase {
+            name: "set_split_invalid",
+            instruction: Instruction::SetFeeSplit {
+                split: FeeSplit::default(),
+            },
+            current: None,
+        },
+        TransitionCase {
+            name: "guardian_signs_alone",
+            instruction: guardian(true),
+            current: Some(council(1)),
+        },
+        TransitionCase {
+            name: "guardian_without_fast_path",
+            instruction: guardian(true),
+            current: Some(council(0)),
+        },
+        TransitionCase {
+            name: "one_signature_for_council",
+            instruction: guardian(false),
+            current: Some(council(1)),
+        },
+    ];
+    m.u64("transition_case_count", cases.len() as u64);
+    for (i, case) in cases.iter().enumerate() {
+        let result = sena_stf::transition(&case.instruction, case.current.as_deref());
+        writeln!(m.0, "    // transition {i}: {}", case.name).unwrap();
+        m.bytes(
+            &format!("transition_instruction_{i}"),
+            &case.instruction.encode(),
+        );
+        m.boolean(&format!("transition_present_{i}"), case.current.is_some());
+        m.bytes(
+            &format!("transition_current_{i}"),
+            case.current.as_deref().unwrap_or(&[]),
+        );
+        m.boolean(&format!("transition_ok_{i}"), result.is_ok());
+        m.bytes(
+            &format!("transition_updated_{i}"),
+            result.as_deref().unwrap_or(&[]),
+        );
+        m.hash(&format!("transition_slot_{i}"), &case.instruction.slot());
+    }
+    let arms: Vec<String> = (0..cases.len())
+        .map(|i| {
+            format!(
+                "if (i == {i}) {{ return (transition_instruction_{i}(), transition_present_{i}(), \
+                 transition_current_{i}(), transition_ok_{i}(), transition_updated_{i}(), transition_slot_{i}()) }};"
+            )
+        })
+        .collect();
+    writeln!(
+        m.0,
+        "    public fun transition_case(i: u64): (vector<u8>, bool, vector<u8>, bool, vector<u8>, vector<u8>) {{\n        {}\n        abort 0\n    }}",
+        arms.join("\n        ")
+    )
+    .unwrap();
+    let _ = DEFAULT_ASSET_INTRINSIC_GAS;
 }
 
 #[test]

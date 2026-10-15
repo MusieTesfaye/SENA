@@ -145,12 +145,17 @@ fn whitelisted_asset_vectors() {
         asset: AssetId(1),
         symbol: "USDC".to_owned(),
         rate: 1_000_000,
+        intrinsic_gas: 10_000,
         enabled: true,
     };
-    let hex = vector("asset{1, USDC, 1e6, true}", &record.encode());
+    let hex = vector("asset{1, USDC, 1e6, 10000, true}", &record.encode());
     let expected = {
         let mut w = Writer::new();
-        w.u32(1).string("USDC").u128(1_000_000).bool(true);
+        w.u32(1)
+            .string("USDC")
+            .u128(1_000_000)
+            .u64(10_000)
+            .bool(true);
         hex::encode(w.finish())
     };
     assert_eq!(hex, expected);

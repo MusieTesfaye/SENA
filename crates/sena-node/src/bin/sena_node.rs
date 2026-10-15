@@ -96,6 +96,9 @@ enum Command {
         /// Asset to move, and to pay fees in.
         #[arg(long, default_value_t = 1)]
         asset: u32,
+        /// Tip per gas for the sequencer, in `PRICE_SCALE`ths of a unit.
+        #[arg(long, default_value_t = 0)]
+        tip: u128,
     },
     /// Query a node.
     Query {
@@ -248,7 +251,8 @@ fn main() {
             amount,
             nonce,
             asset,
-        } => send(&rpc, &secret, &to, amount, nonce, asset),
+            tip,
+        } => send(&rpc, &secret, &to, amount, nonce, asset, tip),
         Command::Query { rpc, what } => query(&rpc, &what),
         Command::Relay {
             rpc,
@@ -509,6 +513,34 @@ fn call(rpc: &str, body: &serde_json::Value) -> Result<serde_json::Value, String
         .map_err(|e| format!("response was not JSON: {e}"))
 }
 
+/// What `sena_gasPrice` quotes for an asset.
+struct GasQuote {
+    rate: u128,
+    intrinsic_gas: u64,
+    base_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+}
+
+fn gas_quote(rpc: &str, asset: u32) -> Result<GasQuote, String> {
+    let response = call(
+        rpc,
+        &serde_json::json!({ "method": "sena_gasPrice", "params": { "asset": asset } }),
+    )?;
+    let num = |k: &str| -> Result<u128, String> {
+        response[k]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .or_else(|| response[k].as_u64().map(u128::from))
+            .ok_or_else(|| format!("no gas quote for asset {asset}: {response}"))
+    };
+    Ok(GasQuote {
+        rate: num("rate")?,
+        intrinsic_gas: u64::try_from(num("intrinsic_gas")?).map_err(|e| e.to_string())?,
+        base_fee_per_gas: num("base_fee_per_gas")?,
+        max_fee_per_gas: num("suggested_max_fee_per_gas")?,
+    })
+}
+
 fn send(
     rpc: &str,
     secret: &str,
@@ -516,6 +548,7 @@ fn send(
     amount: u128,
     nonce: u64,
     asset: u32,
+    tip: u128,
 ) -> Result<(), String> {
     let raw = hex::decode(secret.trim()).map_err(|_| "secret is not hex".to_owned())?;
     let bytes: [u8; 32] = raw
@@ -525,17 +558,20 @@ fn send(
 
     let recipient = L2Address::from_hex(to.trim()).map_err(|e| format!("bad recipient: {e}"))?;
 
-    // The rate the sender believes applies. Validated in-trace against the
-    // whitelist, so a wrong value is rejected rather than honoured.
-    let rate = sena_stf::RATE_SCALE;
-    let fee = sena_stf::gas::fee_for(rate).map_err(|e| e.to_string())?;
+    // The asset's rate and intrinsic gas, and the base fee, as the node quotes
+    // them. All three are checked in the trace, so a wrong quote is refused
+    // rather than honoured.
+    let quote = gas_quote(rpc, asset)?;
 
     let mut tx = sena_stf::Transaction {
         sender: L2Address::from_bytes(key.verifying_key().to_bytes()),
         nonce,
         fee_asset: sena_primitives::AssetId(asset),
-        max_fee: fee,
-        fee_rate: rate,
+        fee_rate: quote.rate,
+        fee_intrinsic_gas: quote.intrinsic_gas,
+        gas_limit: 0,
+        max_fee_per_gas: quote.max_fee_per_gas,
+        max_priority_fee_per_gas: tip,
         payload: sena_stf::Payload::Transfer {
             to: recipient,
             asset: sena_primitives::AssetId(asset),
@@ -546,6 +582,12 @@ fn send(
             signature: [0; 64],
         },
     };
+    // Gas is known before execution: the limit is exactly what it uses.
+    tx.gas_limit = sena_stf::gas_required(&tx).map_err(|e| e.to_string())?;
+    println!(
+        "gas {} at up to {} per gas ({} base) in asset {asset}",
+        tx.gas_limit, quote.max_fee_per_gas, quote.base_fee_per_gas
+    );
     let signature = ed25519_dalek::Signer::sign(&key, tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = sena_stf::Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),

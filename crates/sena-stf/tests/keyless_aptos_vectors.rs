@@ -16,7 +16,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use sena_primitives::{AssetId, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::execute::{encode_jwk_record, genesis_credit};
-use sena_stf::gas::fee_for;
 use sena_stf::keyless::{self, KeylessConfig, KeylessError, KeylessSignature};
 use sena_stf::{
     apply, compile, execute_batch, keys, Account, AuthError, Authenticator, BatchContext,
@@ -109,8 +108,11 @@ fn transfer_from(from: L2Address, sig: KeylessSignature, signer: &SigningKey) ->
         sender: from,
         nonce: 0,
         fee_asset: USDC,
-        max_fee: fee_for(RATE_SCALE).unwrap(),
         fee_rate: RATE_SCALE,
+        fee_intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
+        gas_limit: 200_000,
+        max_fee_per_gas: sena_stf::gas::DEFAULT_BASE_FEE_FLOOR,
+        max_priority_fee_per_gas: 0,
         payload: Payload::Transfer {
             to: L2Address::from_bytes([9; 32]),
             asset: USDC,
@@ -140,6 +142,7 @@ fn state(jwk: Option<bool>) -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".into(),
                 rate: RATE_SCALE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },
@@ -158,8 +161,8 @@ fn state(jwk: Option<bool>) -> MerkleTrie {
 
 fn ctx(config: &KeylessConfig) -> BatchContext<'_> {
     BatchContext {
-        timestamp: 1_700_000_000,
         keyless: Some(config),
+        ..BatchContext::without_keyless(1_700_000_000)
     }
 }
 
@@ -318,8 +321,8 @@ fn an_expired_ephemeral_key_is_refused() {
     let config = devnet();
     let tx = signed();
     let late = BatchContext {
-        timestamp: EXP_DATE,
         keyless: Some(&config),
+        ..BatchContext::without_keyless(EXP_DATE)
     };
     assert!(matches!(
         compile(&tx, &late).unwrap_err(),

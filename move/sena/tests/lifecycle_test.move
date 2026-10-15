@@ -26,6 +26,10 @@ module sena::lifecycle_test {
     use sena::disputes;
     use sena::keyless;
 
+    /// The batch header's base fee and tip recipient; posting does not check
+    /// them (the trace does), so any values serve.
+    const BASE_FEE: u128 = 25000000000;
+    const TIPS: vector<u8> = x"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
     const GENESIS_ROOT: vector<u8> = x"1111111111111111111111111111111111111111111111111111111111111111";
     const NEXT_ROOT: vector<u8> = x"2222222222222222222222222222222222222222222222222222222222222222";
     /// Placeholder batch data: these tests exercise the assertion lifecycle,
@@ -104,7 +108,7 @@ module sena::lifecycle_test {
     }
 
     fun commitment(): vector<u8> {
-        batch::header_commitment(0, 1, batch::root_of(&vector[TX], &vector[0]))
+        batch::header_commitment(0, BASE_FEE, TIPS, 1, batch::root_of(&vector[TX], &vector[0]))
     }
 
     fun child_id(): vector<u8> {
@@ -114,7 +118,7 @@ module sena::lifecycle_test {
     fun post_one(proposer: &signer, admin_addr: address) {
         assertions::post(
             proposer, admin_addr, genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, 0, vector[TX], vector[0], TRACE, BOND,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
         );
     }
 
@@ -289,7 +293,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, 0, vector[TX], vector[0], TRACE, BOND - 1,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND - 1,
         );
     }
 
@@ -302,7 +306,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            NEXT_ROOT, NEXT_ROOT, 0, vector[TX], vector[0], TRACE, BOND,
+            NEXT_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
         );
     }
 
@@ -437,7 +441,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, 3600, vector[TX], vector[0], TRACE, BOND,
+            GENESIS_ROOT, NEXT_ROOT, 3600, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
         );
     }
 
@@ -448,7 +452,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, 0, vector[TX], vector[1], TRACE, BOND,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[1], TRACE, BOND,
         );
     }
 
@@ -459,7 +463,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, 0, vector::empty(), vector::empty(), 0, BOND,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector::empty(), vector::empty(), 0, BOND,
         );
     }
 }

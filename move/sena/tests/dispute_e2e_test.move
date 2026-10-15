@@ -42,8 +42,8 @@ module sena::dispute_e2e_test {
         let n = v::compile_case_count();
         let i = 0;
         while (i < n) {
-            let (bytes, ts, setup, expected_ok, expected_program, expected_digest) = v::compile_case(i);
-            let (ok, program) = compiler::compile(bytes, ts, setup);
+            let (bytes, ts, setup, expected_ok, expected_program, expected_digest, base_fee) = v::compile_case(i);
+            let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup);
             assert!(ok == expected_ok, 1000 + i);
             if (ok) {
                 assert!(vector::length(&program) == vector::length(&expected_program), 2000 + i);
@@ -67,9 +67,9 @@ module sena::dispute_e2e_test {
 
     #[test]
     fun council_verification_consumes_the_epoch_as_the_node_does() {
-        // Case 11 is the council-signed SetJwk; its fifth step is VerifyCouncil.
-        let (bytes, ts, setup, _, _, _) = v::compile_case(11);
-        let (ok, program) = compiler::compile(bytes, ts, setup);
+        // The council-signed SetJwk; its fifth step is VerifyCouncil.
+        let (bytes, ts, setup, _, _, _, base_fee) = v::compile_case(v::council_case());
+        let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup);
         assert!(ok, 0);
         let verify = vector::borrow(&program, 4);
         assert!(osp::encode_instruction(verify) == v::council_instruction(), 1);
@@ -79,6 +79,25 @@ module sena::dispute_e2e_test {
         // Replaying the same signed payload against the advanced council fails.
         let (ok, _) = osp::transition(verify, true, after);
         assert!(!ok, 4);
+    }
+
+    #[test]
+    /// Every fee step -- the base fee charge and its EIP-1559 roll, the fee
+    /// market's governance, the asset check, the breaker, the fee split, and
+    /// the council's guardian path -- reaches exactly the node's result.
+    fun the_fee_steps_match_the_node_on_every_case() {
+        let n = v::transition_case_count();
+        let i = 0;
+        while (i < n) {
+            let (encoded, present, current, expected_ok, expected, slot) = v::transition_case(i);
+            let instruction = osp::decode_instruction(encoded);
+            assert!(osp::encode_instruction(&instruction) == encoded, 5000 + i);
+            assert!(osp::slot_of(&instruction) == slot, 6000 + i);
+            let (ok, updated) = osp::transition(&instruction, present, current);
+            assert!(ok == expected_ok, 7000 + i);
+            if (ok) { assert!(updated == expected, 8000 + i) };
+            i = i + 1;
+        };
     }
 
     #[test]
@@ -151,11 +170,13 @@ module sena::dispute_e2e_test {
         trace_length: u64,
     ): vector<u8> {
         let commitment = batch::header_commitment(
-            v::batch_timestamp(), vector::length(&txs), batch::root_of(&txs, &starts)
+            v::batch_timestamp(), v::batch_base_fee(), v::batch_fee_recipient(),
+            vector::length(&txs), batch::root_of(&txs, &starts)
         );
         assertions::post(
             proposer, admin_addr, genesis_id(), v::genesis_root(), post_root,
-            v::batch_timestamp(), txs, starts, trace_length, BOND,
+            v::batch_timestamp(), v::batch_base_fee(), v::batch_fee_recipient(),
+            txs, starts, trace_length, BOND,
         );
         assertions::assertion_id(genesis_id(), 0, v::genesis_root(), post_root, commitment, trace_length, BOND)
     }
@@ -295,7 +316,9 @@ module sena::dispute_e2e_test {
         verify_keyless(challenger, admin_addr, tx);
         let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, v::batch_timestamp(), setup));
         assert!(done && ok, 0);
-        let (inline_ok, _) = compiler::compile(tx, v::batch_timestamp(), setup);
+        let (inline_ok, _) = compiler::compile(
+            tx, v::batch_timestamp(), v::batch_base_fee(), v::batch_fee_recipient(), setup
+        );
         assert!(inline_ok, 1);
 
         // At a batch time past the ephemeral key's expiry, both refuse; the
@@ -304,7 +327,7 @@ module sena::dispute_e2e_test {
         keyless_jobs::start(challenger, admin_addr, tx, late, setup);
         let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, late, setup));
         assert!(done && !ok, 2);
-        let (inline_ok, _) = compiler::compile(tx, late, setup);
+        let (inline_ok, _) = compiler::compile(tx, late, v::batch_base_fee(), v::batch_fee_recipient(), setup);
         assert!(!inline_ok, 3);
     }
 

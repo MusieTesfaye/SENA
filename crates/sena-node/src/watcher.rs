@@ -277,10 +277,13 @@ impl<C: L1> Watcher<C> {
             .map_err(WatchError::State)
     }
 
-    fn ctx(&self, timestamp: u64) -> BatchContext<'_> {
+    /// The context a published batch executes in, from its header.
+    fn ctx(&self, batch: &l1::PublishedBatch) -> BatchContext<'_> {
         BatchContext {
-            timestamp,
+            timestamp: batch.timestamp,
             keyless: self.config.keyless.as_deref(),
+            base_fee: batch.base_fee,
+            fee_recipient: batch.fee_recipient,
         }
     }
 
@@ -323,9 +326,9 @@ impl<C: L1> Watcher<C> {
                     None => {
                         let batch = self.batch(&id, &rec)?;
                         let txs = decode_all(&batch.tx_bytes).unwrap_or_default();
-                        let r = replay(&self.replica, &txs, &self.ctx(rec.timestamp)).map_err(
-                            |_| WatchError::State("a verified batch stopped replaying".into()),
-                        )?;
+                        let r = replay(&self.replica, &txs, &self.ctx(&batch)).map_err(|_| {
+                            WatchError::State("a verified batch stopped replaying".into())
+                        })?;
                         self.replica = r.post;
                         self.state.head = hex::encode(&id);
                         report.verified += 1;
@@ -363,7 +366,7 @@ impl<C: L1> Watcher<C> {
                 "an assertion on our head starts elsewhere".into(),
             ));
         }
-        let r = match replay(&self.replica, &txs, &self.ctx(rec.timestamp)) {
+        let r = match replay(&self.replica, &txs, &self.ctx(&batch)) {
             Ok(r) => r,
             Err(i) => return Ok(Some(Fault::Uncompilable(i))),
         };
@@ -568,7 +571,7 @@ impl<C: L1> Watcher<C> {
                 .map_err(|_| WatchError::State("game over undecodable data".into()))?;
             let pre = MerkleTrie::from_bytes(&unhex(&game.pre_state))
                 .map_err(|e| WatchError::State(e.to_string()))?;
-            let r = replay(&pre, &txs, &self.ctx(rec.timestamp))
+            let r = replay(&pre, &txs, &self.ctx(&batch))
                 .map_err(|_| WatchError::State("game over uncompilable data".into()))?;
             let contract = self.l1.contract();
             if d.turn == 1 && d.stage == 0 && d.has_offer {

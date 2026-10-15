@@ -35,9 +35,17 @@ module sena::batch {
     }
 
     /// The header commitment an assertion carries.
-    public fun header_commitment(timestamp: u64, tx_count: u64, tx_root: vector<u8>): vector<u8> {
+    public fun header_commitment(
+        timestamp: u64,
+        base_fee: u128,
+        fee_recipient: vector<u8>,
+        tx_count: u64,
+        tx_root: vector<u8>,
+    ): vector<u8> {
         let buf = codec::begin(DOMAIN_BATCH);
         codec::put_field_u64(&mut buf, timestamp);
+        codec::put_field_u128(&mut buf, base_fee);
+        codec::put_field(&mut buf, fee_recipient);
         codec::put_field_u64(&mut buf, tx_count);
         codec::put_field(&mut buf, tx_root);
         codec::commit(buf)

@@ -8,6 +8,7 @@ use sena_primitives::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::gas::FeeSplit;
 use crate::governance::{CouncilSignature, GovernanceUpdate};
 use crate::keyless::{self, KeylessContext, KeylessError, KeylessSignature};
 
@@ -53,6 +54,18 @@ pub enum Payload {
         /// Council signatures over the update digest.
         signatures: Vec<CouncilSignature>,
     },
+    /// Pay `amount` of collected fees out of the fee vault according to the
+    /// fee split in force (Celo's `FeeHandler.distribute`). Permissionless:
+    /// the split decides who is paid, and the sender pays only its own fee.
+    DistributeFees {
+        /// The asset to distribute.
+        asset: AssetId,
+        /// How much of it to take from the vault.
+        #[serde(with = "u128_string")]
+        amount: u128,
+        /// The split the sender believes is in force; checked in the trace.
+        split: FeeSplit,
+    },
 }
 
 /// How a transaction proves it was authorised.
@@ -80,11 +93,8 @@ pub struct Transaction {
     pub sender: L2Address,
     /// The sender's expected nonce. Must equal the account's current nonce.
     pub nonce: u64,
-    /// The asset the fee is paid in (REQ-GAS-001).
+    /// The asset the fee is paid in (REQ-GAS-001) — Celo's `feeCurrency`.
     pub fee_asset: AssetId,
-    /// The maximum fee the sender will pay, in units of `fee_asset`.
-    #[serde(with = "u128_string")]
-    pub max_fee: u128,
     /// The exchange rate the sender believes applies to `fee_asset`, in units
     /// per [`RATE_SCALE`](crate::gas::RATE_SCALE) native units.
     ///
@@ -94,6 +104,18 @@ pub struct Transaction {
     /// [`crate::gas`].
     #[serde(with = "u128_string")]
     pub fee_rate: u128,
+    /// The intrinsic gas the sender believes `fee_asset` charges; checked in
+    /// the trace alongside the rate.
+    pub fee_intrinsic_gas: u64,
+    /// The most gas the transaction may use.
+    pub gas_limit: u64,
+    /// The most the sender pays per gas, base fee and tip together, in
+    /// [`PRICE_SCALE`](crate::gas::PRICE_SCALE)ths of a unit of `fee_asset`.
+    #[serde(with = "u128_string")]
+    pub max_fee_per_gas: u128,
+    /// The most tip the sender pays per gas, in the same units.
+    #[serde(with = "u128_string")]
+    pub max_priority_fee_per_gas: u128,
     /// What to do.
     pub payload: Payload,
     /// Proof of authorisation.
@@ -139,8 +161,11 @@ impl Transaction {
                 .field(self.sender.as_bytes())
                 .u64(self.nonce)
                 .u64(u64::from(self.fee_asset.get()))
-                .u128(self.max_fee)
                 .u128(self.fee_rate)
+                .u64(self.fee_intrinsic_gas)
+                .u64(self.gas_limit)
+                .u128(self.max_fee_per_gas)
+                .u128(self.max_priority_fee_per_gas)
                 .field(&payload),
         )
     }

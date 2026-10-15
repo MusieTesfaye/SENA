@@ -253,6 +253,10 @@ pub fn assemble(
 
 /// Signs `tx` with the session's ephemeral key under `signature`, setting
 /// the sender to the keyless address.
+///
+/// Keyless verification costs gas of its own, so the gas limit is raised to
+/// what the keyless transaction needs if it is below it; the price caps are
+/// left as they are.
 #[must_use]
 pub fn sign(
     mut tx: Transaction,
@@ -262,6 +266,9 @@ pub fn sign(
     tx.sender = signature.address();
     signature.ephemeral_signature = [0; 64];
     tx.authenticator = Authenticator::Keyless(Box::new(signature.clone()));
+    if let Ok(required) = sena_stf::gas_required(&tx) {
+        tx.gas_limit = tx.gas_limit.max(required);
+    }
     signature.ephemeral_signature = session.key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Keyless(Box::new(signature));
     tx
@@ -511,8 +518,11 @@ mod tests {
             sender: L2Address::from_bytes([0; 32]),
             nonce: 0,
             fee_asset: sena_primitives::AssetId(1),
-            max_fee: 1,
-            fee_rate: sena_stf::RATE_SCALE,
+            fee_rate: 0,
+            fee_intrinsic_gas: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
             payload: Payload::Transfer {
                 to: L2Address::from_bytes([9; 32]),
                 asset: sena_primitives::AssetId(1),
@@ -523,6 +533,8 @@ mod tests {
                 signature: [0; 64],
             },
         };
+        let mut tx = tx;
+        sena_stf::gas::fill_default_fees(&mut tx);
         let tx = sign(tx, &s, sig);
         let config = KeylessConfig::aptos_devnet_insecure();
         let ctx = KeylessContext {

@@ -13,7 +13,7 @@ use sena_primitives::{
     AssetId, Channel, DecodeError, Hash256, HashedIdentifier, L2Address, Reader, Writer,
 };
 
-use crate::gas::WhitelistedAsset;
+use crate::gas::{FeeSplit, WhitelistedAsset};
 use crate::governance::{CouncilSignature, GovernanceUpdate};
 use crate::keyless::KeylessSignature;
 use crate::transaction::{Authenticator, Payload, Transaction};
@@ -49,9 +49,13 @@ mod tag {
     pub const BIND_IDENTIFIER: u8 = 1;
     pub const UNBIND_IDENTIFIER: u8 = 2;
     pub const GOVERNANCE: u8 = 3;
+    pub const DISTRIBUTE_FEES: u8 = 4;
     pub const SET_GAS_ASSET: u8 = 0;
     pub const SET_PARAMETER: u8 = 1;
     pub const SET_JWK: u8 = 2;
+    pub const SET_FEE_MARKET: u8 = 3;
+    pub const SET_FEE_SPLIT: u8 = 4;
+    pub const DISABLE_GAS_ASSET: u8 = 5;
 }
 
 fn write_keyless(w: &mut Writer, sig: &KeylessSignature) {
@@ -113,7 +117,30 @@ pub(crate) fn write_update(w: &mut Writer, update: &GovernanceUpdate) {
             w.bytes32(jwk_hash);
             w.bool(*active);
         }
+        GovernanceUpdate::SetFeeMarket { floor, target } => {
+            w.u8(tag::SET_FEE_MARKET);
+            w.u128(*floor);
+            w.u64(*target);
+        }
+        GovernanceUpdate::SetFeeSplit { split } => {
+            w.u8(tag::SET_FEE_SPLIT);
+            w.bytes(&split.encode());
+        }
+        GovernanceUpdate::DisableGasAsset { asset } => {
+            w.u8(tag::DISABLE_GAS_ASSET);
+            w.u32(asset.get());
+        }
     }
+}
+
+/// Reads a length-prefixed fee split, requiring the canonical encoding.
+fn read_split(r: &mut Reader<'_>, variant: u8) -> Result<FeeSplit, DecodeError> {
+    let bytes = r.bytes()?;
+    let split = FeeSplit::decode(&bytes).map_err(|_| DecodeError::UnknownVariant(variant))?;
+    if split.encode() != bytes {
+        return Err(DecodeError::UnknownVariant(variant));
+    }
+    Ok(split)
 }
 
 fn read_update(r: &mut Reader<'_>) -> Result<GovernanceUpdate, DecodeError> {
@@ -136,6 +163,16 @@ fn read_update(r: &mut Reader<'_>) -> Result<GovernanceUpdate, DecodeError> {
             iss_hash: r.bytes32()?,
             jwk_hash: r.bytes32()?,
             active: r.bool()?,
+        },
+        tag::SET_FEE_MARKET => GovernanceUpdate::SetFeeMarket {
+            floor: r.u128()?,
+            target: r.u64()?,
+        },
+        tag::SET_FEE_SPLIT => GovernanceUpdate::SetFeeSplit {
+            split: read_split(r, tag::SET_FEE_SPLIT)?,
+        },
+        tag::DISABLE_GAS_ASSET => GovernanceUpdate::DisableGasAsset {
+            asset: AssetId(r.u32()?),
         },
         other => return Err(DecodeError::UnknownVariant(other)),
     })
@@ -177,6 +214,16 @@ pub(crate) fn write_payload(w: &mut Writer, payload: &Payload) {
                 w.u32(signature.index);
                 w.bytes(&signature.signature);
             }
+        }
+        Payload::DistributeFees {
+            asset,
+            amount,
+            split,
+        } => {
+            w.u8(tag::DISTRIBUTE_FEES);
+            w.u32(asset.get());
+            w.u128(*amount);
+            w.bytes(&split.encode());
         }
     }
 }
@@ -222,6 +269,11 @@ fn read_payload(r: &mut Reader<'_>) -> Result<Payload, WireError> {
                 signatures,
             }
         }
+        tag::DISTRIBUTE_FEES => Payload::DistributeFees {
+            asset: AssetId(r.u32()?),
+            amount: r.u128()?,
+            split: read_split(r, tag::DISTRIBUTE_FEES)?,
+        },
         other => return Err(DecodeError::UnknownVariant(other).into()),
     })
 }
@@ -233,8 +285,11 @@ pub fn encode(tx: &Transaction) -> Vec<u8> {
     w.bytes32(tx.sender.as_bytes());
     w.u64(tx.nonce);
     w.u32(tx.fee_asset.get());
-    w.u128(tx.max_fee);
     w.u128(tx.fee_rate);
+    w.u64(tx.fee_intrinsic_gas);
+    w.u64(tx.gas_limit);
+    w.u128(tx.max_fee_per_gas);
+    w.u128(tx.max_priority_fee_per_gas);
     let mut payload = Writer::new();
     write_payload(&mut payload, &tx.payload);
     w.bytes(&payload.finish());
@@ -269,8 +324,11 @@ pub fn decode(bytes: &[u8]) -> Result<Transaction, WireError> {
     let sender = L2Address::from_bytes(r.bytes32()?);
     let nonce = r.u64()?;
     let fee_asset = AssetId(r.u32()?);
-    let max_fee = r.u128()?;
     let fee_rate = r.u128()?;
+    let fee_intrinsic_gas = r.u64()?;
+    let gas_limit = r.u64()?;
+    let max_fee_per_gas = r.u128()?;
+    let max_priority_fee_per_gas = r.u128()?;
     let payload_bytes = r.bytes()?;
     let mut pr = Reader::new(&payload_bytes);
     let payload = read_payload(&mut pr)?;
@@ -288,8 +346,11 @@ pub fn decode(bytes: &[u8]) -> Result<Transaction, WireError> {
         sender,
         nonce,
         fee_asset,
-        max_fee,
         fee_rate,
+        fee_intrinsic_gas,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
         payload,
         authenticator,
     };
@@ -310,8 +371,11 @@ mod tests {
             sender: L2Address::from_bytes([1; 32]),
             nonce: 7,
             fee_asset: AssetId(1),
-            max_fee: 1_000,
             fee_rate: 1_000_000,
+            fee_intrinsic_gas: 10_000,
+            gas_limit: 50_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
             payload: Payload::Transfer {
                 to: L2Address::from_bytes([2; 32]),
                 asset: AssetId(1),
@@ -344,6 +408,23 @@ mod tests {
             }],
         };
         txs.push(gov);
+        let mut distribute = transfer();
+        distribute.payload = Payload::DistributeFees {
+            asset: AssetId(1),
+            amount: 9,
+            split: FeeSplit {
+                beneficiaries: vec![(L2Address::from_bytes([7; 32]), 1_000_000)],
+                burn: 0,
+            },
+        };
+        txs.push(distribute);
+        let mut guardian = transfer();
+        guardian.payload = Payload::Governance {
+            epoch: 0,
+            update: GovernanceUpdate::DisableGasAsset { asset: AssetId(1) },
+            signatures: vec![],
+        };
+        txs.push(guardian);
         for tx in txs {
             assert_eq!(decode(&encode(&tx)).unwrap(), tx);
         }

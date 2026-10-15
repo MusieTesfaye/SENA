@@ -24,6 +24,11 @@ pub struct DaBlob {
     /// The batch timestamp, part of the batch data (keyless expiry is judged
     /// against it).
     pub timestamp: u64,
+    /// The base fee per gas the batch paid.
+    #[serde(with = "sena_primitives::serde_hex::u128_string")]
+    pub base_fee: u128,
+    /// Where the batch's tips went.
+    pub fee_recipient: sena_primitives::L2Address,
     /// Root before the batch.
     pub pre_state_root: Hash256,
     /// Asserted root after the batch.
@@ -44,6 +49,8 @@ impl DaBlob {
         Self {
             height: block.height,
             timestamp: block.timestamp,
+            base_fee: block.base_fee,
+            fee_recipient: block.fee_recipient,
             pre_state_root: block.pre_state_root,
             post_state_root: block.post_state_root,
             batch_commitment: block.batch_commitment(),
@@ -62,7 +69,13 @@ impl DaBlob {
             .map(|(start, tx)| (*start, tx.encode()))
             .collect();
         let tree = BatchTree::build(&leaves);
-        header_commitment(self.timestamp, tree.tx_count(), &tree.root())
+        header_commitment(
+            self.timestamp,
+            self.base_fee,
+            &self.fee_recipient,
+            tree.tx_count(),
+            &tree.root(),
+        )
     }
 
     /// Whether the stated commitment matches the contents.
@@ -99,6 +112,8 @@ impl DaBlob {
         let ctx = BatchContext {
             timestamp: self.timestamp,
             keyless,
+            base_fee: self.base_fee,
+            fee_recipient: self.fee_recipient,
         };
         let trace = execute_batch(starting_state, &ctx, &self.transactions)
             .map_err(|e| format!("batch execution failed: {e}"))?;
@@ -182,7 +197,6 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use sena_primitives::{AssetId, L2Address};
-    use sena_stf::gas::fee_for;
     use sena_stf::{Authenticator, Payload, RATE_SCALE};
 
     const USDC: AssetId = AssetId(1);
@@ -196,13 +210,15 @@ mod tests {
     }
 
     fn signed_tx(key: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
-        let rate = RATE_SCALE;
         let mut tx = Transaction {
             sender: address_of(key),
             nonce,
             fee_asset: USDC,
-            max_fee: fee_for(rate).unwrap(),
-            fee_rate: rate,
+            fee_rate: 0,
+            fee_intrinsic_gas: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
             payload: Payload::Transfer {
                 to,
                 asset: USDC,
@@ -213,6 +229,7 @@ mod tests {
                 signature: [0; 64],
             },
         };
+        sena_stf::gas::fill_default_fees(&mut tx);
         let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
         tx.authenticator = Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
@@ -237,6 +254,7 @@ mod tests {
                 asset: 1,
                 symbol: "USDC".to_string(),
                 rate: RATE_SCALE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             }],
             allocations: vec![Allocation {
@@ -246,6 +264,8 @@ mod tests {
             }],
             council: None,
             keyless: None,
+            fee_market: None,
+            fee_split: None,
         };
 
         let starting_state = genesis.build_state().unwrap();
@@ -263,9 +283,17 @@ mod tests {
         let da_blob = DaBlob {
             height: 1,
             timestamp: ctx.timestamp,
+            base_fee: ctx.base_fee,
+            fee_recipient: ctx.fee_recipient,
             pre_state_root: pre_root,
             post_state_root: post_root,
-            batch_commitment: header_commitment(ctx.timestamp, tree.tx_count(), &tree.root()),
+            batch_commitment: header_commitment(
+                ctx.timestamp,
+                ctx.base_fee,
+                &ctx.fee_recipient,
+                tree.tx_count(),
+                &tree.root(),
+            ),
             transactions,
             tx_starts: trace.tx_starts.clone(),
         };

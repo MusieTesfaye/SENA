@@ -378,7 +378,9 @@ module sena::disputes {
             E_BAD_LEAF
         );
 
-        let (compiles, program) = compile_leaf(registry_addr, tx_bytes, batch_time, keyless_setup);
+        let (compiles, program) = compile_leaf(
+            registry_addr, chain_addr, assertion, tx_bytes, batch_time, keyless_setup
+        );
         let winner = if (!compiles) {
             PARTY_CHALLENGER
         } else {
@@ -413,18 +415,24 @@ module sena::disputes {
     /// under this registry's setup, which must already exist.
     fun compile_leaf(
         registry_addr: address,
+        chain_addr: address,
+        assertion: vector<u8>,
         tx_bytes: vector<u8>,
         batch_time: u64,
         keyless_setup: u8,
     ): (bool, vector<osp::Instruction>) {
+        // The rest of the batch header the transaction compiles against.
+        let (base_fee, fee_recipient) = assertions::fee_header(chain_addr, assertion);
         if (!compiler::is_keyless(tx_bytes)) {
-            return compiler::compile(tx_bytes, batch_time, keyless_setup)
+            return compiler::compile(tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup)
         };
         let (done, verdict) = keyless_jobs::verdict(
             registry_addr, keyless_jobs::job_id(tx_bytes, batch_time, keyless_setup)
         );
         assert!(done, E_KEYLESS_NOT_VERIFIED);
-        compiler::compile_with_keyless_verdict(tx_bytes, batch_time, keyless_setup, verdict)
+        compiler::compile_with_keyless_verdict(
+            tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, verdict
+        )
     }
 
     // --- Batch-structure fraud proofs ----------------------------------------
@@ -438,6 +446,8 @@ module sena::disputes {
 
     fun leaf_program(
         registry_addr: address,
+        chain_addr: address,
+        assertion: vector<u8>,
         tx_root: vector<u8>,
         tx_count: u64,
         batch_time: u64,
@@ -448,7 +458,9 @@ module sena::disputes {
         siblings: &vector<vector<u8>>,
     ): (bool, u64) {
         assert!(batch::proves(tx_root, tx_count, index, start_pc, tx_bytes, siblings), E_BAD_LEAF);
-        let (ok, program) = compile_leaf(registry_addr, tx_bytes, batch_time, keyless_setup);
+        let (ok, program) = compile_leaf(
+            registry_addr, chain_addr, assertion, tx_bytes, batch_time, keyless_setup
+        );
         (ok, vector::length(&program))
     }
 
@@ -481,7 +493,9 @@ module sena::disputes {
             (r.chain, r.keyless_setup)
         };
         let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
-        let (ok, _) = leaf_program(registry_addr, tx_root, tx_count, batch_time, keyless_setup, index, start_pc, tx_bytes, &siblings);
+        let (ok, _) = leaf_program(
+            registry_addr, chain_addr, assertion, tx_root, tx_count, batch_time, keyless_setup, index, start_pc, tx_bytes, &siblings
+        );
         assert!(!ok, E_NOT_FRAUD);
         apply_structural_win(registry_addr, chain_addr, assertion, who);
     }
@@ -506,7 +520,9 @@ module sena::disputes {
             (r.chain, r.keyless_setup)
         };
         let (_, _, _, batch_time, tx_count, tx_root, _, _) = assertions::dispute_view(chain_addr, assertion);
-        let (ok_a, len_a) = leaf_program(registry_addr, tx_root, tx_count, batch_time, keyless_setup, index, start_a, tx_a, &siblings_a);
+        let (ok_a, len_a) = leaf_program(
+            registry_addr, chain_addr, assertion, tx_root, tx_count, batch_time, keyless_setup, index, start_a, tx_a, &siblings_a
+        );
         assert!(
             batch::proves(tx_root, tx_count, index + 1, start_b, tx_b, &siblings_b),
             E_BAD_LEAF
@@ -533,7 +549,7 @@ module sena::disputes {
         let (_, _, _, batch_time, tx_count, tx_root, trace_length, _) = assertions::dispute_view(chain_addr, assertion);
         assert!(tx_count > 0, E_NOT_FRAUD);
         let (ok, len) = leaf_program(
-            registry_addr, tx_root, tx_count, batch_time, keyless_setup, tx_count - 1, start_pc, tx_bytes, &siblings
+            registry_addr, chain_addr, assertion, tx_root, tx_count, batch_time, keyless_setup, tx_count - 1, start_pc, tx_bytes, &siblings
         );
         assert!(!ok || start_pc + len != trace_length, E_NOT_FRAUD);
         apply_structural_win(registry_addr, chain_addr, assertion, who);

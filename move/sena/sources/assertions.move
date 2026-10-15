@@ -104,6 +104,8 @@ module sena::assertions {
     struct BatchPublished has drop, store {
         assertion: vector<u8>,
         timestamp: u64,
+        base_fee: u128,
+        fee_recipient: vector<u8>,
         tx_bytes: vector<vector<u8>>,
         tx_starts: vector<u64>,
     }
@@ -122,6 +124,10 @@ module sena::assertions {
         batch_commitment: vector<u8>,
         /// The batch header the commitment is computed from.
         timestamp: u64,
+        /// The base fee per gas the batch declared, checked in its trace.
+        base_fee: u128,
+        /// Where the batch's tips go: an L2 address.
+        fee_recipient: vector<u8>,
         tx_count: u64,
         tx_root: vector<u8>,
         trace_length: u64,
@@ -217,6 +223,8 @@ module sena::assertions {
             post_state_root: genesis_root,
             batch_commitment: zero,
             timestamp: 0,
+            base_fee: 0,
+            fee_recipient: zero,
             tx_count: 0,
             tx_root: zero,
             trace_length: 0,
@@ -297,12 +305,15 @@ module sena::assertions {
         pre_state_root: vector<u8>,
         post_state_root: vector<u8>,
         timestamp: u64,
+        base_fee: u128,
+        fee_recipient: vector<u8>,
         tx_bytes: vector<vector<u8>>,
         tx_starts: vector<u64>,
         trace_length: u64,
         bond: u128,
     ) acquires Chain {
         let tx_count = vector::length(&tx_bytes);
+        assert!(vector::length(&fee_recipient) == 32, E_BAD_BATCH_DATA);
         check_batch_shape(&tx_starts, tx_count, trace_length, &pre_state_root, &post_state_root);
         let proposer_addr = signer::address_of(proposer);
         let chain = borrow_global_mut<Chain>(chain_addr);
@@ -325,7 +336,9 @@ module sena::assertions {
         // leaves no one can open, and steps covered by them could never be
         // adjudicated. Publishing the data makes every leaf provable.
         let tx_root = sena::batch::root_of(&tx_bytes, &tx_starts);
-        let batch_commitment = sena::batch::header_commitment(timestamp, tx_count, tx_root);
+        let batch_commitment = sena::batch::header_commitment(
+            timestamp, base_fee, fee_recipient, tx_count, tx_root
+        );
 
         let id = assertion_id(
             parent, 0, pre_state_root, post_state_root, batch_commitment, trace_length, bond
@@ -343,6 +356,8 @@ module sena::assertions {
             post_state_root,
             batch_commitment,
             timestamp,
+            base_fee,
+            fee_recipient,
             tx_count,
             tx_root,
             trace_length,
@@ -353,7 +368,7 @@ module sena::assertions {
         });
         vector::push_back(&mut chain.order, id);
 
-        event::emit(BatchPublished { assertion: id, timestamp, tx_bytes, tx_starts });
+        event::emit(BatchPublished { assertion: id, timestamp, base_fee, fee_recipient, tx_bytes, tx_starts });
     }
 
     /// Checks the shape of published batch data that L1 can check without
@@ -593,6 +608,15 @@ module sena::assertions {
             r.proposer, r.pre_state_root, r.post_state_root, r.timestamp, r.tx_count,
             r.tx_root, r.trace_length, r.status,
         )
+    }
+
+    /// The fee half of an assertion's batch header: `(base_fee,
+    /// fee_recipient)`, which a disputed transaction compiles against.
+    public fun fee_header(chain_addr: address, id: vector<u8>): (u128, vector<u8>) acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        let r = table::borrow(&chain.assertions, id);
+        (r.base_fee, r.fee_recipient)
     }
 
     /// Whether `who` has an open, bonded challenge against `id`.

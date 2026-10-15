@@ -16,7 +16,6 @@ use sena_fraudproof::bisection::{Dispute, Opening, Stage};
 use sena_fraudproof::{AssertionId, PartyId, TracePlayer};
 use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::{MerkleTrie, Terminal};
-use sena_stf::gas::fee_for;
 use sena_stf::keyless::{aptos_sample, KeylessConfig};
 use sena_stf::{
     apply, execute_batch, Authenticator, BatchContext, ExecutionTrace, Instruction, MachineState,
@@ -35,12 +34,15 @@ fn addr(k: &SigningKey) -> L2Address {
 }
 
 fn base(sender: L2Address, nonce: u64, to: L2Address, amount: u128) -> Transaction {
-    Transaction {
+    let mut tx = Transaction {
         sender,
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE_SCALE).unwrap(),
-        fee_rate: RATE_SCALE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload: Payload::Transfer {
             to,
             asset: USDC,
@@ -50,7 +52,9 @@ fn base(sender: L2Address, nonce: u64, to: L2Address, amount: u128) -> Transacti
             public_key: [0; 32],
             signature: [0; 64],
         },
-    }
+    };
+    sena_stf::gas::fill_default_fees(&mut tx);
+    tx
 }
 
 fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
@@ -67,6 +71,8 @@ fn keyless_transfer(to: L2Address, amount: u128) -> Transaction {
     let sig = aptos_sample::signature();
     let mut tx = base(sig.address(), 0, to, amount);
     tx.authenticator = Authenticator::Keyless(Box::new(sig));
+    // Keyless verification costs gas of its own.
+    sena_stf::gas::fill_default_fees(&mut tx);
     let esk = SigningKey::from_bytes(&aptos_sample::ephemeral_secret_key());
     let s = esk.sign(tx.signing_digest().as_bytes()).to_bytes();
     if let Authenticator::Keyless(k) = &mut tx.authenticator {
@@ -81,6 +87,7 @@ fn genesis() -> MerkleTrie {
         asset: USDC,
         symbol: "USDC".into(),
         rate: RATE_SCALE,
+        intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
         enabled: true,
     };
     apply(&mut trie, &Instruction::SetGasAsset { record }).unwrap();
@@ -120,8 +127,8 @@ fn main() {
         .expect("a unix timestamp");
     let devnet = KeylessConfig::aptos_devnet_insecure();
     let ctx = BatchContext {
-        timestamp,
         keyless: Some(&devnet),
+        ..BatchContext::without_keyless(timestamp)
     };
 
     let bob = addr(&key(2));
@@ -203,6 +210,8 @@ fn main() {
     let plan = json!({
         "genesis_root": hx(pre.root().as_bytes()),
         "timestamp": timestamp,
+        "base_fee": ctx.base_fee.to_string(),
+        "fee_recipient": hx(ctx.fee_recipient.as_bytes()),
         "txs": txs.iter().map(|t| hx(&t.encode())).collect::<Vec<_>>(),
         "starts": honest.tx_starts,
         "trace_length": len,

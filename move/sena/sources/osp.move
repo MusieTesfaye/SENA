@@ -24,6 +24,7 @@ module sena::osp {
     use sena::codec;
     use sena::keyless;
     use sena::trie;
+    use sena::gas;
 
     /// The witness described a slot the instruction does not touch.
     const E_WITNESS_SLOT_MISMATCH: u64 = 20;
@@ -44,6 +45,11 @@ module sena::osp {
     const OP_SET_PARAMETER: u8 = 8;
     const OP_VERIFY_JWK: u8 = 9;
     const OP_SET_JWK: u8 = 10;
+    const OP_CHARGE_BASE_FEE: u8 = 11;
+    const OP_VERIFY_FEE_SPLIT: u8 = 12;
+    const OP_SET_FEE_SPLIT: u8 = 13;
+    const OP_SET_FEE_MARKET: u8 = 14;
+    const OP_DISABLE_GAS_ASSET: u8 = 15;
 
     const TAG_BOUND: u8 = 0;
     const TAG_VACANT: u8 = 1;
@@ -58,6 +64,8 @@ module sena::osp {
     const REGION_PARAMETER: vector<u8> = b"SENA:v1:state:parameter";
     const REGION_COUNCIL: vector<u8> = b"SENA:v1:state:council";
     const REGION_JWK: vector<u8> = b"SENA:v1:state:jwk";
+    const REGION_FEE_MARKET: vector<u8> = b"SENA:v1:state:fee-market";
+    const REGION_FEE_SPLIT: vector<u8> = b"SENA:v1:state:fee-split";
 
     /// Outcome of adjudication: the defender's claimed post-state is right.
     const DEFENDER_WINS: u8 = 0;
@@ -88,13 +96,20 @@ module sena::osp {
         account: vector<u8>,
         /// Bind/Unbind: the hashed identifier.
         identifier: vector<u8>,
-        /// Debit/Credit/VerifyGasAsset/SetGasAsset: the asset.
+        /// Debit/Credit/VerifyGasAsset/SetGasAsset/DisableGasAsset: the asset.
         asset: u32,
         /// Debit/Credit: the amount. VerifyGasAsset/SetGasAsset: the rate.
-        /// SetParameter: the value.
+        /// SetParameter: the value. ChargeBaseFee: the base fee.
+        /// SetFeeMarket: the floor.
         amount: u128,
         /// ConsumeNonce: the expected nonce. VerifyCouncil: the epoch.
+        /// ChargeBaseFee: the batch timestamp.
         nonce: u64,
+        /// VerifyGasAsset/SetGasAsset: the intrinsic gas. ChargeBaseFee: the
+        /// gas charged. SetFeeMarket: the target.
+        gas: u64,
+        /// VerifyFeeSplit/SetFeeSplit: the split's canonical bytes.
+        split: vector<u8>,
         /// VerifyCouncil: the signed update digest.
         digest: vector<u8>,
         /// VerifyCouncil: signer indices and signatures, in order.
@@ -102,7 +117,7 @@ module sena::osp {
         signatures: vector<vector<u8>>,
         /// SetGasAsset: the symbol. SetParameter: the name.
         text: vector<u8>,
-        /// SetGasAsset: enabled. SetJwk: active.
+        /// SetGasAsset: enabled. SetJwk: active. VerifyCouncil: guardian.
         flag: bool,
         /// VerifyJwk/SetJwk.
         iss_hash: vector<u8>,
@@ -123,6 +138,8 @@ module sena::osp {
             asset: 0,
             amount: 0,
             nonce: 0,
+            gas: 0,
+            split: vector::empty(),
             digest: vector::empty(),
             signer_indices: vector::empty(),
             signatures: vector::empty(),
@@ -148,21 +165,42 @@ module sena::osp {
     public fun unbind_identifier(identifier: vector<u8>, expected_owner: vector<u8>): Instruction {
         let i = blank(OP_UNBIND_IDENTIFIER); i.identifier = identifier; i.account = expected_owner; i
     }
-    public fun verify_gas_asset(asset: u32, rate: u128): Instruction {
-        let i = blank(OP_VERIFY_GAS_ASSET); i.asset = asset; i.amount = rate; i
+    public fun verify_gas_asset(asset: u32, rate: u128, intrinsic_gas: u64): Instruction {
+        let i = blank(OP_VERIFY_GAS_ASSET); i.asset = asset; i.amount = rate; i.gas = intrinsic_gas; i
     }
     public fun verify_council(
         epoch: u64,
         digest: vector<u8>,
         signer_indices: vector<u32>,
         signatures: vector<vector<u8>>,
+        guardian: bool,
     ): Instruction {
         let i = blank(OP_VERIFY_COUNCIL);
         i.nonce = epoch; i.digest = digest; i.signer_indices = signer_indices; i.signatures = signatures;
+        i.flag = guardian;
         i
     }
-    public fun set_gas_asset(asset: u32, symbol: vector<u8>, rate: u128, enabled: bool): Instruction {
-        let i = blank(OP_SET_GAS_ASSET); i.asset = asset; i.text = symbol; i.amount = rate; i.flag = enabled; i
+    public fun set_gas_asset(
+        asset: u32, symbol: vector<u8>, rate: u128, intrinsic_gas: u64, enabled: bool
+    ): Instruction {
+        let i = blank(OP_SET_GAS_ASSET);
+        i.asset = asset; i.text = symbol; i.amount = rate; i.gas = intrinsic_gas; i.flag = enabled;
+        i
+    }
+    public fun charge_base_fee(timestamp: u64, base_fee: u128, gas: u64): Instruction {
+        let i = blank(OP_CHARGE_BASE_FEE); i.nonce = timestamp; i.amount = base_fee; i.gas = gas; i
+    }
+    public fun verify_fee_split(split: vector<u8>): Instruction {
+        let i = blank(OP_VERIFY_FEE_SPLIT); i.split = split; i
+    }
+    public fun set_fee_split(split: vector<u8>): Instruction {
+        let i = blank(OP_SET_FEE_SPLIT); i.split = split; i
+    }
+    public fun set_fee_market(floor: u128, target: u64): Instruction {
+        let i = blank(OP_SET_FEE_MARKET); i.amount = floor; i.gas = target; i
+    }
+    public fun disable_gas_asset(asset: u32): Instruction {
+        let i = blank(OP_DISABLE_GAS_ASSET); i.asset = asset; i
     }
     public fun set_parameter(name: vector<u8>, value: u128): Instruction {
         let i = blank(OP_SET_PARAMETER); i.text = name; i.amount = value; i
@@ -209,6 +247,7 @@ module sena::osp {
         } else if (i.op == OP_VERIFY_GAS_ASSET) {
             codec::put_u32(&mut out, i.asset);
             codec::put_u128(&mut out, i.amount);
+            codec::put_u64(&mut out, i.gas);
         } else if (i.op == OP_VERIFY_COUNCIL) {
             codec::put_u64(&mut out, i.nonce);
             vector::append(&mut out, i.digest);
@@ -220,8 +259,9 @@ module sena::osp {
                 vector::append(&mut out, *vector::borrow(&i.signatures, k));
                 k = k + 1;
             };
+            codec::put_bool(&mut out, i.flag);
         } else if (i.op == OP_SET_GAS_ASSET) {
-            codec::put_field(&mut out, encode_asset_record(i.asset, i.text, i.amount, i.flag));
+            codec::put_field(&mut out, encode_asset_record(i.asset, i.text, i.amount, i.gas, i.flag));
         } else if (i.op == OP_SET_PARAMETER) {
             codec::put_field(&mut out, i.text);
             codec::put_u128(&mut out, i.amount);
@@ -232,6 +272,17 @@ module sena::osp {
             vector::append(&mut out, i.iss_hash);
             vector::append(&mut out, i.jwk_hash);
             codec::put_bool(&mut out, i.flag);
+        } else if (i.op == OP_CHARGE_BASE_FEE) {
+            codec::put_u64(&mut out, i.nonce);
+            codec::put_u128(&mut out, i.amount);
+            codec::put_u64(&mut out, i.gas);
+        } else if (i.op == OP_VERIFY_FEE_SPLIT || i.op == OP_SET_FEE_SPLIT) {
+            codec::put_field(&mut out, i.split);
+        } else if (i.op == OP_SET_FEE_MARKET) {
+            codec::put_u128(&mut out, i.amount);
+            codec::put_u64(&mut out, i.gas);
+        } else if (i.op == OP_DISABLE_GAS_ASSET) {
+            codec::put_u32(&mut out, i.asset);
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
         };
@@ -239,13 +290,29 @@ module sena::osp {
     }
 
     /// A whitelisted gas asset record, as `WhitelistedAsset::encode` writes it.
-    fun encode_asset_record(asset: u32, symbol: vector<u8>, rate: u128, enabled: bool): vector<u8> {
+    fun encode_asset_record(
+        asset: u32, symbol: vector<u8>, rate: u128, intrinsic_gas: u64, enabled: bool
+    ): vector<u8> {
         let out = vector::empty<u8>();
         codec::put_u32(&mut out, asset);
         codec::put_field(&mut out, symbol);
         codec::put_u128(&mut out, rate);
+        codec::put_u64(&mut out, intrinsic_gas);
         codec::put_bool(&mut out, enabled);
         out
+    }
+
+    /// Decodes a stored asset record: `(asset, symbol, rate, intrinsic_gas,
+    /// enabled)`.
+    fun decode_asset_record(bytes: vector<u8>): (u32, vector<u8>, u128, u64, bool) {
+        let r = codec::reader(bytes);
+        let asset = codec::take_u32(&mut r);
+        let symbol = codec::take_field(&mut r);
+        let rate = codec::take_u128(&mut r);
+        let intrinsic_gas = codec::take_u64(&mut r);
+        let enabled = codec::take_bool(&mut r);
+        codec::finish(&r);
+        (asset, symbol, rate, intrinsic_gas, enabled)
     }
 
     // --- Slots ---------------------------------------------------------------
@@ -268,7 +335,7 @@ module sena::osp {
             account_key(i.account)
         } else if (op == OP_BIND_IDENTIFIER || op == OP_UNBIND_IDENTIFIER) {
             region_key(REGION_SOCIAL_BY_IDENTIFIER, i.identifier)
-        } else if (op == OP_VERIFY_GAS_ASSET || op == OP_SET_GAS_ASSET) {
+        } else if (op == OP_VERIFY_GAS_ASSET || op == OP_SET_GAS_ASSET || op == OP_DISABLE_GAS_ASSET) {
             let buf = codec::begin(REGION_ASSET);
             codec::put_field_u64(&mut buf, (i.asset as u64));
             codec::commit(buf)
@@ -281,8 +348,31 @@ module sena::osp {
             codec::put_field(&mut buf, i.iss_hash);
             codec::put_field(&mut buf, i.jwk_hash);
             codec::commit(buf)
+        } else if (op == OP_CHARGE_BASE_FEE || op == OP_SET_FEE_MARKET) {
+            codec::commit(codec::begin(REGION_FEE_MARKET))
+        } else if (op == OP_VERIFY_FEE_SPLIT || op == OP_SET_FEE_SPLIT) {
+            codec::commit(codec::begin(REGION_FEE_SPLIT))
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
+        }
+    }
+
+    /// `gas::instruction_gas`: what one payload instruction costs. The steps
+    /// every transaction runs are covered by the intrinsic gas instead.
+    public fun instruction_gas(i: &Instruction): u64 {
+        let op = i.op;
+        if (op == OP_DEBIT || op == OP_CREDIT || op == OP_UNBIND_IDENTIFIER) {
+            5000
+        } else if (op == OP_VERIFY_COUNCIL) {
+            10000 + 3000 * vector::length(&i.signatures)
+        } else if (op == OP_BIND_IDENTIFIER || op == OP_SET_GAS_ASSET || op == OP_SET_PARAMETER
+            || op == OP_SET_JWK || op == OP_SET_FEE_MARKET || op == OP_SET_FEE_SPLIT
+            || op == OP_DISABLE_GAS_ASSET) {
+            20000
+        } else if (op == OP_VERIFY_FEE_SPLIT) {
+            2000
+        } else {
+            0
         }
     }
 
@@ -465,22 +555,41 @@ module sena::osp {
             (true, vector::singleton(TAG_VACANT))
         } else if (op == OP_VERIFY_GAS_ASSET) {
             if (!present) { return (false, vector::empty()) };
-            let r = codec::reader(current);
-            let _asset = codec::take_u32(&mut r);
-            let _symbol = codec::take_field(&mut r);
-            let rate = codec::take_u128(&mut r);
-            let enabled = codec::take_bool(&mut r);
-            codec::finish(&r);
-            if (!enabled || rate != instruction.amount) { return (false, vector::empty()) };
+            let (_, _, rate, intrinsic_gas, enabled) = decode_asset_record(current);
+            if (!enabled || rate != instruction.amount || intrinsic_gas != instruction.gas) {
+                return (false, vector::empty())
+            };
             // Read-only: written back unchanged.
             (true, current)
+        } else if (op == OP_CHARGE_BASE_FEE) {
+            let (ok, market) = gas::market_at(&gas::market_in(present, current), instruction.nonce);
+            if (!ok || gas::base_fee(&market) != instruction.amount) { return (false, vector::empty()) };
+            if (!gas::charge(&mut market, instruction.gas)) { return (false, vector::empty()) };
+            (true, gas::encode_market(&market))
+        } else if (op == OP_VERIFY_FEE_SPLIT) {
+            if (!present || current != instruction.split) { return (false, vector::empty()) };
+            (true, current)
+        } else if (op == OP_SET_FEE_SPLIT) {
+            if (!gas::split_is_valid(instruction.split)) { return (false, vector::empty()) };
+            (true, instruction.split)
+        } else if (op == OP_SET_FEE_MARKET) {
+            if (instruction.amount == 0 || instruction.gas == 0) { return (false, vector::empty()) };
+            let market = gas::market_in(present, current);
+            gas::set_parameters(&mut market, instruction.amount, instruction.gas);
+            (true, gas::encode_market(&market))
+        } else if (op == OP_DISABLE_GAS_ASSET) {
+            if (!present) { return (false, vector::empty()) };
+            let (asset, symbol, rate, intrinsic_gas, _) = decode_asset_record(current);
+            (true, encode_asset_record(asset, symbol, rate, intrinsic_gas, false))
         } else if (op == OP_VERIFY_COUNCIL) {
             if (!present) { return (false, vector::empty()) };
             verify_council_step(instruction, current)
         } else if (op == OP_SET_GAS_ASSET) {
             // A zero rate would make every fee round to zero.
             if (instruction.amount == 0) { return (false, vector::empty()) };
-            (true, encode_asset_record(instruction.asset, instruction.text, instruction.amount, instruction.flag))
+            (true, encode_asset_record(
+                instruction.asset, instruction.text, instruction.amount, instruction.gas, instruction.flag
+            ))
         } else if (op == OP_SET_PARAMETER) {
             if (!is_governable(&instruction.text)) { return (false, vector::empty()) };
             let out = vector::empty<u8>();
@@ -498,7 +607,7 @@ module sena::osp {
 
     /// `GOVERNABLE_PARAMETERS` in `sena_stf::governance`.
     public fun is_governable(name: &vector<u8>): bool {
-        *name == b"gas.base_native" || *name == b"batch.max_transactions"
+        *name == b"batch.max_transactions"
     }
 
     /// Checks council signatures and consumes the epoch.
@@ -519,9 +628,13 @@ module sena::osp {
         };
         let threshold = codec::take_u32(&mut r);
         let epoch = codec::take_u64(&mut r);
+        let guardian_threshold = codec::take_u32(&mut r);
         codec::finish(&r);
 
-        if (epoch != instruction.nonce || threshold == 0) { return (false, vector::empty()) };
+        // `Council::required`: the guardian threshold suffices only for a
+        // guardian payload, and only if the council has one.
+        let required = if (instruction.flag && guardian_threshold > 0) { guardian_threshold } else { threshold };
+        if (epoch != instruction.nonce || required == 0) { return (false, vector::empty()) };
 
         let n = vector::length(&instruction.signatures);
         let k = 0;
@@ -537,7 +650,7 @@ module sena::osp {
             };
             k = k + 1;
         };
-        if (n < (threshold as u64)) { return (false, vector::empty()) };
+        if (n < (required as u64)) { return (false, vector::empty()) };
         if (epoch == MAX_U64) { return (false, vector::empty()) };
 
         let out = vector::empty<u8>();
@@ -549,6 +662,7 @@ module sena::osp {
         };
         codec::put_u32(&mut out, threshold);
         codec::put_u64(&mut out, epoch + 1);
+        codec::put_u32(&mut out, guardian_threshold);
         (true, out)
     }
 
@@ -606,6 +720,66 @@ module sena::osp {
     public fun defender_wins(): u8 { DEFENDER_WINS }
     public fun challenger_wins(): u8 { CHALLENGER_WINS }
     public fun op_of(i: &Instruction): u8 { i.op }
+
+    #[test_only]
+    /// Decodes an instruction from `Instruction::encode` bytes, so conformance
+    /// tests can replay Rust's transitions.
+    public fun decode_instruction(bytes: vector<u8>): Instruction {
+        let r = codec::reader(bytes);
+        let op = codec::take_u8(&mut r);
+        let i = blank(op);
+        if (op == OP_CONSUME_NONCE) {
+            i.account = codec::take_bytes(&mut r, 32);
+            i.nonce = codec::take_u64(&mut r);
+        } else if (op == OP_DEBIT || op == OP_CREDIT) {
+            i.account = codec::take_bytes(&mut r, 32);
+            i.asset = codec::take_u32(&mut r);
+            i.amount = codec::take_u128(&mut r);
+        } else if (op == OP_BIND_IDENTIFIER || op == OP_UNBIND_IDENTIFIER) {
+            i.identifier = codec::take_bytes(&mut r, 32);
+            i.account = codec::take_bytes(&mut r, 32);
+        } else if (op == OP_VERIFY_GAS_ASSET) {
+            i.asset = codec::take_u32(&mut r);
+            i.amount = codec::take_u128(&mut r);
+            i.gas = codec::take_u64(&mut r);
+        } else if (op == OP_VERIFY_COUNCIL) {
+            i.nonce = codec::take_u64(&mut r);
+            i.digest = codec::take_bytes(&mut r, 32);
+            let n = codec::take_u32(&mut r);
+            let k = 0;
+            while (k < n) {
+                vector::push_back(&mut i.signer_indices, codec::take_u32(&mut r));
+                vector::push_back(&mut i.signatures, codec::take_bytes(&mut r, 64));
+                k = k + 1;
+            };
+            i.flag = codec::take_bool(&mut r);
+        } else if (op == OP_SET_GAS_ASSET) {
+            let (asset, symbol, rate, intrinsic_gas, enabled) = decode_asset_record(codec::take_field(&mut r));
+            i.asset = asset; i.text = symbol; i.amount = rate; i.gas = intrinsic_gas; i.flag = enabled;
+        } else if (op == OP_SET_PARAMETER) {
+            i.text = codec::take_field(&mut r);
+            i.amount = codec::take_u128(&mut r);
+        } else if (op == OP_VERIFY_JWK || op == OP_SET_JWK) {
+            i.iss_hash = codec::take_bytes(&mut r, 32);
+            i.jwk_hash = codec::take_bytes(&mut r, 32);
+            if (op == OP_SET_JWK) { i.flag = codec::take_bool(&mut r) };
+        } else if (op == OP_CHARGE_BASE_FEE) {
+            i.nonce = codec::take_u64(&mut r);
+            i.amount = codec::take_u128(&mut r);
+            i.gas = codec::take_u64(&mut r);
+        } else if (op == OP_VERIFY_FEE_SPLIT || op == OP_SET_FEE_SPLIT) {
+            i.split = codec::take_field(&mut r);
+        } else if (op == OP_SET_FEE_MARKET) {
+            i.amount = codec::take_u128(&mut r);
+            i.gas = codec::take_u64(&mut r);
+        } else if (op == OP_DISABLE_GAS_ASSET) {
+            i.asset = codec::take_u32(&mut r);
+        } else {
+            abort E_UNSUPPORTED_INSTRUCTION
+        };
+        codec::finish(&r);
+        i
+    }
 
     // --- Conformance tests ---------------------------------------------------
 
@@ -721,10 +895,10 @@ module sena::osp {
     fun a_disabled_asset_is_written_as_disabled() {
         // The previous verifier always wrote `enabled = 1`, so an honest
         // sequencer disabling an asset lost the dispute over it.
-        let (ok, record) = transition(&set_gas_asset(1, b"USDC", 1000000, false), false, vector::empty());
+        let (ok, record) = transition(&set_gas_asset(1, b"USDC", 1000000, 10000, false), false, vector::empty());
         assert!(ok, 0);
         assert!(*vector::borrow(&record, vector::length(&record) - 1) == 0, 1);
-        let (ok, _) = transition(&verify_gas_asset(1, 1000000), true, record);
+        let (ok, _) = transition(&verify_gas_asset(1, 1000000, 10000), true, record);
         assert!(!ok, 2);
     }
 

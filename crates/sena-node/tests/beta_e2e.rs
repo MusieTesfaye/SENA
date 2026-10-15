@@ -20,8 +20,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, L2Address};
-use sena_stf::gas::fee_for;
-use sena_stf::{execute_batch, Authenticator, BatchContext, Payload, Transaction, RATE_SCALE};
+use sena_stf::{execute_batch, Authenticator, BatchContext, Payload, Transaction};
 
 use sena_fraudproof::{AssertionChain, PartyId};
 use sena_node::genesis::{Allocation, GenesisConfig};
@@ -40,13 +39,15 @@ fn address_of(key: &SigningKey) -> L2Address {
 }
 
 fn signed(key: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
-    let rate = RATE_SCALE;
     let mut tx = Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(rate).unwrap(),
-        fee_rate: rate,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload: Payload::Transfer {
             to,
             asset: USDC,
@@ -57,6 +58,7 @@ fn signed(key: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transact
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -251,7 +253,14 @@ fn a_node_serves_rpc_and_seals_blocks() {
         other => panic!("unexpected response: {other:?}"),
     }
 
-    // 5 transfers of 1,000 plus 5 fees of 1,000.
+    // 5 transfers of 1,000 plus 5 fees, each 41,000 gas at the base fee floor
+    // (the windows never fill, so the base fee stays there).
+    let fee = {
+        let tx = signed(&alice, 0, bob, 1_000);
+        let c = sena_stf::fee_charge(&tx, &sena_stf::BatchContext::without_keyless(0)).unwrap();
+        c.base + c.tip
+    };
+    assert_eq!(fee, 1_025);
     match call(
         &node.endpoint,
         &Request::GetAccount {
@@ -260,7 +269,7 @@ fn a_node_serves_rpc_and_seals_blocks() {
     ) {
         Response::Account { nonce, balances } => {
             assert_eq!(nonce, 5);
-            assert_eq!(balances, vec![(1, 100_000_000 - 10_000)]);
+            assert_eq!(balances, vec![(1, 100_000_000 - 5_000 - 5 * fee)]);
         }
         other => panic!("unexpected response: {other:?}"),
     }
