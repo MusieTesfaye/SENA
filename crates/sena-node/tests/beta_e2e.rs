@@ -399,19 +399,36 @@ fn a_node_resumes_from_disk_with_the_same_state() {
     // And the retained batch data still reproduces the state, which is what a
     // verifier would need after the node restarts.
     let mut rebuilt = config.build_state().expect("genesis builds");
-    for (timestamp, batch) in &batches {
-        execute_batch(
-            &mut rebuilt,
-            &BatchContext::without_keyless(*timestamp),
-            batch,
-        )
-        .expect("retained batch executes");
+    for batch in &batches {
+        let ctx = BatchContext {
+            base_fee: batch.base_fee,
+            fee_recipient: batch.fee_recipient,
+            ..BatchContext::without_keyless(batch.timestamp)
+        };
+        execute_batch(&mut rebuilt, &ctx, &batch.transactions).expect("retained batch executes");
     }
     assert_eq!(
         rebuilt.root(),
         root_before,
         "retained data must rebuild the state"
     );
+
+    // A resumed sequencer has every block back, with the assertions covering
+    // them, so it can still serve and defend them.
+    let resumed = Sequencer::resume(
+        config.build_state().unwrap(),
+        AssertionChain::restore(chain),
+        PartyId(1),
+        config.minimum_bond,
+        None,
+        &batches,
+        state.root(),
+    )
+    .expect("the saved blocks replay");
+    assert_eq!(resumed.blocks.len() as u64, height_before);
+    for block in &resumed.blocks {
+        assert!(resumed.assertion_for(block.height).is_some());
+    }
 }
 
 #[test]

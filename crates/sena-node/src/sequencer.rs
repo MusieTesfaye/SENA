@@ -240,6 +240,96 @@ impl Sequencer {
         }
     }
 
+    /// Rebuilds a sequencer from its data directory: replays every saved
+    /// batch from `genesis`, reconstructing each block, its trace and the
+    /// assertion covering it, so the node can serve and defend blocks it
+    /// produced before restarting.
+    ///
+    /// Nothing is taken on trust: each batch must reach the root it was saved
+    /// with, each assertion must be one `chain` holds, and the result must be
+    /// `saved_state_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first disagreement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a trace exceeds `u64::MAX` steps, which no batch can reach.
+    pub fn resume(
+        genesis: MerkleTrie,
+        chain: AssertionChain,
+        identity: PartyId,
+        bond: u128,
+        keyless: Option<Arc<KeylessConfig>>,
+        batches: &[crate::store::StoredBatch],
+        saved_state_root: Hash256,
+    ) -> Result<Self, String> {
+        let genesis_id = Assertion {
+            parent: AssertionId::GENESIS,
+            proposer: PartyId(0),
+            pre_state_root: Hash256::ZERO,
+            post_state_root: genesis.root(),
+            batch_commitment: Hash256::ZERO,
+            trace_length: 0,
+            bond: 0,
+        }
+        .id();
+        let mut seq = Self::new(genesis, chain, identity, bond).with_keyless(keyless);
+        seq.head = genesis_id;
+        for (i, batch) in batches.iter().enumerate() {
+            let height = i as u64 + 1;
+            let pre_state_root = seq.state.root();
+            let ctx = BatchContext {
+                timestamp: batch.timestamp,
+                keyless: seq.keyless.as_deref(),
+                base_fee: batch.base_fee,
+                fee_recipient: batch.fee_recipient,
+            };
+            let mut next = seq.state.clone();
+            let trace = execute_batch(&mut next, &ctx, &batch.transactions)
+                .map_err(|e| format!("saved block {height} no longer executes: {e}"))?;
+            if next.root() != batch.post_state_root {
+                return Err(format!(
+                    "saved block {height} re-executes to a different root"
+                ));
+            }
+            let block = Block {
+                height,
+                timestamp: batch.timestamp,
+                base_fee: batch.base_fee,
+                fee_recipient: batch.fee_recipient,
+                transactions: batch.transactions.clone(),
+                pre_state_root,
+                post_state_root: next.root(),
+                trace,
+            };
+            let id = Assertion {
+                parent: seq.head,
+                proposer: identity,
+                pre_state_root,
+                post_state_root: block.post_state_root,
+                batch_commitment: block.batch_commitment(),
+                trace_length: block.trace.len() as u64,
+                bond,
+            }
+            .id();
+            if seq.chain.get(&id).is_none() {
+                return Err(format!(
+                    "the saved chain has no assertion for block {height}"
+                ));
+            }
+            seq.state = next;
+            seq.head = id;
+            seq.blocks.push(block);
+            seq.assertions.push(id);
+        }
+        if seq.state.root() != saved_state_root {
+            return Err("replaying the saved blocks does not reach the saved state".to_owned());
+        }
+        Ok(seq)
+    }
+
     /// Enables keyless accounts with the network's parameters.
     #[must_use]
     pub fn with_keyless(mut self, keyless: Option<Arc<KeylessConfig>>) -> Self {

@@ -64,6 +64,10 @@ enum Command {
         /// Requests allowed per client per minute.
         #[arg(long, default_value_t = 600)]
         rate_limit: u32,
+        /// This sequencer's L2 account, where tips are paid. Without it tips
+        /// go to the fee vault with the base fee.
+        #[arg(long)]
+        fee_recipient: Option<String>,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -231,6 +235,7 @@ fn main() {
             run_for,
             auth_token,
             rate_limit,
+            fee_recipient,
         } => serve(
             &data_dir,
             &listen,
@@ -238,6 +243,7 @@ fn main() {
             run_for,
             auth_token,
             rate_limit,
+            fee_recipient.as_deref(),
         ),
         Command::Verify { data_dir, rpc } => verify(&data_dir, &rpc),
         Command::Keygen => {
@@ -324,6 +330,7 @@ fn serve(
     run_for: u64,
     auth_token: Option<String>,
     rate_limit: u32,
+    fee_recipient: Option<&str>,
 ) -> Result<(), String> {
     let store = Store::open(data_dir).map_err(|e| e.to_string())?;
     let config = store
@@ -339,9 +346,17 @@ fn serve(
     let loaded = store.load(&config).map_err(|e| e.to_string())?;
     let sequencer = match loaded {
         Some((state, chain, batches)) => {
-            println!("resuming from {} blocks of saved state", batches.len());
-            let chain = sena_fraudproof::AssertionChain::restore(chain);
-            Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
+            println!("resuming: replaying {} saved blocks", batches.len());
+            let genesis = config.build_state().map_err(|e| e.to_string())?;
+            Sequencer::resume(
+                genesis,
+                sena_fraudproof::AssertionChain::restore(chain),
+                PartyId(1),
+                config.minimum_bond,
+                keyless.clone(),
+                &batches,
+                state.root(),
+            )?
         }
         None => {
             let state = config.build_state().map_err(|e| e.to_string())?;
@@ -355,6 +370,12 @@ fn serve(
         }
     };
     let mut sequencer = sequencer.with_keyless(keyless);
+    if let Some(account) = fee_recipient {
+        let account =
+            L2Address::from_hex(account.trim()).map_err(|e| format!("bad --fee-recipient: {e}"))?;
+        println!("tips go to {account}");
+        sequencer = sequencer.with_fee_recipient(account);
+    }
 
     // Warn rather than refuse: binding a public interface without a token is a
     // choice an operator can legitimately make behind their own proxy, but it
