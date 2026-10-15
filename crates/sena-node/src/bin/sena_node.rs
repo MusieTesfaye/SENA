@@ -97,9 +97,12 @@ enum Command {
         /// Sender's next nonce.
         #[arg(long)]
         nonce: u64,
-        /// Asset to move, and to pay fees in.
+        /// Asset to move.
         #[arg(long, default_value_t = 1)]
         asset: u32,
+        /// Whitelisted asset to pay the fee in; the moved asset if absent.
+        #[arg(long)]
+        fee_asset: Option<u32>,
         /// Tip per gas for the sequencer, in `PRICE_SCALE`ths of a unit.
         #[arg(long, default_value_t = 0)]
         tip: u128,
@@ -257,8 +260,20 @@ fn main() {
             amount,
             nonce,
             asset,
+            fee_asset,
             tip,
-        } => send(&rpc, &secret, &to, amount, nonce, asset, tip),
+        } => send(
+            &rpc,
+            &secret,
+            &Transfer {
+                to,
+                amount,
+                nonce,
+                asset,
+                fee_asset: fee_asset.unwrap_or(asset),
+                tip,
+            },
+        ),
         Command::Query { rpc, what } => query(&rpc, &what),
         Command::Relay {
             rpc,
@@ -562,15 +577,25 @@ fn gas_quote(rpc: &str, asset: u32) -> Result<GasQuote, String> {
     })
 }
 
-fn send(
-    rpc: &str,
-    secret: &str,
-    to: &str,
+/// What `send` signs.
+struct Transfer {
+    to: String,
     amount: u128,
     nonce: u64,
     asset: u32,
+    fee_asset: u32,
     tip: u128,
-) -> Result<(), String> {
+}
+
+fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
+    let Transfer {
+        ref to,
+        amount,
+        nonce,
+        asset,
+        fee_asset,
+        tip,
+    } = *t;
     let raw = hex::decode(secret.trim()).map_err(|_| "secret is not hex".to_owned())?;
     let bytes: [u8; 32] = raw
         .try_into()
@@ -582,12 +607,12 @@ fn send(
     // The asset's rate and intrinsic gas, and the base fee, as the node quotes
     // them. All three are checked in the trace, so a wrong quote is refused
     // rather than honoured.
-    let quote = gas_quote(rpc, asset)?;
+    let quote = gas_quote(rpc, fee_asset)?;
 
     let mut tx = sena_stf::Transaction {
         sender: L2Address::from_bytes(key.verifying_key().to_bytes()),
         nonce,
-        fee_asset: sena_primitives::AssetId(asset),
+        fee_asset: sena_primitives::AssetId(fee_asset),
         fee_rate: quote.rate,
         fee_intrinsic_gas: quote.intrinsic_gas,
         gas_limit: 0,
@@ -606,7 +631,7 @@ fn send(
     // Gas is known before execution: the limit is exactly what it uses.
     tx.gas_limit = sena_stf::gas_required(&tx).map_err(|e| e.to_string())?;
     println!(
-        "gas {} at up to {} per gas ({} base) in asset {asset}",
+        "gas {} at up to {} per gas ({} base) in asset {fee_asset}",
         tx.gas_limit, quote.max_fee_per_gas, quote.base_fee_per_gas
     );
     let signature = ed25519_dalek::Signer::sign(&key, tx.signing_digest().as_bytes()).to_bytes();

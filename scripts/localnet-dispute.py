@@ -95,6 +95,29 @@ def h(b):
     return "0x" + b.hex()
 
 
+def keyless_verdict(m, admin, o, timestamp, gas):
+    run("challenger", m + "keyless_jobs::start", [
+        {"type": "address", "value": admin},
+        {"type": "hex", "value": o["leaf_tx"]},
+        {"type": "u64", "value": str(timestamp)},
+        {"type": "u8", "value": DEVNET_SETUP},
+    ], gas)
+    job = commit(b"SENA:v1:keyless-job", bytes.fromhex(o["leaf_tx"][2:]), u64(timestamp), u64(DEVNET_SETUP))
+    remaining = 69
+    while remaining > 0:
+        chunk = min(STEPS_PER_TX, remaining)
+        run("challenger", m + "keyless_jobs::advance", [
+            {"type": "address", "value": admin},
+            {"type": "hex", "value": h(job)},
+            {"type": "u64", "value": str(chunk)},
+        ], gas)
+        remaining -= chunk
+    run("challenger", m + "keyless_jobs::finish", [
+        {"type": "address", "value": admin},
+        {"type": "hex", "value": h(job)},
+    ], gas)
+
+
 def main():
     plan = json.load(open(sys.argv[1]))
     admin, proposer, challenger = (profile_address(p) for p in ("admin", "proposer", "challenger"))
@@ -161,28 +184,10 @@ def main():
             {"type": "u64", "value": str(r["select"])},
         ], gas)
     o = plan["one_step"]
-    # The disputed step is inside the keyless transaction: compute its verdict
+    # A disputed step inside a keyless transaction needs its verdict computed
     # first, spread over transactions that each fit Aptos's execution budget.
-    run("challenger", m + "keyless_jobs::start", [
-        {"type": "address", "value": admin},
-        {"type": "hex", "value": o["leaf_tx"]},
-        {"type": "u64", "value": str(plan["timestamp"])},
-        {"type": "u8", "value": DEVNET_SETUP},
-    ], gas)
-    job = commit(b"SENA:v1:keyless-job", bytes.fromhex(o["leaf_tx"][2:]), u64(plan["timestamp"]), u64(DEVNET_SETUP))
-    remaining = 69
-    while remaining > 0:
-        chunk = min(STEPS_PER_TX, remaining)
-        run("challenger", m + "keyless_jobs::advance", [
-            {"type": "address", "value": admin},
-            {"type": "hex", "value": h(job)},
-            {"type": "u64", "value": str(chunk)},
-        ], gas)
-        remaining -= chunk
-    run("challenger", m + "keyless_jobs::finish", [
-        {"type": "address", "value": admin},
-        {"type": "hex", "value": h(job)},
-    ], gas)
+    if o.get("leaf_is_keyless", True):
+        keyless_verdict(m, admin, o, plan["timestamp"], gas)
     run("challenger", m + "disputes::one_step", [
         {"type": "address", "value": admin},
         {"type": "hex", "value": did},
@@ -207,7 +212,9 @@ def main():
     print(f"assertion status: {status[0]} (3 = rejected)")
     if int(status[0]) != 3:
         sys.exit("the forged assertion was not rejected")
-    print("OK: the forged keyless credit was rejected on chain")
+    f = plan.get("forged", {})
+    what = "sequencer's EURC tip" if plan.get("scenario") == "fee" else "keyless credit"
+    print(f"OK: the forged {what} ({f.get('forged')} instead of {f.get('honest')}) was rejected on chain")
 
 
 if __name__ == "__main__":

@@ -127,6 +127,112 @@ fn an_unfunded_transaction_is_refused_at_admission() {
     ));
 }
 
+/// Whitelists `asset` for fees.
+fn whitelist(trie: &mut MerkleTrie, asset: AssetId, rate: u128, intrinsic_gas: u64, on: bool) {
+    let record = WhitelistedAsset {
+        asset,
+        symbol: format!("A{}", asset.get()),
+        rate,
+        intrinsic_gas,
+        enabled: on,
+    };
+    apply(trie, &Instruction::SetGasAsset { record }).unwrap();
+}
+
+/// A transfer of `asset` paying its fee in `fee_asset`, declared at `rate`
+/// and `intrinsic_gas`.
+fn paying_in(
+    key: &SigningKey,
+    nonce: u64,
+    asset: AssetId,
+    fee_asset: AssetId,
+    rate: u128,
+    intrinsic_gas: u64,
+) -> Transaction {
+    let mut tx = signed(
+        key,
+        nonce,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset,
+            amount: 10,
+        },
+    );
+    tx.fee_asset = fee_asset;
+    let max_fee =
+        2 * sena_stf::gas::native_to_asset(sena_stf::gas::DEFAULT_BASE_FEE_FLOOR, rate).unwrap();
+    sena_stf::gas::fill_fees(&mut tx, rate, intrinsic_gas, max_fee);
+    let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
+    tx.authenticator = Authenticator::Ed25519 {
+        public_key: key.verifying_key().to_bytes(),
+        signature,
+    };
+    tx
+}
+
+#[test]
+fn only_an_enabled_fee_asset_declared_as_whitelisted_is_admitted() {
+    // The node's own admission, not just a wallet's quote, must refuse a fee
+    // that the trace would reject: a disabled asset, an unlisted one, and a
+    // listed one declared at the wrong rate or intrinsic gas.
+    const USDT: AssetId = AssetId(2);
+    const EURC: AssetId = AssetId(3);
+    const DAI: AssetId = AssetId(4);
+    const EURC_RATE: u128 = 925_000;
+    let alice = signer(1);
+    let mut trie = genesis(&[]);
+    whitelist(&mut trie, USDT, RATE, 10_000, true);
+    whitelist(&mut trie, EURC, EURC_RATE, 15_000, true);
+    whitelist(&mut trie, DAI, RATE, 10_000, false);
+    for asset in [USDC, USDT, EURC, DAI] {
+        let credit = Instruction::Credit {
+            account: address_of(&alice),
+            asset,
+            amount: 1_000_000,
+        };
+        apply(&mut trie, &credit).unwrap();
+    }
+    let mut seq = node(trie);
+
+    let refused = [
+        ("disabled", paying_in(&alice, 0, DAI, DAI, RATE, 10_000)),
+        (
+            "unlisted",
+            paying_in(&alice, 0, USDC, AssetId(9), RATE, 10_000),
+        ),
+        ("wrong rate", paying_in(&alice, 0, USDT, EURC, RATE, 15_000)),
+        (
+            "wrong intrinsic gas",
+            paying_in(&alice, 0, USDT, EURC, EURC_RATE, 10_000),
+        ),
+    ];
+    for (why, tx) in refused {
+        assert!(
+            matches!(
+                handle(
+                    &mut seq,
+                    "sena-test-1",
+                    Request::SubmitTransaction(Box::new(tx))
+                ),
+                Response::Error { .. }
+            ),
+            "a {why} fee asset was admitted"
+        );
+    }
+    assert!(seq.mempool.is_empty());
+
+    // Correctly declared, every enabled stablecoin pays, including for a
+    // transfer of another asset, and a disabled one can still be moved.
+    seq.submit(paying_in(&alice, 0, USDT, EURC, EURC_RATE, 15_000))
+        .unwrap();
+    seq.submit(paying_in(&alice, 1, DAI, USDT, RATE, 10_000))
+        .unwrap();
+    seq.submit(paying_in(&alice, 2, USDC, USDC, RATE, 10_000))
+        .unwrap();
+    let (block, _) = seq.produce(100).unwrap().expect("a block");
+    assert_eq!(block.transactions.len(), 3);
+}
+
 #[test]
 fn admission_accounts_for_what_is_already_queued() {
     // The subtle case: each transaction is affordable alone, but not together.

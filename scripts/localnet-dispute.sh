@@ -6,7 +6,10 @@
 #
 # Prerequisites: `aptos node run-localnet` on 127.0.0.1:8080 (faucet :8081).
 #
-# Usage: scripts/localnet-dispute.sh
+# Usage: scripts/localnet-dispute.sh [fee]
+#
+# With `fee`, the forgery is instead the sequencer's tip on a fee paid in EURC
+# at a non-par rate, so Aptos must recompute that stablecoin's fee to rule.
 
 set -euo pipefail
 
@@ -30,5 +33,5 @@ echo "package published at $ADMIN"
 # The batch time must be fresh by L1's clock.
 now=$(curl -s http://127.0.0.1:8080/v1 | python3 -c \
   'import json,sys; print(int(json.load(sys.stdin)["ledger_timestamp"]) // 1000000)')
-(cd "$REPO" && cargo run -q -p sena-fraudproof --example dispute_plan -- "$now") >plan.json
+(cd "$REPO" && cargo run -q -p sena-fraudproof --example dispute_plan -- "$now" ${1:+"$1"}) >plan.json
 python3 "$REPO/scripts/localnet-dispute.py" plan.json

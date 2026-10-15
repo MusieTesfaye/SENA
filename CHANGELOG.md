@@ -22,7 +22,11 @@ while below 1.0 the protocol may change in breaking ways between releases.
   and package all change.
 - A governed fee split with permissionless `DistributeFees` (Celo's
   `FeeHandler`), and a guardian threshold that may only disable a fee asset.
-- `sena_gasPrice` RPC; `sena-node send` uses it and a `--tip` option.
+- `sena_gasPrice` RPC; `sena-node send` uses it and a `--tip` option, and
+  `--fee-asset` to pay the fee in a different stablecoin from the one moved.
+- Tested with several stablecoins (`scripts/stablecoins-test.py`), and a
+  forged tip in a non-par stablecoin disputed to rejection on an Aptos
+  localnet (`scripts/localnet-dispute.sh fee`).
 - Per-asset block-space caps and window-sized batches in the sequencer.
 - Parameter set `sena-beta-params-2`.
 - Redeployed to Aptos testnet at new addresses.

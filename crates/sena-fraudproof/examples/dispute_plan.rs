@@ -7,8 +7,14 @@
 //! chain to accept. `scripts/localnet-dispute.py` replays it against a local
 //! Aptos node, through real transactions, and reports the gas each move costs.
 //!
+//! With `fee` as a second argument it builds a fee scenario instead: two
+//! transfers paying their fees in EURC, whitelisted at a non-par rate with its
+//! own intrinsic gas, and the sequencer's EURC tip forged a thousandfold. The
+//! disputed step is then a fee credit, which Aptos can only rule on by
+//! recompiling the transaction at EURC's rate.
+//!
 //! ```sh
-//! cargo run -p sena-fraudproof --example dispute_plan -- <unix-timestamp> > plan.json
+//! cargo run -p sena-fraudproof --example dispute_plan -- <unix-timestamp> [fee] > plan.json
 //! ```
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -24,6 +30,12 @@ use sena_stf::{
 use serde_json::json;
 
 const USDC: AssetId = AssetId(1);
+/// A second stablecoin, priced off par: 0.925 EURC per native unit.
+const EURC: AssetId = AssetId(3);
+const EURC_RATE: u128 = 925_000;
+const EURC_INTRINSIC_GAS: u64 = 15_000;
+/// Tip per gas the fee scenario's transactions offer.
+const TIP: u128 = 1_000_000_000;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -67,6 +79,22 @@ fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Trans
     tx
 }
 
+/// A transfer by `from` paying its fee, with a tip, in EURC.
+fn eurc_fee_transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
+    let mut tx = base(addr(from), nonce, to, amount);
+    tx.fee_asset = EURC;
+    let base_per_gas =
+        sena_stf::gas::native_to_asset(sena_stf::gas::DEFAULT_BASE_FEE_FLOOR, EURC_RATE).unwrap();
+    sena_stf::gas::fill_fees(&mut tx, EURC_RATE, EURC_INTRINSIC_GAS, 2 * base_per_gas);
+    tx.max_priority_fee_per_gas = TIP;
+    let signature = from.sign(tx.signing_digest().as_bytes()).to_bytes();
+    tx.authenticator = Authenticator::Ed25519 {
+        public_key: from.verifying_key().to_bytes(),
+        signature,
+    };
+    tx
+}
+
 fn keyless_transfer(to: L2Address, amount: u128) -> Transaction {
     let sig = aptos_sample::signature();
     let mut tx = base(sig.address(), 0, to, amount);
@@ -91,6 +119,14 @@ fn genesis() -> MerkleTrie {
         enabled: true,
     };
     apply(&mut trie, &Instruction::SetGasAsset { record }).unwrap();
+    let record = WhitelistedAsset {
+        asset: EURC,
+        symbol: "EURC".into(),
+        rate: EURC_RATE,
+        intrinsic_gas: EURC_INTRINSIC_GAS,
+        enabled: true,
+    };
+    apply(&mut trie, &Instruction::SetGasAsset { record }).unwrap();
     let sample = aptos_sample::signature();
     apply(
         &mut trie,
@@ -102,15 +138,14 @@ fn genesis() -> MerkleTrie {
     )
     .unwrap();
     for who in [addr(&key(1)), sample.address()] {
-        apply(
-            &mut trie,
-            &Instruction::Credit {
+        for asset in [USDC, EURC] {
+            let credit = Instruction::Credit {
                 account: who,
-                asset: USDC,
+                asset,
                 amount: 5_000_000,
-            },
-        )
-        .unwrap();
+            };
+            apply(&mut trie, &credit).unwrap();
+        }
     }
     trie
 }
@@ -125,23 +160,55 @@ fn main() {
         .expect("usage: dispute_plan <unix-timestamp>")
         .parse()
         .expect("a unix timestamp");
+    let fee_scenario = match std::env::args().nth(2).as_deref() {
+        None => false,
+        Some("fee") => true,
+        Some(other) => panic!("unknown scenario {other:?}; the only one is `fee`"),
+    };
     let devnet = KeylessConfig::aptos_devnet_insecure();
+    let sequencer = addr(&key(9));
     let ctx = BatchContext {
         keyless: Some(&devnet),
+        fee_recipient: sequencer,
         ..BatchContext::without_keyless(timestamp)
     };
 
     let bob = addr(&key(2));
-    let txs = vec![
-        transfer(&key(1), 0, bob, 1_000),
-        keyless_transfer(bob, 1_234),
-        transfer(&key(1), 1, addr(&key(3)), 7),
-    ];
+    let txs = if fee_scenario {
+        vec![
+            eurc_fee_transfer(&key(1), 0, bob, 1_000),
+            eurc_fee_transfer(&key(1), 1, addr(&key(3)), 7),
+        ]
+    } else {
+        vec![
+            transfer(&key(1), 0, bob, 1_000),
+            keyless_transfer(bob, 1_234),
+            transfer(&key(1), 1, addr(&key(3)), 7),
+        ]
+    };
     let pre = genesis();
     let honest = execute_batch(&mut pre.clone(), &ctx, &txs).unwrap();
     let tree = honest.batch_tree(&txs);
 
-    let at = usize::try_from(honest.tx_starts[1]).unwrap() + 6;
+    // The forged step: the keyless transfer's payload credit, or the second
+    // fee transaction's tip to the sequencer.
+    let start = usize::try_from(honest.tx_starts[1]).unwrap();
+    let at = if fee_scenario {
+        let end = honest
+            .tx_starts
+            .get(2)
+            .map_or(honest.instructions.len(), |s| usize::try_from(*s).unwrap());
+        (start..end)
+            .find(|&i| {
+                matches!(
+                    honest.instructions[i],
+                    Instruction::Credit { account, asset: EURC, .. } if account == sequencer
+                )
+            })
+            .expect("the tip credit")
+    } else {
+        start + 6
+    };
     let Instruction::Credit {
         account,
         asset,
@@ -212,6 +279,8 @@ fn main() {
         "timestamp": timestamp,
         "base_fee": ctx.base_fee.to_string(),
         "fee_recipient": hx(ctx.fee_recipient.as_bytes()),
+        "scenario": if fee_scenario { "fee" } else { "keyless" },
+        "forged": { "step": at, "honest": amount.to_string(), "forged": (amount * 1_000).to_string() },
         "txs": txs.iter().map(|t| hx(&t.encode())).collect::<Vec<_>>(),
         "starts": honest.tx_starts,
         "trace_length": len,
@@ -220,6 +289,7 @@ fn main() {
         "rounds": rounds,
         "one_step": {
             "leaf_index": leaf,
+            "leaf_is_keyless": matches!(txs[leaf].authenticator, Authenticator::Keyless(_)),
             "leaf_start": honest.tx_starts[leaf],
             "leaf_tx": hx(&txs[leaf].encode()),
             "leaf_siblings": tree.prove(leaf as u64).unwrap().siblings.iter().map(|h| hx(h.as_bytes())).collect::<Vec<_>>(),

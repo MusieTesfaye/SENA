@@ -8,9 +8,10 @@ For a guided run through all of them, see [`END_TO_END.md`](END_TO_END.md).
 | Rust suite | `cargo test --workspace` | ~1 min | The protocol logic is correct in isolation |
 | Demo | `cargo run --bin sena-demo` | ~30 s | Fraud is caught, end to end |
 | Live node | `sena-node run` + `send` | ~2 min | It works as a service over HTTP |
+| Stablecoins | `scripts/stablecoins-test.py` | ~15 s | Fees in four stablecoins, every balance checked to the unit |
 | Move contracts | `aptos move test` | ~1 min | Aptos computes the same answers |
 | On chain | `scripts/chain-lifecycle.sh` | ~3 min | Aptos *enforces* the safety rules |
-| Disputes on chain | `scripts/localnet-dispute.sh` | ~3 min | Aptos *adjudicates* fraud, keyless proof and all |
+| Disputes on chain | `scripts/localnet-dispute.sh [fee]` | ~3 min | Aptos *adjudicates* fraud, keyless proof and all; with `fee`, a forged tip in a non-par stablecoin |
 | Agents on chain | `scripts/localnet-agents.sh` | ~2 min | The relayer and watcher binaries work against Aptos |
 
 The last three are the only layers where something other than our own code is

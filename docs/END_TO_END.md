@@ -281,6 +281,37 @@ a busier window raises the next one's base fee by up to 1/8, a quieter one
 lowers it, never below the floor. A wallet that leaves room (as `send` does,
 at twice the base fee) keeps working while it rises.
 
+### Several stablecoins
+
+Any number of assets can be whitelisted in genesis, each with its own rate
+and intrinsic gas. The fee asset is the sender's choice, independent of the
+asset moved:
+
+```json
+"gas_assets": [
+  { "asset": 1, "symbol": "USDC", "rate": "1000000", "intrinsic_gas": 10000, "enabled": true },
+  { "asset": 2, "symbol": "USDT", "rate": "1000000", "intrinsic_gas": 10000, "enabled": true },
+  { "asset": 3, "symbol": "EURC", "rate": "925000",  "intrinsic_gas": 15000, "enabled": true },
+  { "asset": 4, "symbol": "DAI",  "rate": "1000000", "intrinsic_gas": 10000, "enabled": false }
+]
+```
+
+```sh
+sena-node send --rpc $RPC --secret $SECRET --to $BOB --amount 1000000 --nonce 1 \
+  --asset 2 --fee-asset 3 --tip 1000000000     # move USDT, pay the fee in EURC
+```
+
+```
+gas 46000 at up to 46250000000 per gas (23125000000 base) in asset 3
+```
+
+EURC's base fee is the native base fee × 0.925, and its own 15,000 intrinsic
+gas makes the transfer 46,000 gas: 46 EURC units of tip and 1,063 of base fee.
+A disabled asset (DAI above) gets no quote and its fees are refused, but it
+can still be transferred. `scripts/stablecoins-test.py` runs all of this and
+checks every balance; results are in
+[evidence 05](beta/evidence/05-stablecoins.md).
+
 ## 5. Settle on Aptos
 
 This part uses a local Aptos node; [part 10](#10-testnet) does the same on
@@ -563,7 +594,8 @@ live in the Aptos contracts, which the L2 cannot change.
 
 | Script | Needs | Does |
 |---|---|---|
-| `scripts/localnet-dispute.sh` | a localnet | Parts 5–6 in one go: fresh accounts, publish, and the keyless fraud dispute to rejection |
+| `scripts/localnet-dispute.sh [fee]` | a localnet | Parts 5–6 in one go: fresh accounts, publish, and the keyless fraud dispute to rejection; with `fee`, a sequencer's forged EURC tip instead |
+| `scripts/stablecoins-test.py` | `cargo build --release -p sena-node` | Part 4 with four stablecoins: fees in each, a fee in one for a transfer of another, a disabled and an unlisted asset refused, every balance checked |
 | `scripts/localnet-agents.sh` | a localnet, `cargo build -p sena-node` | Part 5: a sequencer, the relayer posting, the watcher verifying; fails if the watcher challenges |
 | `scripts/chain-lifecycle.sh local\|devnet\|testnet` | a network | Publish and initialise; then the safety checks — an underbonded post, finalizing early, a self-challenge and finalizing a challenged assertion must all be refused |
 | `scripts/bridge-test.sh setup\|deposit\|status` | testnet, USDC | The bridge with Circle's testnet USDC |
@@ -671,7 +703,7 @@ remote-signer support yet.
 | `keygen` | An Ed25519 keypair and its address | — |
 | `genesis` | Write `genesis.json` | `--data-dir`, `--dev`, `--fund <address>:<amount>` (repeatable) |
 | `run` | Sequencer and JSON-RPC server | `--data-dir`, `--listen`, `--block-interval` (2), `--fee-recipient`, `--auth-token`, `--rate-limit` (600), `--run-for` |
-| `send` | Sign and submit a transfer | `--rpc`, `--secret`, `--to`, `--amount`, `--nonce`, `--asset` (1), `--tip` |
+| `send` | Sign and submit a transfer | `--rpc`, `--secret`, `--to`, `--amount`, `--nonce`, `--asset` (1), `--fee-asset` (the moved asset), `--tip` |
 | `query` | `info`, `account <addr>`, `block <h>`, `confirmation <hash>`, `proof <addr> [--height]` | `--rpc` |
 | `relay` | Post, defend, finalize on Aptos | `--rpc`, `--rpc-token`, `--aptos-url`, `--contract`, `--profile`, `--account`, `--bond`, `--state`, `--max-gas`, `--poll-interval`, `--aptos-bin` |
 | `watch` | Verify from L1 and challenge | `--data-dir`, `--aptos-url`, `--contract`, `--profile`, `--account`, `--bond`, `--state`, `--keyless-steps-per-tx` (12), … |
