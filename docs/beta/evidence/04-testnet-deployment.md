@@ -1,5 +1,12 @@
 # Evidence — Aptos testnet deployment, assertion lifecycle and bridge deposit
 
+> **Two deployments.** Sections 1–2 record the first package (`6947c5f`,
+> flat fees). It was superseded the same day by the fee-market package
+> (`9442900`) in [section 3](#3-the-fee-market-package-9442900), which
+> changes public function signatures and so could not be published over the
+> first one. The first package's 1 USDC remains in its bridge custody; nothing
+> on L2 can withdraw it.
+
 **Date:** 2026-10-15
 **Network:** Aptos testnet (chain id 2)
 **Toolchain:** Aptos CLI `7.9.0`; framework pinned to `46d871fa1feb61ffafb73353a0755e8cc3aaed9d`.
@@ -78,3 +85,47 @@ Two things differed from a localnet, both now handled by the scripts:
   (`0xc673844626c70c499b7be972863dc7d259814ecc610e8b8ca8aaa8f3db001eb0`) and the
   publish repeated with a 2,000,000-unit ceiling. A publishing account should
   hold at least 4 APT.
+
+## 3. The fee-market package (`9442900`)
+
+The package with metered gas, the EIP-1559 base fee, refunds, tips, the fee
+split and the guardian breaker (see [`docs/FEES.md`](../../FEES.md)). The
+accounts were funded by transfer from the first deployment's accounts.
+
+Lifecycle — `SENA_PROFILE=sena-v2-lifecycle scripts/chain-lifecycle.sh testnet`:
+**11 passed, 0 failed.**
+
+Package account (proposer): `0x6c05eee26aa536ce16d1d72437190b1dd65096c7fb112a6a95018fe85f21c638`
+Challenger: `0x54c10827330e8911912e5a9f59756d59e46c7b5a70f86d8a3c7bb499e67339f8`
+
+| Step | Outcome | Gas | Transaction |
+|---|---|---|---|
+| Publish (5 staged chunks + publish) | success | 2,344,656 total | final: `0x3732e7b91c50823ec9bf67299040853995d03f2c1131d1510c02fbc2500df5c0` |
+| `assertions::initialize` | success | 16,509 | `0xf1bfa7a45851ebe395226bff6bdb8190e72e39480fe0dce4950b26245b2ef098` |
+| `disputes::initialize` (keyless setup 1) | success | 9,105 | `0xab14767be17df48f62112c3a475bcdf280498c4c596deda9897368c116d8c245` |
+| `assertions::post` with batch data, base fee and tip recipient | success | 5,752 | `0x59cf6dac4b7c14a5bcec0e60f23fdea87adae9c193a95987322f14b3804d3193` |
+| underbonded `post` | **refused** `E_BOND_TOO_SMALL` | 53 | `0x07124d6a7a27f57c6ff4ac410a68a83218925190499be0f08d6a2da907fa1737` |
+| `finalize` inside the window | **refused** `E_WINDOW_OPEN` | 72 | `0x77e3a830a9f5faff3a23413ca0068fcc3d7450e4230a2e46359bd69614f81b9c` |
+| proposer challenges itself | **refused** `E_SELF_CHALLENGE` | 52 | `0xfec6015b767ed92a18e686c06c849354b476df16a349ab29881d063f0fe5cdd7` |
+| `open_challenge` by a second account | success | 9,482 | `0x384c842c253e709d6655ceba8f6618125af12b7b2c8623bb037922c852811a96` |
+| `finalize` while challenged | **refused** `E_WRONG_STATUS` | 52 | `0x1d3ff332728818f15cdfd81d1c18d498f11a42772de452e721fa4397fad63739` |
+
+The assertion id the contract accepted
+(`0x9302ce14f20b9c8551404a0ffab17ee7e63e6d72a38e90e7d655a1f04045b9b0`) was
+computed independently by the script over the new batch header (timestamp,
+base fee, tip recipient, count, root).
+
+Bridge — `SENA_PROFILE=sena-v2-bridge scripts/bridge-test.sh setup` and `deposit`:
+
+Account: `0xe24c59933c49ece47d186a6cf2969dd3eb66fe0feab2297590426522d00f4c1b`
+
+| Step | Outcome | Gas | Transaction |
+|---|---|---|---|
+| Publish | success | 2,344,656 total | final: `0x0c0ed4ef022ba3587fc039acf0e572888cd9ccf0209eabc438724410fc0ab990` |
+| `assertions::initialize` | success | 16,509 | `0x17d82263eaa987b6b1b7fca44102f2f465b33234890538b6d1d14acf90f5417a` |
+| `disputes::initialize` | success | 9,105 | `0xe44fc5178b46110f799906d929921f80c5c27b55288a1b7b168ee2de9c8695d0` |
+| `bridge::initialize`, custodying USDC | success | 10,764 | `0xe99361f6da4b06f5e668fd1cddc20fc5656150380b9d06102e19e0c2e117dec3` |
+| `bridge::deposit` of 1.000000 USDC | success | 158 | `0x8c29c044be73b626e88bbbd9a07e9666dccc4858590709d5320f230695357239` |
+
+Custody afterwards: 1,000,000 units across 1 deposit. As before, the
+deposit is not credited on L2: nothing in the node reads `Deposited` yet.

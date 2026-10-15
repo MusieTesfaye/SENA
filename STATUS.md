@@ -1,6 +1,6 @@
 # Status
 
-**Unreleased (after 0.2.0-beta)** · 306 Rust tests + 76 Move tests passing · **deployed to Aptos testnet** · not audited
+**Unreleased (after 0.2.0-beta)** · 318 Rust tests + 78 Move tests passing · **deployed to Aptos testnet** · not audited
 
 > **Fraud proofs work on a real Aptos node.** On a localnet, a batch whose
 > keyless transfer was forged a thousandfold was posted with its batch data,
@@ -10,8 +10,9 @@
 > honest block from L1 data alone. CI repeats both on every change
 > (`.github/workflows/move.yml`, job *localnet dispute and agents*).
 >
-> The current package is **published on Aptos testnet**: the assertion lifecycle
-> passed 11/11 there and real Circle USDC was deposited into the bridge
+> The current package — with the fee market — is **published on Aptos
+> testnet**: the assertion lifecycle passed 11/11 there and real Circle USDC
+> was deposited into the bridge
 > ([evidence with transaction hashes](docs/beta/evidence/04-testnet-deployment.md)).
 > No dispute has been played on testnet yet, nothing is on mainnet, and nothing
 > is audited.
@@ -36,7 +37,10 @@ assumed not to work.
 | Deterministic execution producing a disputable trace | `sena-stf` | Same batch, same root, order-independent |
 | Transfers, nonces, replay protection, strict Ed25519 | `sena-stf` | A key can spend only from its own account |
 | Social handles resolving to addresses | `sena-stf` | Binding, release, and theft-prevention tested |
-| Stablecoin gas with in-trace rate validation | `sena-stf` | Wrong rate rejected; rounding cannot make fees zero |
+| **Celo-style fees**: metered gas, EIP-1559 base fee with a floor, hold / refund / tip / base, any whitelisted stablecoin ([`docs/FEES.md`](docs/FEES.md)) | `sena-stf`, `move/sena` | Settlement sums to the hold exactly; base fee rises, falls and floors; a wrong declared rate, intrinsic gas or base fee is a failing step; 31 compile and 26 transition cases agree on L1 |
+| Governed fee split and permissionless distribution (Celo's `FeeHandler`) | `sena-stf` | Shares paid, burn and rounding credited to no one, a wrong split refused |
+| Guardian circuit breaker: a smaller quorum may only disable a fee asset | `sena-stf`, `move/sena` | One guardian disables; the same signature cannot re-enable |
+| Per-asset block-space caps and window-sized batches (Celo's fee-currency limits) | `sena-node` | Batches stop at the window's gas and at each asset's share |
 | Governance bounded by an allowlist, council epochs | `sena-stf` | Council cannot reach the dispute system; replayed approvals refused |
 | **Keyless accounts on the Aptos Keyless circuit** | `sena-stf` | Aptos's sample proof verifies; every intermediate value matches aptos-core |
 | Keyless wallet flow: session, nonce, authenticator, signing | `sena-node::keyless_client` | Assembled sample sign-in verifies; a proof for other inputs is refused |
@@ -44,7 +48,7 @@ assumed not to work.
 | **Every instruction adjudicable on L1**, keyless included | `move/sena` | Move recompiles each disputed transaction and agrees with Rust on every generated case |
 | **Batch data published on L1**; L1 computes the batch root | `move/sena` | A post whose data does not match its claim cannot be made |
 | Batch-structure fraud proofs (uncompilable tx, start gaps, trace length) | `move/sena` | Move tests; watcher mock-L1 tests |
-| **A full keyless fraud dispute on a real Aptos node** | `scripts/localnet-dispute.sh` | Assertion ends rejected; 4,809 gas units from post to rejection |
+| **A full keyless fraud dispute on a real Aptos node** | `scripts/localnet-dispute.sh` | Assertion ends rejected; 4,833 gas units from post to rejection |
 | Bonds and bridge custody move real fungible assets | `move/sena` | Balances checked on reject, refund, groundless challenge, withdrawal |
 | Assertion lifecycle enforced by Aptos | `scripts/chain-lifecycle.sh` | 11/11 on a localnet: window, self-challenge and challenge all block as they must |
 | **Relayer**: post with batch data, defend, finalize | `sena-node relay` | Mock-L1 tests; posted a real block on a localnet |
@@ -62,14 +66,14 @@ only in a Rust model. On a localnet the forged keyless credit was rejected by
 real transactions:
 
 ```
-    1052  assertions::post            (batch data published, root computed on L1)
+    1072  assertions::post            (batch data published, root computed on L1)
      950  assertions::open_challenge
      536  disputes::open
      120  4 bisection moves
-    2093  keyless_jobs start, advance ×6, finish   (Groth16 verified on L1)
+    2094  keyless_jobs start, advance ×6, finish   (Groth16 verified on L1)
+      61  disputes::one_step          → assertion rejected
     ----
-    4809  gas units from post to rejection (≈0.0048 APT at 100 octas per unit)
-      58  disputes::one_step          → assertion rejected
+    4833  gas units from post to rejection (≈0.0048 APT at 100 octas per unit)
 ```
 
 A keyless verdict is spread over several transactions because one Poseidon
@@ -122,8 +126,11 @@ USDC was deposited into bridge custody. Not yet done on testnet:
   sequencer-produced balance proof;
 - **the relayer and watcher** against testnet.
 
-Publishing costs about 2.25 APT on testnet (mostly storage fees), so a
-publishing account should hold at least 4 APT.
+Publishing costs about 2.35 APT on testnet (mostly storage fees), so a
+publishing account should hold at least 4 APT. The fee-market package could
+not be published over the first one (its public signatures changed), so it
+lives at new addresses; the first package's 1 USDC deposit is stranded in its
+custody.
 
 The package is larger than one transaction and is published with
 `--chunked-publish`.
@@ -172,7 +179,11 @@ Forced inclusion exists in `sena::bridge` but is not wired into the Rust node.
 
 ### 7. Operational gaps
 
-- Fees are flat per transaction; per-instruction gas metering is not implemented.
+- The per-instruction gas weights are a first calibration, not benchmarked
+  against what a step costs the node or Aptos.
+- The circuit breaker is manual: with council-set rates there is no price
+  feed to detect a depeg. An automatic breaker needs an oracle.
+- Fee rates are set by the council, not fed by an oracle as Celo's are.
 - State is an in-memory trie snapshotted to disk. RocksDB and NOMT, as the SDD
   specifies, are not integrated.
 - No peer-to-peer layer.

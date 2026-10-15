@@ -1,7 +1,7 @@
 # SENA Closed-Beta Scope
 
 **Status:** Proposed — awaiting sign-off
-**Parameter set:** `sena-beta-params-1` ([`crates/sena-params`](../../crates/sena-params))
+**Parameter set:** `sena-beta-params-2` ([`crates/sena-params`](../../crates/sena-params))
 **Protocol version:** `0.3.0-beta`
 **Satisfies:** `BETA_BUILD_PLAN.md` W-01
 
@@ -197,7 +197,10 @@ floor — a relationship an earlier fixed budget violated.
 | `sequencer_bond_min` | 1,000,000 |
 | `challenger_bond` | 100,000 |
 | `slash_reward_percent` | 50 (the remainder to treasury) |
-| `base_gas_native` | 1,000 |
+| `intrinsic_gas` | 21,000 |
+| `base_fee_floor` | 25,000,000,000 (0.025 micro-dollars per gas, in 10⁻¹² units) |
+| `gas_target` | 5,000,000 gas per one-second window |
+| `gas_price_scale` | 10¹² |
 | `gas_rate_scale` | 1,000,000 |
 | `max_block_transactions` | 512 |
 

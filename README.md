@@ -108,6 +108,8 @@ RPC=http://127.0.0.1:8545
     --to 0x1111111111111111111111111111111111111111111111111111111111111111 \
     --amount 1000 --nonce 0
 
+# `send` asks the node for a gas quote (sena_gasPrice) and sets the gas limit
+# to exactly what the transaction uses; a transfer costs ~0.001 USDC.
 # Blocks seal every 2 seconds by default.
 ./target/release/sena-node query --rpc $RPC account 0x1111...1111
 ./target/release/sena-node query --rpc $RPC block 1
@@ -208,7 +210,7 @@ network rather than in every application:
 | Friction | SENA's answer |
 |---|---|
 | Seed phrases | OIDC keyless accounts — sign in with an existing Web2 identity |
-| Buying a gas token | Pay fees in whitelisted stablecoins |
+| Buying a gas token | Pay fees in whitelisted stablecoins, Celo-style: metered gas, a demand-driven base fee, refunds and tips ([`docs/FEES.md`](docs/FEES.md)) |
 | `0x7f3a9c…` addresses | Human-readable handles, stored as salted hashes |
 | Trusting the operator | Bonded state roots, published data, permissionless fraud proofs |
 
@@ -243,7 +245,7 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
 | [`sena-node`](crates/sena-node) | Mempool, block production, RPC, L1 relayer and watcher, keyless wallet client, CLI |
 | [`sena-light-client`](crates/sena-light-client) | Ultralight mobile verification: sub-millisecond Sparse Merkle Proof checks |
-| [`move/sena`](move/sena) | Aptos L1 contracts — every instruction adjudicable, keyless included; 76/76 tests, see [`move/README.md`](move/README.md) |
+| [`move/sena`](move/sena) | Aptos L1 contracts — every instruction adjudicable, keyless and fees included; 78/78 tests, see [`move/README.md`](move/README.md) |
 
 ## Light client
 
@@ -272,7 +274,7 @@ processes and diffs the results.
 See [`docs/TESTING.md`](docs/TESTING.md) for what each layer actually proves.
 
 ```sh
-cargo test --workspace                                    # 306 tests
+cargo test --workspace                                    # 318 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

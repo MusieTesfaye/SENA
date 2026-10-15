@@ -5,6 +5,28 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### Celo-style fees
+
+- Fees follow Celo's fee abstraction, without a native token
+  ([`docs/FEES.md`](docs/FEES.md)): metered gas (21,000 intrinsic plus each
+  asset's own intrinsic gas plus per-instruction costs), an EIP-1559 base fee
+  per one-second window with a governed floor and target, priced in
+  micro-dollars and converted at each asset's rate, and a hold of
+  `gas_limit ×` the effective price that is settled into refund, tip (to the
+  sequencer) and base fee (to the fee vault), with rounding remainders in the
+  base fee.
+- **Breaking:** transactions replace `max_fee` with `fee_intrinsic_gas`,
+  `gas_limit`, `max_fee_per_gas` and `max_priority_fee_per_gas`; the batch
+  header (and `assertions::post`) carries the base fee and tip recipient;
+  gas asset and council records gain fields. The wire format, signing digest
+  and package all change.
+- A governed fee split with permissionless `DistributeFees` (Celo's
+  `FeeHandler`), and a guardian threshold that may only disable a fee asset.
+- `sena_gasPrice` RPC; `sena-node send` uses it and a `--tip` option.
+- Per-asset block-space caps and window-sized batches in the sequencer.
+- Parameter set `sena-beta-params-2`.
+- Redeployed to Aptos testnet at new addresses.
+
 ### On Aptos testnet
 
 - The current package is published on Aptos testnet. `chain-lifecycle.sh
