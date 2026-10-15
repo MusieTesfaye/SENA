@@ -1,6 +1,7 @@
 # Testing SENA
 
 Layers, cheapest first. Each tests something the one before it cannot.
+For a guided run through all of them, see [`END_TO_END.md`](END_TO_END.md).
 
 | Layer | Command | Time | What it proves |
 |---|---|---|---|

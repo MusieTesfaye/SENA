@@ -23,6 +23,9 @@ proofs**.
 >
 > [`STATUS.md`](STATUS.md) is the honest, line-by-line account of what works
 > today and what does not. Read it before forming a view.
+>
+> [`docs/END_TO_END.md`](docs/END_TO_END.md) walks through the whole system,
+> from a local L2 to a dispute settled on Aptos, with real output.
 
 ## Quickstart
 
