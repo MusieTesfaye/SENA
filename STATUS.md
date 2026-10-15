@@ -92,7 +92,25 @@ conformance vectors make divergence on known cases a test failure; they are not
 a substitute for review. `SRS NFR-SEC-012` requires an independent audit before
 mainnet.
 
-### 2. On testnet, but only the lifecycle and a deposit
+### 2. Deposits on L1 are never credited on L2
+
+`bridge::deposit` takes custody of the asset on L1 and emits a `Deposited`
+event, but nothing in the node reads it: no instruction credits a deposit, so
+the USDC deposited on testnet sits in custody with no L2 balance behind it.
+L2 balances exist only from genesis allocations. Building it needs:
+
+- a deposit instruction that credits each L1 deposit exactly once, adjudicable
+  on L1 against the bridge's own record of deposits;
+- the sequencer (or relayer) ingesting `Deposited` events in order;
+- **an address mapping.** A deposit credits the depositor's Aptos address, but
+  an L2 Ed25519 account's address is its public key, which is not its Aptos
+  address, so the credited account would be unspendable. The deposit needs to
+  name its L2 recipient explicitly.
+
+Withdrawals, the other direction, are implemented and tested in Move and Rust
+but have not run on a live network.
+
+### 3. On testnet, but only the lifecycle and a deposit
 
 The current package is published on Aptos testnet
 ([evidence](docs/beta/evidence/04-testnet-deployment.md)): the assertion
@@ -110,7 +128,7 @@ publishing account should hold at least 4 APT.
 The package is larger than one transaction and is published with
 `--chunked-publish`.
 
-### 3. Keyless depends on Aptos's services
+### 4. Keyless depends on Aptos's services
 
 SENA verifies proofs for the Aptos Keyless circuit; it does not produce them.
 Wallets use the Aptos prover and pepper services through
@@ -133,7 +151,7 @@ no live sign-in has been run. Consequences:
 The insecure devnet setup is usable only behind `allow_insecure_test_setup`,
 and exists because Aptos publishes a real proof for it.
 
-### 4. Operating the agents
+### 5. Operating the agents
 
 - **The relayer halts when an assertion is rejected.** That is the right
   default — continuing would build on fraud — but recovering (rolling the
@@ -146,13 +164,13 @@ and exists because Aptos publishes a real proof for it.
 - Both agents sign through the Aptos CLI and keep keys in its profile; there is
   no HSM or remote-signer integration.
 
-### 5. Single sequencer, no decentralisation
+### 6. Single sequencer, no decentralisation
 
 By design for now. Fraud proofs constrain *what state the sequencer can
 assert*; they do not constrain which transactions it includes or in what order.
 Forced inclusion exists in `sena::bridge` but is not wired into the Rust node.
 
-### 6. Operational gaps
+### 7. Operational gaps
 
 - Fees are flat per transaction; per-instruction gas metering is not implemented.
 - State is an in-memory trie snapshotted to disk. RocksDB and NOMT, as the SDD
