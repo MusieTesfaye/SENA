@@ -507,14 +507,16 @@ the same genesis.
 
 ### The wallet flow
 
-[`sena_node::keyless_client`](../crates/sena-node/src/keyless_client.rs) does
-the wallet's side:
+[`sena_wallet::keyless`](../crates/sena-wallet/src/keyless.rs) does the
+wallet's side without I/O; `sena_node::keyless_client` re-exports it and adds
+the HTTP calls, and [`sena-wasm`](../crates/sena-wasm/src/lib.rs) compiles it
+for browsers:
 
 ```rust
 use sena_node::keyless_client::{assemble, sign, Jwt, KeylessSession, PepperClient, ProverClient, SignIn};
 
 // 1. A fresh ephemeral key, its expiry and a blinder; the nonce commits to all three.
-let session = KeylessSession::generate(expiry_unix_secs);
+let session = KeylessSession::generate(expiry_unix_secs, &mut rand::rngs::OsRng);
 let nonce = session.nonce();          // put this in the OAuth request
 
 // 2. The user signs in; the provider returns a JWT carrying that nonce.
@@ -534,9 +536,41 @@ let signed = sign(tx, &session, auth);
 ```
 
 The pepper and prover services are Aptos's (`POST /v0/fetch` and
-`POST /v0/prove`). The client has been tested against Aptos's sample proof
-and recorded responses; **no live sign-in has been run**, and training-wheels
-signatures are not checked.
+`POST /v0/prove`). Aptos's testnet and mainnet verifying keys on chain are
+point for point the ones SENA's `aptos-keyless-mainnet-2025-01` setup holds,
+so proofs from either prover verify on SENA. The client has been tested
+against Aptos's sample proof, and both live services accept its request
+shapes, rejecting a fake token only on its contents; **no live Google
+sign-in has been run** yet, and training-wheels signatures are not checked.
+
+### The browser wallet
+
+[github.com/MusieTesfaye/wallet](https://github.com/MusieTesfaye/wallet) is a
+Vue wallet on all of this:
+- Google keyless sign-in;
+- signing in WebAssembly, with this repository's code;
+- balances, fees and history from the node;
+- a faucet sending real transfers.
+
+It needs:
+- a node that lets the wallet's origin call it (`--cors-origin`);
+- a genesis that accepts Google's keys.
+
+`scripts/wallet-devnet.py` sets up both:
+
+```sh
+cargo build --release -p sena-node
+python3 scripts/wallet-devnet.py        # node on :8545, four stablecoins, a funded faucet
+```
+
+The wallet's README covers the rest: a Google OAuth client, `bun run faucet`,
+`bun run dev`, and sending between two Google accounts.
+
+Two tests drive the WebAssembly package against a live node.
+`crates/sena-wasm/tests/e2e.mjs` (36 checks) has a keyless account send each
+stablecoin, paying its fee in that coin, then checks balances, history,
+CORS and refusals. The wallet's `bun run test:e2e` (28 checks) does the same
+through the wallet's UI in Chromium.
 
 ## 8. Governance
 
@@ -704,7 +738,7 @@ remote-signer support yet.
 |---|---|---|
 | `keygen` | An Ed25519 keypair and its address | — |
 | `genesis` | Write `genesis.json` | `--data-dir`, `--dev`, `--fund <address>:<amount>` (repeatable) |
-| `run` | Sequencer and JSON-RPC server | `--data-dir`, `--listen`, `--block-interval` (2), `--fee-recipient`, `--auth-token`, `--rate-limit` (600), `--run-for` |
+| `run` | Sequencer and JSON-RPC server | `--data-dir`, `--listen`, `--block-interval` (2), `--fee-recipient`, `--cors-origin` (repeatable; none by default), `--auth-token`, `--rate-limit` (600), `--run-for` |
 | `send` | Sign and submit a transfer | `--rpc`, `--secret`, `--to`, `--amount`, `--nonce`, `--asset` (1), `--fee-asset` (the moved asset), `--tip` |
 | `query` | `info`, `account <addr>`, `block <h>`, `confirmation <hash>`, `proof <addr> [--height]` | `--rpc` |
 | `relay` | Post, defend, finalize on Aptos | `--rpc`, `--rpc-token`, `--aptos-url`, `--contract`, `--profile`, `--account`, `--bond`, `--state`, `--max-gas`, `--poll-interval`, `--aptos-bin` |
@@ -723,6 +757,8 @@ honest chain, a caught fraud, and a withdrawal refused before finality.
 | `sena_submitTransaction` | a transaction | its hash, `pending` |
 | `sena_getAccount` | `address` | nonce and balances |
 | `sena_gasPrice` | `asset` | rate, intrinsic gas, base fee (native and in the asset), a suggested max fee |
+| `sena_getFeeAssets` | — | each whitelisted stablecoin: symbol, rate, intrinsic gas, enabled |
+| `sena_getAccountTransactions` | `address`, optional `limit` (50) | sent and received transactions, newest first, queued ones included, with the fee each paid |
 | `sena_getConfirmation` | `hash` | `pending`, `soft_confirmed` or `finalized`, with the height |
 | `sena_getBlock` | `height` | header (timestamp, base fee, tip recipient), transactions, trace length, start positions, assertion |
 | `sena_getChainInfo` | — | chain id, height, finalized height, window, state root, mempool size |

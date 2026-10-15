@@ -43,7 +43,8 @@ assumed not to work.
 | Per-asset block-space caps and window-sized batches (Celo's fee-currency limits) | `sena-node` | Batches stop at the window's gas and at each asset's share |
 | Governance bounded by an allowlist, council epochs | `sena-stf` | Council cannot reach the dispute system; replayed approvals refused |
 | **Keyless accounts on the Aptos Keyless circuit** | `sena-stf` | Aptos's sample proof verifies; every intermediate value matches aptos-core |
-| Keyless wallet flow: session, nonce, authenticator, signing | `sena-node::keyless_client` | Assembled sample sign-in verifies; a proof for other inputs is refused |
+| Keyless wallet flow: session, nonce, authenticator, signing | `sena-wallet`, `sena-wasm` | Assembled sample sign-in verifies; a proof for other inputs is refused |
+| **A browser wallet on the live node** | [wallet](https://github.com/MusieTesfaye/wallet), `crates/sena-wasm/tests/e2e.mjs` | Keyless transfers in all four stablecoins, built and signed in WebAssembly, confirmed by a live node; the wallet's UI tested in Chromium. No live Google sign-in yet |
 | Bonded assertions, bisection, one-step adjudication (Rust) | `sena-fraudproof` | Honest party wins wherever fraud is placed (property test) |
 | **Every instruction adjudicable on L1**, keyless included | `move/sena` | Move recompiles each disputed transaction and agrees with Rust on every generated case |
 | **Batch data published on L1**; L1 computes the batch root | `move/sena` | A post whose data does not match its claim cannot be made |

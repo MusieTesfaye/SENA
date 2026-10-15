@@ -5,6 +5,24 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### A browser wallet
+
+- `sena-wallet`: the I/O-free wallet logic, moved out of
+  `sena_node::keyless_client`, which now only sends requests.
+- `sena-wasm`: that logic compiled to WebAssembly for browsers
+  (`scripts/build-wasm.sh`), used by github.com/MusieTesfaye/wallet.
+- The node: `--cors-origin` lets named browser origins call it;
+  `sena_getFeeAssets` and `sena_getAccountTransactions`.
+- `scripts/wallet-devnet.py` starts a devnet that accepts Google sign-ins,
+  with four stablecoins and a funded faucet.
+
+### Fixed
+
+- RPC requests could hang while the node was healthy, when a browser held
+  idle connections open (a lost wakeup in `tiny_http`'s worker pool). The
+  node now uses a small HTTP transport of its own: one request per
+  connection, with timeouts.
+
 ### Celo-style fees
 
 - Fees follow Celo's fee abstraction, without a native token
