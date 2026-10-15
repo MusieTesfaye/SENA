@@ -30,7 +30,7 @@ PROFILE="${SENA_PROFILE:-sena-${NETWORK}-$(date +%Y%m%d-%H%M%S)}"
 # substantially more than an entry-function call -- the first successful publish
 # used 184,594 -- so the two budgets are separate.
 GAS_ARGS=(--max-gas 100000 --gas-unit-price 100 --assume-yes)
-PUBLISH_GAS_ARGS=(--max-gas 2000000 --gas-unit-price 100 --assume-yes)
+PUBLISH_GAS_ARGS=(--max-gas 500000 --gas-unit-price 100 --assume-yes)
 
 # Distinct roots so a mistake shows up as a mismatch rather than a coincidence.
 GENESIS_ROOT="0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -109,6 +109,31 @@ if [ "$NETWORK" = "local" ] || [ "$NETWORK" = "devnet" ]; then
     aptos account fund-with-faucet --profile "$p" --amount 2000000000 >/dev/null 2>&1 \
       || echo "  note: could not top up $p from the faucet"
   done
+fi
+
+# Stop before spending anything if either account cannot pay its way. The
+# publisher needs its 0.5 APT gas ceiling to be covered plus what publishing
+# spends; the challenger, the bond plus gas.
+apt_of() {
+  aptos move view --function-id 0x1::coin::balance --type-args 0x1::aptos_coin::AptosCoin \
+    --args "address:$1" --profile "$PROFILE" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(int(json.load(sys.stdin)["Result"][0]))
+except Exception: print(0)'
+}
+CHALLENGER_ADDR="0x$(profile_account "$CHALLENGER")"
+short=0
+for pair in "$ADDR:100000000" "$CHALLENGER_ADDR:30000000"; do
+  a="${pair%%:*}"; need="${pair##*:}"; have=$(apt_of "$a")
+  if [ "$have" -lt "$need" ]; then
+    echo "  $a holds $have octas; needs at least $need ($((need / 100000000)).$(printf '%08d' $((need % 100000000))) APT)"
+    short=1
+  fi
+done
+if [ "$short" -eq 1 ]; then
+  echo "  fund at https://aptos.dev/network/faucet?address=<address>, then rerun with:"
+  echo "    SENA_PROFILE=$PROFILE $0 $NETWORK"
+  exit 1
 fi
 
 step "2. Publish the package"

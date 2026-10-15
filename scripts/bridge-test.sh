@@ -34,7 +34,7 @@ MAX_BATCH_AGE=3600
 KEYLESS_SETUP=1     # aptos-keyless-mainnet-2025-01
 
 GAS=(--max-gas 100000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
-PUBLISH_GAS=(--max-gas 2000000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
+PUBLISH_GAS=(--max-gas 500000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
