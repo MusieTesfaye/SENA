@@ -43,6 +43,10 @@ pub struct ServerConfig {
     pub rate_limit_per_minute: u32,
     /// Largest request body accepted, in bytes.
     pub max_body_bytes: usize,
+    /// Browser origins allowed to call the node (CORS), e.g.
+    /// `http://localhost:5173`; `*` allows any. Empty allows none, so a web
+    /// page cannot reach the node unless its operator says so.
+    pub cors_origins: Vec<String>,
 }
 
 /// A fixed-window request counter, keyed by client.
@@ -88,6 +92,7 @@ impl Default for ServerConfig {
             auth_token: None,
             rate_limit_per_minute: 600,
             max_body_bytes: 1 << 20,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -200,10 +205,23 @@ pub fn run(
 
         match server.recv_timeout(Duration::from_millis(200)) {
             Ok(Some(mut request)) => {
-                let response = serve(sequencer, config, &mut limiter, &mut request);
+                let cors = cors_headers(&config.cors_origins, &request);
+                if *request.method() == Method::Options {
+                    let mut response = HttpResponse::empty(204);
+                    for h in cors {
+                        response.add_header(h);
+                    }
+                    let _ = request.respond(response);
+                    continue;
+                }
+                let body = serve(sequencer, config, &mut limiter, &mut request);
                 let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                     .expect("static header is valid");
-                let _ = request.respond(HttpResponse::from_string(response).with_header(header));
+                let mut response = HttpResponse::from_string(body).with_header(header);
+                for h in cors {
+                    response.add_header(h);
+                }
+                let _ = request.respond(response);
             }
             Ok(None) => {}
             Err(error) => eprintln!("request error: {error}"),
@@ -219,6 +237,34 @@ pub fn run(
     )?;
     println!("state persisted to {}", store.path().display());
     Ok(())
+}
+
+/// The CORS headers for a request: none unless its `Origin` is allowed.
+fn cors_headers(allowed: &[String], request: &tiny_http::Request) -> Vec<Header> {
+    let Some(origin) = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_owned())
+    else {
+        return Vec::new();
+    };
+    if !allowed.iter().any(|a| a == "*" || *a == origin) {
+        return Vec::new();
+    }
+    [
+        ("Access-Control-Allow-Origin", origin.as_str()),
+        ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+        (
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        ),
+        ("Access-Control-Max-Age", "600"),
+        ("Vary", "Origin"),
+    ]
+    .iter()
+    .filter_map(|(k, v)| Header::from_bytes(k.as_bytes(), v.as_bytes()).ok())
+    .collect()
 }
 
 /// Finalizes every assertion whose challenge window has elapsed.

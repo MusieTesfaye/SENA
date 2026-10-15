@@ -7,3 +7,6 @@ Cargo.lock.bak
 /move/**/build/
 /test-devnet/
 /frontend/
+
+# scripts/wallet-devnet.py: chain data and the faucet key
+/wallet-devnet/

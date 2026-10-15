@@ -122,6 +122,7 @@ impl TestNode {
             auth_token: None,
             rate_limit_per_minute: 10_000,
             max_body_bytes: 1 << 20,
+            cors_origins: Vec::new(),
         };
 
         let flag = Arc::clone(&shutdown);
@@ -530,6 +531,7 @@ fn start_authenticated(
         auth_token: Some(token.to_owned()),
         rate_limit_per_minute: 5,
         max_body_bytes: 2_048,
+        cors_origins: Vec::new(),
     };
 
     let flag = Arc::clone(&shutdown);

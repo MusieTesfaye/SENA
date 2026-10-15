@@ -68,6 +68,10 @@ enum Command {
         /// go to the fee vault with the base fee.
         #[arg(long)]
         fee_recipient: Option<String>,
+        /// Let a web page at this origin call the node (CORS), e.g.
+        /// `http://localhost:5173`; repeatable. Without it, browsers cannot.
+        #[arg(long)]
+        cors_origin: Vec<String>,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -239,14 +243,19 @@ fn main() {
             auth_token,
             rate_limit,
             fee_recipient,
+            cors_origin,
         } => serve(
             &data_dir,
-            &listen,
-            block_interval,
             run_for,
-            auth_token,
-            rate_limit,
             fee_recipient.as_deref(),
+            ServerConfig {
+                listen,
+                block_interval_secs: block_interval,
+                auth_token,
+                rate_limit_per_minute: rate_limit,
+                cors_origins: cors_origin,
+                ..ServerConfig::default()
+            },
         ),
         Command::Verify { data_dir, rpc } => verify(&data_dir, &rpc),
         Command::Keygen => {
@@ -340,12 +349,9 @@ fn genesis(data_dir: &str, dev: bool, fund: &[String]) -> Result<(), String> {
 
 fn serve(
     data_dir: &str,
-    listen: &str,
-    block_interval: u64,
     run_for: u64,
-    auth_token: Option<String>,
-    rate_limit: u32,
     fee_recipient: Option<&str>,
+    server_config: ServerConfig,
 ) -> Result<(), String> {
     let store = Store::open(data_dir).map_err(|e| e.to_string())?;
     let config = store
@@ -384,7 +390,13 @@ fn serve(
             Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
         }
     };
-    let mut sequencer = sequencer.with_keyless(keyless);
+    let mut sequencer = sequencer.with_keyless(keyless).with_fee_assets(
+        config
+            .gas_assets
+            .iter()
+            .map(|a| sena_primitives::AssetId(a.asset))
+            .collect(),
+    );
     if let Some(account) = fee_recipient {
         let account =
             L2Address::from_hex(account.trim()).map_err(|e| format!("bad --fee-recipient: {e}"))?;
@@ -395,7 +407,10 @@ fn serve(
     // Warn rather than refuse: binding a public interface without a token is a
     // choice an operator can legitimately make behind their own proxy, but it
     // should never be made by accident.
-    if auth_token.is_none() && !listen.starts_with("127.0.0.1") && !listen.starts_with("localhost")
+    let listen = &server_config.listen;
+    if server_config.auth_token.is_none()
+        && !listen.starts_with("127.0.0.1")
+        && !listen.starts_with("localhost")
     {
         eprintln!(
             "warning: listening on {listen} with no --auth-token; anyone who can reach this \
@@ -404,13 +419,12 @@ fn serve(
     }
 
     let server_config = ServerConfig {
-        listen: listen.to_owned(),
         chain_id: config.chain_id.clone(),
-        block_interval_secs: block_interval,
-        auth_token,
-        rate_limit_per_minute: rate_limit,
-        ..ServerConfig::default()
+        ..server_config
     };
+    for origin in &server_config.cors_origins {
+        println!("browsers at {origin} may call this node");
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if run_for > 0 {

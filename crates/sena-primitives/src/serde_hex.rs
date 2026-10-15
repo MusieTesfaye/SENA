@@ -146,6 +146,34 @@ pub mod u128_string {
     }
 }
 
+/// [`u128_string`] for an `Option<u128>`: a decimal string or `null`.
+pub mod option_u128_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the value as a decimal string, or `null`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the serializer's error.
+    pub fn serialize<S: Serializer>(value: &Option<u128>, s: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => s.serialize_str(&v.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    /// Reads a decimal string or `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not a decimal `u128`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|s| s.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 /// Serialises `Vec<(u32, u128)>` with the amounts as decimal strings.
 pub mod balances {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

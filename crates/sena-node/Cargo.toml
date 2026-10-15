@@ -14,6 +14,7 @@ sena-state.workspace = true
 sena-stf.workspace = true
 sena-fraudproof.workspace = true
 sena-light-client.workspace = true
+sena-wallet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

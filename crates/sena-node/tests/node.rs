@@ -986,3 +986,81 @@ fn a_fee_asset_cannot_take_more_than_its_share_of_a_window() {
     let (block, _) = seq.produce(64).unwrap().unwrap();
     assert_eq!(block.transactions.len(), 3);
 }
+
+#[test]
+fn rpc_lists_fee_assets_as_state_holds_them() {
+    let mut trie = genesis(&[]);
+    whitelist(&mut trie, AssetId(3), 925_000, 15_000, false);
+    let mut seq = node(trie).with_fee_assets(vec![USDC, AssetId(3), AssetId(9)]);
+    match handle(&mut seq, "sena-test-1", Request::GetFeeAssets) {
+        Response::FeeAssets { assets } => {
+            // Asset 9 has no record, so it is not listed.
+            let listed: Vec<_> = assets
+                .iter()
+                .map(|a| (a.asset, a.rate, a.intrinsic_gas, a.enabled))
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    (USDC, RATE, sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS, true),
+                    (AssetId(3), 925_000, 15_000, false),
+                ]
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn rpc_reports_an_accounts_sent_and_received_transactions() {
+    let alice = signer(1);
+    let bob = signer(2);
+    let carol = address_of(&signer(3));
+    let mut seq = node(genesis(&[
+        (address_of(&alice), 1_000_000),
+        (address_of(&bob), 1_000_000),
+    ]));
+    let to = |who: L2Address, amount| Payload::Transfer {
+        to: who,
+        asset: USDC,
+        amount,
+    };
+    seq.submit(signed(&alice, 0, to(address_of(&bob), 5)))
+        .unwrap();
+    seq.submit(signed(&bob, 0, to(carol, 7))).unwrap();
+    seq.produce(100).unwrap().expect("a block");
+    let queued = signed(&alice, 1, to(carol, 9));
+    seq.submit(queued.clone()).unwrap();
+
+    let history = |seq: &mut Sequencer, who: L2Address| match handle(
+        seq,
+        "sena-test-1",
+        Request::GetAccountTransactions {
+            address: who,
+            limit: None,
+        },
+    ) {
+        Response::AccountTransactions { transactions } => transactions,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    // Bob received from Alice and sent to Carol, both in block 1.
+    let bobs = history(&mut seq, address_of(&bob));
+    assert_eq!(bobs.len(), 2);
+    assert!(bobs
+        .iter()
+        .all(|t| t.confirmation == Confirmation::SoftConfirmed { height: 1 }));
+    // His own transfer paid a fee; the one he received was paid by Alice.
+    assert!(bobs.iter().all(|t| t.fee_paid == Some(1_025)));
+
+    // Alice's queued transfer comes first, still pending.
+    let alices = history(&mut seq, address_of(&alice));
+    assert_eq!(alices.len(), 2);
+    assert_eq!(alices[0].hash, queued.hash());
+    assert_eq!(alices[0].confirmation, Confirmation::Pending);
+    assert_eq!(alices[0].fee_paid, None);
+
+    // Amounts and fees travel as strings.
+    let json = serde_json::to_value(&alices[1]).unwrap();
+    assert_eq!(json["fee_paid"], "1025");
+}

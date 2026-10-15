@@ -108,12 +108,59 @@ pub enum Request {
         /// The steps, each at most the trace length.
         steps: Vec<u64>,
     },
+    /// List the fee assets: each whitelisted stablecoin's symbol, rate,
+    /// intrinsic gas and whether it is enabled, as state currently holds them.
+    #[serde(rename = "sena_getFeeAssets")]
+    GetFeeAssets,
+    /// An account's transactions, newest first: those it sent and the
+    /// transfers it received, queued ones included.
+    #[serde(rename = "sena_getAccountTransactions")]
+    GetAccountTransactions {
+        /// The account.
+        address: L2Address,
+        /// At most this many; 50 if absent.
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     /// Fetch canonical DA blob for a block (REQ-FRAUD-007, REQ-FRAUD-008).
     #[serde(rename = "sena_getDaBlob")]
     GetDaBlob {
         /// Target block height.
         height: u64,
     },
+}
+
+/// A whitelisted fee asset, as state holds it.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FeeAsset {
+    /// The asset id.
+    pub asset: AssetId,
+    /// Its symbol.
+    pub symbol: String,
+    /// Its rate, to declare as `fee_rate`.
+    #[serde(with = "u128_string")]
+    pub rate: u128,
+    /// Its intrinsic gas, to declare as `fee_intrinsic_gas`.
+    pub intrinsic_gas: u64,
+    /// Whether fees may be paid in it.
+    pub enabled: bool,
+}
+
+/// One of an account's transactions.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct AccountTransaction {
+    /// The transaction's hash.
+    pub hash: Hash256,
+    /// Whether it is queued, included, or final.
+    pub confirmation: Confirmation,
+    /// The batch time, once included.
+    pub timestamp: Option<u64>,
+    /// The transaction itself.
+    pub transaction: Transaction,
+    /// What its fee came to (tip plus base fee) in its fee asset, once
+    /// included.
+    #[serde(with = "sena_primitives::serde_hex::option_u128_string", default)]
+    pub fee_paid: Option<u128>,
 }
 
 /// A response from the node.
@@ -212,6 +259,16 @@ pub enum Response {
         /// A `max_fee_per_gas` with room for the base fee to double.
         #[serde(with = "u128_string")]
         suggested_max_fee_per_gas: u128,
+    },
+    /// The fee assets.
+    FeeAssets {
+        /// In the order genesis listed them.
+        assets: Vec<FeeAsset>,
+    },
+    /// An account's transactions.
+    AccountTransactions {
+        /// Newest first.
+        transactions: Vec<AccountTransaction>,
     },
     /// Chain-level status.
     ChainInfo {
@@ -481,6 +538,59 @@ fn gas_price(sequencer: &Sequencer, asset: AssetId) -> Response {
     }
 }
 
+/// Whether `tx` concerns `address`: sent by it, or a transfer to it.
+fn concerns(tx: &Transaction, address: &L2Address) -> bool {
+    tx.sender == *address
+        || matches!(&tx.payload, sena_stf::Payload::Transfer { to, .. } if to == address)
+}
+
+/// `address`'s transactions, newest first, queued ones included.
+fn account_transactions(
+    sequencer: &Sequencer,
+    address: &L2Address,
+    limit: u32,
+) -> Vec<AccountTransaction> {
+    let limit = limit as usize;
+    let mut out: Vec<AccountTransaction> = sequencer
+        .mempool
+        .queued()
+        .iter()
+        .rev()
+        .filter(|tx| concerns(tx, address))
+        .map(|tx| AccountTransaction {
+            hash: tx.hash(),
+            confirmation: Confirmation::Pending,
+            timestamp: None,
+            transaction: tx.clone(),
+            fee_paid: None,
+        })
+        .take(limit)
+        .collect();
+    for block in sequencer.blocks.iter().rev() {
+        if out.len() >= limit {
+            break;
+        }
+        let ctx = block.context(sequencer.keyless().map(AsRef::as_ref));
+        for tx in block.transactions.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if !concerns(tx, address) {
+                continue;
+            }
+            let hash = tx.hash();
+            out.push(AccountTransaction {
+                hash,
+                confirmation: sequencer.confirmation(&hash),
+                timestamp: Some(block.timestamp),
+                transaction: tx.clone(),
+                fee_paid: sena_stf::fee_charge(tx, &ctx).ok().map(|c| c.tip + c.base),
+            });
+        }
+    }
+    out
+}
+
 /// Commitments to a block's trace at `steps`.
 fn trace_commitments(sequencer: &Sequencer, height: u64, steps: &[u64]) -> Response {
     let Some(block) = height
@@ -609,6 +719,26 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
         Request::GetDaBlob { height } => da_blob(sequencer, height),
 
         Request::GasPrice { asset } => gas_price(sequencer, asset),
+
+        Request::GetFeeAssets => Response::FeeAssets {
+            assets: sequencer
+                .fee_assets()
+                .iter()
+                .filter_map(|a| sequencer.state.get(&keys::asset(a.get())))
+                .filter_map(|b| WhitelistedAsset::decode(b).ok())
+                .map(|r| FeeAsset {
+                    asset: r.asset,
+                    symbol: r.symbol,
+                    rate: r.rate,
+                    intrinsic_gas: r.intrinsic_gas,
+                    enabled: r.enabled,
+                })
+                .collect(),
+        },
+
+        Request::GetAccountTransactions { address, limit } => Response::AccountTransactions {
+            transactions: account_transactions(sequencer, &address, limit.unwrap_or(50)),
+        },
 
         Request::GetTraceCommitments { height, steps } => {
             trace_commitments(sequencer, height, &steps)

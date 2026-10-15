@@ -170,6 +170,9 @@ pub struct Sequencer {
     /// The share of a window's gas each fee asset may use, in permille
     /// (Celo's `celo.feecurrency.limits`). Assets not listed may use it all.
     fee_asset_limits: BTreeMap<AssetId, u32>,
+    /// The fee assets wallets are told about (`sena_getFeeAssets`): those
+    /// whitelisted at genesis. Their current records are read from state.
+    fee_assets: Vec<AssetId>,
 }
 
 impl Sequencer {
@@ -199,7 +202,21 @@ impl Sequencer {
             clock: system_clock,
             fee_recipient: FEE_VAULT,
             fee_asset_limits: BTreeMap::new(),
+            fee_assets: Vec::new(),
         }
+    }
+
+    /// The fee assets to list to wallets.
+    #[must_use]
+    pub fn with_fee_assets(mut self, assets: Vec<AssetId>) -> Self {
+        self.fee_assets = assets;
+        self
+    }
+
+    /// The fee assets listed to wallets.
+    #[must_use]
+    pub fn fee_assets(&self) -> &[AssetId] {
+        &self.fee_assets
     }
 
     /// Sends tips to `account` instead of the fee vault.
