@@ -74,6 +74,25 @@ module sena::codec {
         vector::append(buf, bytes);
     }
 
+    /// Appends a boolean as one byte, as `Writer::bool` does.
+    public fun put_bool(buf: &mut vector<u8>, value: bool) {
+        vector::push_back(buf, if (value) { 1 } else { 0 });
+    }
+
+    /// Appends a `u64` as a framed fixed-width field (`CanonicalEncoder::u64`).
+    public fun put_field_u64(buf: &mut vector<u8>, value: u64) {
+        let f = vector::empty<u8>();
+        put_u64(&mut f, value);
+        put_field(buf, f);
+    }
+
+    /// Appends a `u128` as a framed fixed-width field (`CanonicalEncoder::u128`).
+    public fun put_field_u128(buf: &mut vector<u8>, value: u128) {
+        let f = vector::empty<u8>();
+        put_u128(&mut f, value);
+        put_field(buf, f);
+    }
+
     /// Starts a canonical encoding in `domain`.
     public fun begin(domain: vector<u8>): vector<u8> {
         let buf = vector::empty<u8>();

@@ -12,56 +12,35 @@ use crate::hash::{Hash256, HashParseError};
 pub struct L2Address(pub [u8; 32]);
 
 impl L2Address {
-    /// Derives the address controlled by an OIDC identity (REQ-AUTH-002).
+    /// Derives the address of a keyless account (REQ-AUTH-002).
     ///
-    /// The address commits to three values:
+    /// A keyless account is identified, as in Aptos Keyless (AIP-61), by its
+    /// issuer and an *identity commitment*:
     ///
-    /// - `aud`, the application-scoped audience claim, so that the same person
-    ///   signing into two different applications receives two unlinkable
-    ///   addresses;
-    /// - `sub`, the identity provider's stable subject identifier for the user;
-    /// - `pepper`, a high-entropy blinding value the user holds privately.
+    /// - `iss_hash` is the Poseidon hash of the OIDC issuer string, padded as
+    ///   the circuit pads it, as a 32-byte little-endian field element;
+    /// - `idc` is `Poseidon(pepper, H(aud), H(uid_val), H(uid_key))`, also a
+    ///   little-endian field element.
     ///
-    /// The pepper is what keeps the mapping one-way in practice. `aud` and `sub`
-    /// are low-entropy and frequently guessable — an observer who knows someone's
-    /// Google subject identifier could otherwise derive their address and
-    /// deanonymise every transaction they have ever made. With a pepper the
-    /// preimage is unguessable, so the address reveals nothing about the identity
-    /// behind it.
-    ///
-    /// Losing the pepper means losing the ability to derive the address, so it is
-    /// recovery-critical: wallets obtain it from a pepper service keyed to the
-    /// same OIDC identity rather than generating it locally.
+    /// The commitment hides the user's identity behind a high-entropy pepper,
+    /// and scopes it to the application (`aud`), so the same person signing in
+    /// to two applications receives two unlinkable addresses. Both inputs are
+    /// public inputs of the zero-knowledge proof, which is how the proof binds
+    /// a JWT to exactly this address.
     ///
     /// ```
     /// use sena_primitives::L2Address;
     ///
-    /// let a = L2Address::derive_from_oidc("app-1", "user-42", b"pepper");
-    /// let b = L2Address::derive_from_oidc("app-2", "user-42", b"pepper");
-    /// assert_ne!(a, b, "the same user is unlinkable across applications");
+    /// let a = L2Address::derive_keyless(&[1; 32], &[2; 32]);
+    /// let b = L2Address::derive_keyless(&[1; 32], &[3; 32]);
+    /// assert_ne!(a, b, "a different commitment is a different account");
     /// ```
     #[must_use]
-    pub fn derive_from_oidc(aud: &str, sub: &str, pepper: &[u8]) -> Self {
+    pub fn derive_keyless(iss_hash: &[u8; 32], idc: &[u8; 32]) -> Self {
         let digest = Hash256::commit(
-            CanonicalEncoder::new(domain::OIDC_ADDRESS)
-                .field(aud.as_bytes())
-                .field(sub.as_bytes())
-                .field(pepper),
-        );
-        Self(digest.0)
-    }
-
-    /// Derives a unified identity-scoped address across applications (Aptos Keyless model).
-    ///
-    /// Commits to `(iss, sub, pepper)` rather than application-scoped `aud`,
-    /// guaranteeing the user controls a single unified wallet across all dApps.
-    #[must_use]
-    pub fn derive_from_oidc_unified(iss: &str, sub: &str, pepper: &[u8]) -> Self {
-        let digest = Hash256::commit(
-            CanonicalEncoder::new(domain::OIDC_ADDRESS_UNIFIED)
-                .field(iss.as_bytes())
-                .field(sub.as_bytes())
-                .field(pepper),
+            CanonicalEncoder::new(domain::KEYLESS_ADDRESS)
+                .field(iss_hash)
+                .field(idc),
         );
         Self(digest.0)
     }
@@ -155,51 +134,32 @@ impl fmt::Display for AssetId {
 mod tests {
     use super::*;
 
-    const PEPPER: &[u8] = b"a-high-entropy-pepper-value-0123";
-
     #[test]
-    fn derivation_is_deterministic() {
-        let a = L2Address::derive_from_oidc("app", "user", PEPPER);
-        let b = L2Address::derive_from_oidc("app", "user", PEPPER);
-        assert_eq!(a, b);
-        println!("root={}", hex::encode(a.0));
+    fn keyless_derivation_is_deterministic() {
+        assert_eq!(
+            L2Address::derive_keyless(&[1; 32], &[2; 32]),
+            L2Address::derive_keyless(&[1; 32], &[2; 32])
+        );
     }
 
     #[test]
-    fn same_user_is_unlinkable_across_applications() {
-        // REQ-AUTH-002: aud scoping is what prevents two applications from
-        // correlating the same person.
-        let app1 = L2Address::derive_from_oidc("app-1", "user", PEPPER);
-        let app2 = L2Address::derive_from_oidc("app-2", "user", PEPPER);
-        assert_ne!(app1, app2);
+    fn issuer_and_commitment_both_matter() {
+        let base = L2Address::derive_keyless(&[1; 32], &[2; 32]);
+        assert_ne!(base, L2Address::derive_keyless(&[9; 32], &[2; 32]));
+        assert_ne!(base, L2Address::derive_keyless(&[1; 32], &[9; 32]));
     }
 
     #[test]
-    fn different_users_get_different_addresses() {
-        let a = L2Address::derive_from_oidc("app", "alice", PEPPER);
-        let b = L2Address::derive_from_oidc("app", "bob", PEPPER);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn pepper_changes_the_address() {
-        let a = L2Address::derive_from_oidc("app", "user", b"pepper-one");
-        let b = L2Address::derive_from_oidc("app", "user", b"pepper-two");
-        assert_ne!(a, b, "the pepper must blind the derivation");
-    }
-
-    #[test]
-    fn claim_boundaries_are_unambiguous() {
-        // Without length-prefixed framing these two distinct identities would
-        // collide, letting one user derive another's address.
-        let a = L2Address::derive_from_oidc("ab", "c", PEPPER);
-        let b = L2Address::derive_from_oidc("a", "bc", PEPPER);
-        assert_ne!(a, b);
+    fn swapping_the_fields_is_a_different_account() {
+        assert_ne!(
+            L2Address::derive_keyless(&[1; 32], &[2; 32]),
+            L2Address::derive_keyless(&[2; 32], &[1; 32])
+        );
     }
 
     #[test]
     fn hex_round_trips_with_and_without_prefix() {
-        let addr = L2Address::derive_from_oidc("app", "user", PEPPER);
+        let addr = L2Address::derive_keyless(&[1; 32], &[2; 32]);
         assert_eq!(L2Address::from_hex(&addr.to_hex()).unwrap(), addr);
         assert_eq!(L2Address::from_hex(&hex::encode(addr.0)).unwrap(), addr);
     }

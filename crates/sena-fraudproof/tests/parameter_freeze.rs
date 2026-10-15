@@ -72,9 +72,25 @@ fn the_gas_parameters_match_the_frozen_set() {
         BETA.gas_rate_scale,
         "gas rate scale drifted from sena-params"
     );
+    use sena_stf::gas;
     assert_eq!(
-        sena_stf::BASE_GAS_NATIVE,
-        BETA.base_gas_native,
-        "base gas drifted from sena-params"
+        gas::INTRINSIC_GAS,
+        BETA.intrinsic_gas,
+        "intrinsic gas drifted"
+    );
+    assert_eq!(
+        gas::DEFAULT_BASE_FEE_FLOOR,
+        BETA.base_fee_floor,
+        "base fee floor drifted"
+    );
+    assert_eq!(
+        gas::DEFAULT_GAS_TARGET,
+        BETA.gas_target,
+        "gas target drifted"
+    );
+    assert_eq!(
+        gas::PRICE_SCALE,
+        BETA.gas_price_scale,
+        "price scale drifted"
     );
 }

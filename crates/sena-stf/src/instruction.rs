@@ -26,9 +26,10 @@
 //! as follow-up work; the present design is sound for the instruction set that
 //! exists.
 
+use sena_primitives::serde_hex::bytes_32;
 use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address};
 
-use crate::gas::WhitelistedAsset;
+use crate::gas::{FeeSplit, WhitelistedAsset};
 use crate::governance::CouncilSignature;
 use serde::{Deserialize, Serialize};
 
@@ -84,9 +85,10 @@ pub enum Instruction {
         /// The address that must currently hold it.
         expected_owner: L2Address,
     },
-    /// Check that `asset` is whitelisted for fees at exactly `rate` (REQ-GAS-005).
+    /// Check that `asset` is enabled for fees at exactly `rate` and
+    /// `intrinsic_gas` (REQ-GAS-005).
     ///
-    /// Writes its slot back unchanged. The step exists so that the rate a
+    /// Writes its slot back unchanged. The step exists so that what a
     /// transaction declared is validated against state *inside the trace*,
     /// where it is disputable, rather than during compilation, which must stay
     /// state-independent. See [`crate::gas`].
@@ -95,16 +97,66 @@ pub enum Instruction {
         asset: AssetId,
         /// The rate the transaction claimed applies.
         rate: u128,
+        /// The asset's intrinsic gas the transaction claimed applies.
+        intrinsic_gas: u64,
     },
-    /// Check that the council authorised `digest` (REQ-GOV-004).
+    /// Charge `gas` against the fee market at `timestamp`, checking that the
+    /// base fee is `base_fee` (EIP-1559).
     ///
-    /// Also a read-only step, for the same reason: the council roster lives in
-    /// state, so the check belongs in the trace.
+    /// Rolls the market into a new window first if `timestamp` is past the
+    /// current one, then requires the base fee the batch declared to be the
+    /// one in force, and adds `gas` to the window, refusing to exceed its
+    /// limit. An absent record is the genesis market.
+    ChargeBaseFee {
+        /// The batch timestamp.
+        timestamp: u64,
+        /// The base fee the batch declared, in `PRICE_SCALE`ths of a native
+        /// unit per gas.
+        base_fee: u128,
+        /// Gas the transaction uses.
+        gas: u64,
+    },
+    /// Check that the fee split in force is exactly `split`. Read-only.
+    VerifyFeeSplit {
+        /// The split a fee distribution declared.
+        split: FeeSplit,
+    },
+    /// Write the fee split (Celo's `FeeHandler` configuration).
+    SetFeeSplit {
+        /// The new split.
+        split: FeeSplit,
+    },
+    /// Set the fee market's floor and target, keeping its current window. The
+    /// base fee is raised to the new floor if it is below it.
+    SetFeeMarket {
+        /// The new base fee floor.
+        floor: u128,
+        /// The new gas target per window.
+        target: u64,
+    },
+    /// Disable a fee asset, keeping the rest of its record (the guardians'
+    /// circuit breaker). Fails if the asset has no record.
+    DisableGasAsset {
+        /// The asset to disable.
+        asset: AssetId,
+    },
+    /// Check that the council authorised `digest` for `epoch`, and consume the
+    /// epoch (REQ-GOV-004).
+    ///
+    /// The council record lives in state, so the check belongs in the trace.
+    /// The step requires `epoch` to be the council's current epoch and writes
+    /// the record back with the epoch advanced, so each signed payload applies
+    /// exactly once.
     VerifyCouncil {
+        /// The epoch the payload was signed for.
+        epoch: u64,
         /// The governance update digest that was signed.
         digest: Hash256,
         /// The signatures offered.
         signatures: Vec<CouncilSignature>,
+        /// Whether the guardian threshold suffices, which it does only for
+        /// disabling a fee asset.
+        guardian: bool,
     },
     /// Write a gas asset's whitelist record (REQ-GAS-003).
     SetGasAsset {
@@ -117,6 +169,30 @@ pub enum Instruction {
         name: String,
         /// Its new value.
         value: u128,
+    },
+    /// Check that `jwk_hash` is a JWK the network accepts for `iss_hash`.
+    ///
+    /// Read-only, like [`Instruction::VerifyGasAsset`]: the keyless proof is
+    /// checked statelessly at compile time, but which JWKs are current is
+    /// state, so that half of the check lives in the trace.
+    VerifyJwk {
+        /// Poseidon hash of the issuer.
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK the proof was made against.
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+    },
+    /// Accept or retire a JWK for an issuer (REQ-AUTH-003).
+    SetJwk {
+        /// Poseidon hash of the issuer.
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK.
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+        /// Whether proofs against this JWK are accepted.
+        active: bool,
     },
 }
 
@@ -155,6 +231,121 @@ impl MachineState {
 }
 
 impl Instruction {
+    /// Encodes the instruction canonically.
+    ///
+    /// Not part of consensus — instructions are never published, only derived —
+    /// but `sena::osp::encode_instruction` implements the same encoding, so the
+    /// Rust and Move compilers can be compared byte for byte in conformance
+    /// tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics on more than `u32::MAX` council signatures, which the wire limits
+    /// rule out.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = sena_primitives::Writer::new();
+        match self {
+            Self::ConsumeNonce { account, expected } => {
+                w.u8(0).bytes32(account.as_bytes()).u64(*expected);
+            }
+            Self::Debit {
+                account,
+                asset,
+                amount,
+            } => {
+                w.u8(1)
+                    .bytes32(account.as_bytes())
+                    .u32(asset.get())
+                    .u128(*amount);
+            }
+            Self::Credit {
+                account,
+                asset,
+                amount,
+            } => {
+                w.u8(2)
+                    .bytes32(account.as_bytes())
+                    .u32(asset.get())
+                    .u128(*amount);
+            }
+            Self::BindIdentifier {
+                identifier,
+                address,
+            } => {
+                w.u8(3)
+                    .bytes32(identifier.as_hash().as_bytes())
+                    .bytes32(address.as_bytes());
+            }
+            Self::UnbindIdentifier {
+                identifier,
+                expected_owner,
+            } => {
+                w.u8(4)
+                    .bytes32(identifier.as_hash().as_bytes())
+                    .bytes32(expected_owner.as_bytes());
+            }
+            Self::VerifyGasAsset {
+                asset,
+                rate,
+                intrinsic_gas,
+            } => {
+                w.u8(5).u32(asset.get()).u128(*rate).u64(*intrinsic_gas);
+            }
+            Self::VerifyCouncil {
+                epoch,
+                digest,
+                signatures,
+                guardian,
+            } => {
+                w.u8(6)
+                    .u64(*epoch)
+                    .bytes32(digest.as_bytes())
+                    .u32(u32::try_from(signatures.len()).expect("bounded"));
+                for s in signatures {
+                    w.u32(s.index).raw(&s.signature);
+                }
+                w.bool(*guardian);
+            }
+            Self::SetGasAsset { record } => {
+                w.u8(7).bytes(&record.encode());
+            }
+            Self::SetParameter { name, value } => {
+                w.u8(8).string(name).u128(*value);
+            }
+            Self::VerifyJwk { iss_hash, jwk_hash } => {
+                w.u8(9).bytes32(iss_hash).bytes32(jwk_hash);
+            }
+            Self::SetJwk {
+                iss_hash,
+                jwk_hash,
+                active,
+            } => {
+                w.u8(10).bytes32(iss_hash).bytes32(jwk_hash).bool(*active);
+            }
+            Self::ChargeBaseFee {
+                timestamp,
+                base_fee,
+                gas,
+            } => {
+                w.u8(11).u64(*timestamp).u128(*base_fee).u64(*gas);
+            }
+            Self::VerifyFeeSplit { split } => {
+                w.u8(12).bytes(&split.encode());
+            }
+            Self::SetFeeSplit { split } => {
+                w.u8(13).bytes(&split.encode());
+            }
+            Self::SetFeeMarket { floor, target } => {
+                w.u8(14).u128(*floor).u64(*target);
+            }
+            Self::DisableGasAsset { asset } => {
+                w.u8(15).u32(asset.get());
+            }
+        }
+        w.finish()
+    }
+
     /// Returns the single trie slot this instruction reads and writes.
     ///
     /// Every instruction touches exactly one slot. That restriction is what
@@ -179,10 +370,18 @@ impl Instruction {
             Self::BindIdentifier { identifier, .. } | Self::UnbindIdentifier { identifier, .. } => {
                 keys::social_by_identifier(identifier)
             }
-            Self::VerifyGasAsset { asset, .. } => keys::asset(asset.get()),
+            Self::VerifyGasAsset { asset, .. } | Self::DisableGasAsset { asset } => {
+                keys::asset(asset.get())
+            }
+            Self::ChargeBaseFee { .. } | Self::SetFeeMarket { .. } => keys::fee_market(),
+            Self::VerifyFeeSplit { .. } | Self::SetFeeSplit { .. } => keys::fee_split(),
             Self::SetGasAsset { record } => keys::asset(record.asset.get()),
             Self::VerifyCouncil { .. } => keys::council(),
             Self::SetParameter { name, .. } => keys::parameter(name),
+            Self::VerifyJwk { iss_hash, jwk_hash }
+            | Self::SetJwk {
+                iss_hash, jwk_hash, ..
+            } => keys::jwk(iss_hash, jwk_hash),
         }
     }
 }

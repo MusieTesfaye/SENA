@@ -82,14 +82,49 @@ struct Metadata {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct StoredBlock {
     height: u64,
+    /// Absent from data directories written before batch timestamps existed.
+    #[serde(default)]
+    timestamp: u64,
+    /// Absent from data directories written before the fee market.
+    #[serde(
+        default = "default_base_fee",
+        with = "sena_primitives::serde_hex::u128_string"
+    )]
+    base_fee: u128,
+    #[serde(default = "default_fee_recipient")]
+    fee_recipient: sena_primitives::L2Address,
     transactions: Vec<Transaction>,
     pre_state_root: String,
     post_state_root: String,
 }
 
+const fn default_base_fee() -> u128 {
+    sena_stf::gas::DEFAULT_BASE_FEE_FLOOR
+}
+
+const fn default_fee_recipient() -> sena_primitives::L2Address {
+    sena_stf::FEE_VAULT
+}
+
+/// A saved block: its header and transactions, which is everything
+/// re-executing it needs, and the root it reached.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StoredBatch {
+    /// The batch timestamp.
+    pub timestamp: u64,
+    /// The base fee it paid.
+    pub base_fee: u128,
+    /// Where its tips went.
+    pub fee_recipient: sena_primitives::L2Address,
+    /// Its transactions, in order.
+    pub transactions: Vec<Transaction>,
+    /// The state root it reached.
+    pub post_state_root: sena_primitives::Hash256,
+}
+
 /// What a node reads back when it resumes: its state, the assertion chain, and
 /// the batch data it is still responsible for publishing.
-pub type Loaded = (MerkleTrie, ChainSnapshot, Vec<Vec<Transaction>>);
+pub type Loaded = (MerkleTrie, ChainSnapshot, Vec<StoredBatch>);
 
 /// A node's data directory.
 #[derive(Clone, Debug)]
@@ -204,6 +239,9 @@ impl Store {
             .iter()
             .map(|b| StoredBlock {
                 height: b.height,
+                timestamp: b.timestamp,
+                base_fee: b.base_fee,
+                fee_recipient: b.fee_recipient,
                 transactions: b.transactions.clone(),
                 pre_state_root: b.pre_state_root.to_hex(),
                 post_state_root: b.post_state_root.to_hex(),
@@ -284,7 +322,25 @@ impl Store {
                         file: "blocks.json",
                         detail: e.to_string(),
                     })?;
-                stored.into_iter().map(|b| b.transactions).collect()
+                stored
+                    .into_iter()
+                    .map(|b| {
+                        let post_state_root = sena_primitives::Hash256::from_hex(
+                            &b.post_state_root,
+                        )
+                        .map_err(|e| StoreError::Malformed {
+                            file: "blocks.json",
+                            detail: e.to_string(),
+                        })?;
+                        Ok(StoredBatch {
+                            timestamp: b.timestamp,
+                            base_fee: b.base_fee,
+                            fee_recipient: b.fee_recipient,
+                            transactions: b.transactions,
+                            post_state_root,
+                        })
+                    })
+                    .collect::<Result<_, StoreError>>()?
             }
             None => Vec::new(),
         };

@@ -7,22 +7,25 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="tests" src="https://img.shields.io/badge/tests-260%20rust%20%2B%2052%20move-brightgreen">
-<img alt="devnet" src="https://img.shields.io/badge/aptos-devnet%20deployed-blue">
+<img alt="aptos" src="https://img.shields.io/badge/aptos-testnet%20deployed-blue">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
 > ### Beta — read this before using it
 >
-> The Rust node runs, seals blocks, serves JSON-RPC, and survives restarts. A
-> verifier can rebuild the chain from published data and catch a lying sequencer.
-> That part is real and tested.
+> The node runs, seals blocks and posts them to Aptos with their batch data. An
+> independent watcher re-executes every assertion from L1 data and challenges
+> fraud, and on a real Aptos node a forged keyless transfer has been disputed
+> down to one step and rejected by Aptos itself, Groth16 proof and all.
 >
-> **It has not been audited. Nothing has been deployed to any network. Keyless
-> sign-in is not finished.** Do not put real funds anywhere near it.
+> **It has not been audited.** The contracts are on Aptos testnet, not mainnet.
+> Do not put real funds anywhere near it.
 >
 > [`STATUS.md`](STATUS.md) is the honest, line-by-line account of what works
 > today and what does not. Read it before forming a view.
+>
+> [`docs/END_TO_END.md`](docs/END_TO_END.md) walks through the whole system,
+> from a local L2 to a dispute settled on Aptos, with real output.
 
 ## Quickstart
 
@@ -51,71 +54,31 @@ Three scenarios, run against the real implementation with no mocks:
 3. A withdrawal is refused against a pending state root and honoured once the
    challenge window has elapsed.
 
-### 2. See the Keyless & Mobile Sync flow end-to-end
+### 2. Keyless sign-in
 
-```sh
-cargo run --release --bin sena-keyless-demo
+Keyless accounts use the audited
+[Aptos Keyless](https://github.com/aptos-labs/keyless-zk-proofs) circom circuit
+(`circuit-v1.0.1`) and the Aptos mainnet ceremony verification key (January
+2025). The node and the L1 contracts both verify the Groth16 proof, so a keyless
+transaction can be disputed like any other.
+
+Enable it in genesis:
+
+```json
+"keyless": {
+  "setup": "aptos-keyless-mainnet-2025-01",
+  "jwks": [{ "iss": "https://accounts.google.com", "kid": "…", "n": "<modulus, base64url>" }]
+}
 ```
 
-Simulates an entire Web2-to-Web3 payment workflow live:
-1. **Google OIDC Login:** Alice and Bob log in via Google OIDC to derive self-custodial `L2Address`es.
-2. **On-Device ZK Prover:** Alice's client generates a fresh ephemeral keypair (EPK) and computes a 128-byte BN254 Groth16 zero-knowledge proof binding the EPK to her identity.
-3. **Live HTTP Submission:** Alice transfers 0.50 USDC to Bob over real HTTP JSON-RPC to a live `sena-node`.
-4. **Mempool Verification & Block Production:** Sequencer admits the transaction via Groth16 verification, executes it, and seals block 1.
-5. **Ultralight Mobile Verification:** Bob's mobile wallet performs ultralight sync via Sparse Merkle Proof verification in **< 0.25 ms** with zero trust in the RPC node.
+Wallets sign in through the Aptos prover and pepper services;
+[`sena_node::keyless_client`](crates/sena-node/src/keyless_client.rs) builds the
+session nonce, assembles the authenticator from the JWT and proof (refusing a
+proof for other inputs), and signs transactions with the ephemeral key. An
+earlier, unsound prototype is quarantined in
+[`attic/`](attic/unsafe-keyless-2026-10/README.md); see `STATUS.md`.
 
-### 3. Production Proving Ceremony & Prover Daemon
-
-For production Keyless accounts, SENA features a high-performance Groth16 Prover Service over the BN254 curve ([`crates/sena-prover`](crates/sena-prover)):
-
-```sh
-# 1. Run the BN254 Phase 2 Setup Ceremony (exports .pk, .vk, and verification_key.json)
-./target/release/sena-prover ceremony --output ./prover-params
-
-# 2. Run prover benchmarks (averaging ~19ms per proof)
-./target/release/sena-prover bench
-
-# 3. Launch the production Prover Daemon on port 8090
-./target/release/sena-prover run --port 8090 --params ./prover-params
-```
-
-#### External Prover Service REST API (Port 8090)
-
-- **`GET /api/v1/health`**: Prover service status, curve (`BN254`), `universal_oidc: true`, `social_connect: "Celo-ODIS-tOPRF"`, and `distributed_pepper: "BN254-tOPRF-V-Shamir"`.
-- **`POST /api/v1/prove`**: Generates a 128-byte Groth16 zero-knowledge proof binding any OIDC identity (Google, Apple, Microsoft, Discord, GitHub, Auth0) to a client ephemeral keypair (EPK). Supports **unified single-wallet address derivation** ($\text{iss} + \text{sub} + \text{pepper}$) without `client_id` lock-in. Average proving time: **~19 ms**.
-- **`POST /api/v1/verify`**: Verifies a 128-byte Groth16 proof against public statement inputs with cryptographic pairing checks over BN254.
-- **`POST /api/v1/odis/evaluate`**: **Celo-style ODIS Oblivious PRF (tOPRF)** service for SocialConnect. Evaluates blinded curve points ($B = r \cdot M$) so users can derive anti-enumeration `ObfuscatedIdentifier`s for phone numbers and emails without ever exposing plaintext contact details to the server.
-- **`POST /api/v1/pepper/get`**: Gateway derivation for cross-device Keyless peppers. Queries the distributed guardian cluster, performs Lagrange interpolation, unblinds, and returns the deterministic 32-byte pepper and unified address.
-- **`POST /api/v1/pepper/blinded_evaluate`**: Privacy-preserving endpoint evaluating user-blinded points ($B = r \cdot M$) across guardians with zero leakage of user identity.
-- **`GET /api/v1/pepper/cluster`**: Returns quorum status, threshold requirements, and guardian node endpoints.
-
-### 4. Distributed Pepper Storage & Guardian Cluster (Aptos & Celo Model)
-
-To guarantee that user wallets are recoverable across multiple devices (phone, laptop, desktop) without relying on a centralized database or exposing user identities to rainbow table dictionary attacks, SENA implements a **Verifiable Threshold Oblivious PRF (V-tOPRF)** cluster:
-
-1. **Shamir Secret Sharing over BN254**: The master pepper secret $s \in \mathbb{F}_r$ is split into $N$ polynomial shares $\{ s_1, \dots, s_N \}$ with threshold $T$. No individual guardian node holds the secret or can de-anonymize accounts.
-2. **Oblivious Evaluation (Zero-Knowledge Privacy)**: The client blinds their identity with a private random scalar $r$: $B = r \cdot H_{\mathbb{G}_1}(\text{iss} \parallel \text{sub})$. Guardian nodes evaluate $S_i = s_i \cdot B$ without **ever learning who the user is**.
-3. **Byzantine Fault Tolerance (Chaum-Pedersen DLEQ Proofs)**: Each guardian attaches a zero-knowledge discrete log equality proof $(c, z)$ proving that $\log_{G_1}(VK_i) = \log_B(S_i) = s_i$. The client cryptographically verifies each proof against the guardian's public verification key before accepting the share, detecting and rejecting any corrupted or malicious nodes.
-4. **Lagrange Interpolation & Unblinding**: The client interpolates $S = \sum L_i(0) S_i = s \cdot B$, unblinds $P = r^{-1} \cdot S = s \cdot M \in \mathbb{G}_1$, and digests $P$ into the deterministic 32-byte pepper.
-
-```sh
-# 1. Generate 2-of-3 production cluster key shares and config
-./target/release/sena-prover guardian-keygen --threshold 2 --nodes 3 --output ./cluster-keys
-
-# 2. Launch individual guardian daemons
-./target/release/sena-prover guardian --config ./cluster-keys/guardian_1.json --port 8091
-./target/release/sena-prover guardian --config ./cluster-keys/guardian_2.json --port 8092
-./target/release/sena-prover guardian --config ./cluster-keys/guardian_3.json --port 8093
-
-# 3. Derive pepper across guardians with automatic Byzantine fault detection
-./target/release/sena-prover pepper-client \
-    --guardians http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093 \
-    --threshold 2 \
-    --iss https://accounts.google.com \
-    --sub user_99999
-```
-
-### 5. Run your own devnet
+### 3. Run your own devnet
 
 ```sh
 # A keypair to play with. Note the secret and the address.
@@ -134,7 +97,7 @@ The node prints its state root on startup. **Two operators with the same genesis
 file must see the same root** — that is how you tell you are on the same chain
 before exchanging a single transaction.
 
-### 6. Send a transaction
+### 4. Send a transaction
 
 In another terminal:
 
@@ -148,11 +111,13 @@ RPC=http://127.0.0.1:8545
     --to 0x1111111111111111111111111111111111111111111111111111111111111111 \
     --amount 1000 --nonce 0
 
+# `send` asks the node for a gas quote (sena_gasPrice) and sets the gas limit
+# to exactly what the transaction uses; a transfer costs ~0.001 USDC.
 # Blocks seal every 2 seconds by default.
 ./target/release/sena-node query --rpc $RPC account 0x1111...1111
 ./target/release/sena-node query --rpc $RPC block 1
 
-# Cryptographic Sparse Merkle Proof for ultralight mobile verification (< 1ms).
+# A Sparse Merkle proof of an account, for light-client verification.
 ./target/release/sena-node query --rpc $RPC proof 0x1111...1111
 ```
 
@@ -181,33 +146,48 @@ nothing can be withdrawn against it. **Soft confirmation and L1 finality are
 different things**, and every response that touches a transaction keeps them
 apart.
 
-### 7. It runs on Aptos devnet
+### 5. Settle on Aptos: relay and watch
 
-The contracts are published and the lifecycle is verified on chain. Aptos itself
-rejects the two things it must:
-
-```
-assertions::finalize  (inside challenge window)  →  E_WINDOW_OPEN
-assertions::finalize  (while challenged)         →  E_WRONG_STATUS
-```
-
-Transaction hashes and a reproduction script are in
-[`docs/beta/evidence/03-devnet-deployment.md`](docs/beta/evidence/03-devnet-deployment.md).
-No bonds move yet — posting an assertion costs gas and nothing else.
-
-### 8. Run it against Aptos yourself
+The sequencer's L1 agent posts each block as a bonded assertion with its batch
+data, answers bisection moves and finalizes:
 
 ```sh
-scripts/chain-lifecycle.sh devnet     # or testnet
+./target/release/sena-node relay --rpc $RPC \
+    --aptos-url https://api.testnet.aptoslabs.com/v1 \
+    --contract 0xSENA_PACKAGE --profile proposer --account 0xPROPOSER
 ```
 
-Deploys to a fresh account and asserts an expected outcome at every step. The
-two that matter are failures — if a challenged assertion ever finalizes, the
-script fails loudly.
+Anyone can run the other half. A watcher trusts only Aptos and its own copy of
+the genesis file: it re-executes every assertion from the batch data published
+on L1 and challenges anything wrong, playing the dispute to the end.
+
+```sh
+./target/release/sena-node watch --data-dir ./devnet \
+    --aptos-url https://api.testnet.aptoslabs.com/v1 \
+    --contract 0xSENA_PACKAGE --profile watcher --account 0xWATCHER
+```
+
+Signing goes through an [Aptos CLI](https://aptos.dev/tools/aptos-cli/) profile,
+so keys stay in its keystore.
+
+### 6. Run it against Aptos yourself
+
+With `aptos node run-localnet` running:
+
+```sh
+scripts/localnet-dispute.sh    # a forged keyless credit, disputed until Aptos rejects it
+scripts/localnet-agents.sh     # relay posts a real block; watch verifies it from L1 data
+scripts/chain-lifecycle.sh local   # or devnet, testnet
+```
+
+The dispute script prints the gas of every move — 4,809 units from post to
+rejection. The lifecycle script asserts an expected outcome at every step; the
+ones that matter are failures — if a challenged assertion ever finalizes, it
+fails loudly. CI runs the first two on every change.
 
 Full guide: [`docs/TESTING.md`](docs/TESTING.md).
 
-### 9. Verify the chain yourself
+### 7. Verify the chain yourself
 
 Do not take the node's word for its own state root. Fetch the published
 transactions and re-execute them:
@@ -233,7 +213,7 @@ network rather than in every application:
 | Friction | SENA's answer |
 |---|---|
 | Seed phrases | OIDC keyless accounts — sign in with an existing Web2 identity |
-| Buying a gas token | Pay fees in whitelisted stablecoins |
+| Buying a gas token | Pay fees in whitelisted stablecoins, Celo-style: metered gas, a demand-driven base fee, refunds and tips ([`docs/FEES.md`](docs/FEES.md)) |
 | `0x7f3a9c…` addresses | Human-readable handles, stored as salted hashes |
 | Trusting the operator | Bonded state roots, published data, permissionless fraud proofs |
 
@@ -264,33 +244,20 @@ is watching. The cost: trust-minimised withdrawal takes a challenge window.
 |---|---|
 | [`sena-primitives`](crates/sena-primitives) | Hashes, OIDC address derivation, identifier hashing, canonical codec |
 | [`sena-state`](crates/sena-state) | Sparse Merkle trie, inclusion and non-inclusion proofs |
-| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, keyless (Groth16 / BN254 ZK verifier), execution traces |
+| [`sena-stf`](crates/sena-stf) | Accounts, transactions, gas, governance, Aptos Keyless verification, execution traces |
 | [`sena-fraudproof`](crates/sena-fraudproof) | Bonded assertions, bisection, one-step adjudication |
-| [`sena-node`](crates/sena-node) | Mempool, block production, RPC, verifier mode, CLI |
+| [`sena-node`](crates/sena-node) | Mempool, block production, RPC, L1 relayer and watcher, keyless wallet client, CLI |
 | [`sena-light-client`](crates/sena-light-client) | Ultralight mobile verification: sub-millisecond Sparse Merkle Proof checks |
-| [`move/sena`](move/sena) | Aptos L1 contracts — **deployed to devnet**, 53/53 tests, see [`move/README.md`](move/README.md) |
+| [`move/sena`](move/sena) | Aptos L1 contracts — every instruction adjudicable, keyless and fees included; 78/78 tests, see [`move/README.md`](move/README.md) |
 
-## Keyless ZK Architecture & Light Client
+## Light client
 
-SENA brings seedless Web2 onboarding to Layer 2 by implementing zero-knowledge OpenID Connect authentication aligned with Aptos Keyless (AIP-61):
-
-### 1. `sena-light-client` (Ultralight Mobile Verifier)
-- **Zero-History Sync**: Mobile clients do not need to download or process blocks.
-- **Cryptographic Verification**: Verifies account balances, nonces, and state inclusion in **< 0.25 ms** using Sparse Merkle Tree (SMT) sibling proofs.
-- **Dual Confirmation Levels**:
-  - `SoftConfirmed`: Sequencer-attested state root (sub-second execution).
-  - `Finalized`: State root anchored to Aptos L1 after expiration of the fraud challenge window.
-
-### 2. `sena-stf::groth16` (BN254 Zero-Knowledge Verifier)
-- Verifies 128-byte compressed Groth16 zero-knowledge proofs ($A \in G_1, B \in G_2, C \in G_1$) over the BN254 elliptic curve using Arkworks.
-- Cryptographically binds Ephemeral Public Keys (EPKs) to Google/Apple OIDC identities without exposing JWT tokens or user salts.
-- Fully compatible with `move/sena/sources/groth16.move` for on-chain settlement and bisection dispute resolution on Aptos L1.
-
-### 3. Keyless JSON-RPC API
-The `sena-node` daemon exposes native RPC methods for keyless wallet clients:
-- `sena_getAccountProof(address)`: Serves Sparse Merkle Proofs for instant client-side verification.
-- `sena_submitTransaction`: Accepts keyless payload authenticators containing EPK signatures and Groth16 proofs.
-- `sena_getChainInfo`: Returns current sequencer block height, Aptos L1 finalized height, and state root.
+[`sena-light-client`](crates/sena-light-client) verifies an account's nonce and
+balances against a state root with a Sparse Merkle proof served by
+`sena_getAccountProof`. It removes trust in the RPC node **only if the caller
+supplies a root it trusts independently** — for `Finalized`, a root read from
+the L1 assertion chain; for `SoftConfirmed`, the sequencer's root. The crate
+does not itself read Aptos.
 
 ## Determinism is a security property
 
@@ -310,7 +277,7 @@ processes and diffs the results.
 See [`docs/TESTING.md`](docs/TESTING.md) for what each layer actually proves.
 
 ```sh
-cargo test --workspace                                    # 265 tests
+cargo test --workspace                                    # 318 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

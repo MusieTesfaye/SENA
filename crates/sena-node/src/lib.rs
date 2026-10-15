@@ -19,7 +19,7 @@
 //!
 //! let sequencer = Sequencer::new(genesis.clone(), chain, PartyId(1), 1_000_000);
 //! // A verifier starts from the same genesis and rebuilds everything itself.
-//! let verifier = VerifierNode::new(genesis, PartyId(2));
+//! let verifier = VerifierNode::new(genesis, PartyId(2), None); // keyless off
 //!
 //! assert_eq!(sequencer.finalized_height(), 0);
 //! assert_eq!(verifier.state.root(), sequencer.state.root());
@@ -31,6 +31,9 @@
 
 pub mod da;
 pub mod genesis;
+pub mod http;
+pub mod keyless_client;
+pub mod l1;
 pub mod mempool;
 pub mod relayer;
 pub mod rpc;
@@ -38,13 +41,15 @@ pub mod sequencer;
 pub mod server;
 pub mod store;
 pub mod verifier_node;
+pub mod watcher;
 
 pub use da::{DaBlob, DaStore};
 pub use genesis::{Allocation, GenesisConfig, GenesisError};
 pub use mempool::{Mempool, RejectReason};
-pub use relayer::{AptosRelayer, RelayerConfig, TrackedAssertion};
+pub use relayer::{L2Source, Relayer, RelayerConfig, RpcSource};
 pub use rpc::{handle, Request, Response};
 pub use sequencer::{Block, Confirmation, ProduceError, Sequencer};
 pub use server::{ServerConfig, ServerError};
 pub use store::{Store, StoreError};
 pub use verifier_node::{Outcome, VerifierNode};
+pub use watcher::{Game, WatchError, WatchReport, Watcher, WatcherConfig};

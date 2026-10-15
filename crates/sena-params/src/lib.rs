@@ -34,7 +34,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Identifies this parameter set. Bumped whenever any value changes.
-pub const PARAM_SET_VERSION: &str = "sena-beta-params-1";
+pub const PARAM_SET_VERSION: &str = "sena-beta-params-2";
 
 /// The protocol version these parameters describe.
 pub const PROTOCOL_VERSION: &str = "0.3.0-beta";
@@ -106,8 +106,15 @@ pub struct Params {
     pub slash_reward_percent: u8,
 
     // --- Execution ---
-    /// Base cost of a transaction, in native units.
-    pub base_gas_native: u128,
+    /// Gas every transaction pays before anything else (Ethereum's 21,000).
+    pub intrinsic_gas: u64,
+    /// The genesis base fee floor per gas, in `gas_price_scale`ths of a native
+    /// unit (a micro-dollar).
+    pub base_fee_floor: u128,
+    /// The genesis gas target per one-second fee window.
+    pub gas_target: u64,
+    /// Fixed-point scale for per-gas prices.
+    pub gas_price_scale: u128,
     /// Fixed-point scale for gas asset exchange rates.
     pub gas_rate_scale: u128,
     /// Maximum transactions a block may contain.
@@ -142,7 +149,10 @@ pub const BETA: Params = Params {
     challenger_bond: 100_000,
     slash_reward_percent: 50,
 
-    base_gas_native: 1_000,
+    intrinsic_gas: 21_000,
+    base_fee_floor: 25_000_000_000,
+    gas_target: 5_000_000,
+    gas_price_scale: 1_000_000_000_000,
     gas_rate_scale: 1_000_000,
     max_block_transactions: 512,
 

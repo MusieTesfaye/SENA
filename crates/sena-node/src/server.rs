@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tiny_http::{Header, Method, Response as HttpResponse, Server};
-
+use crate::http::{Body, HttpRequest, HttpResponse, HttpServer};
 use crate::rpc::{handle, Request, Response};
 use crate::sequencer::Sequencer;
 use crate::store::Store;
@@ -43,6 +42,10 @@ pub struct ServerConfig {
     pub rate_limit_per_minute: u32,
     /// Largest request body accepted, in bytes.
     pub max_body_bytes: usize,
+    /// Browser origins allowed to call the node (CORS), e.g.
+    /// `http://localhost:5173`; `*` allows any. Empty allows none, so a web
+    /// page cannot reach the node unless its operator says so.
+    pub cors_origins: Vec<String>,
 }
 
 /// A fixed-window request counter, keyed by client.
@@ -88,6 +91,7 @@ impl Default for ServerConfig {
             auth_token: None,
             rate_limit_per_minute: 600,
             max_body_bytes: 1 << 20,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -126,9 +130,6 @@ fn unix_now() -> u64 {
 ///
 /// Returns [`ServerError`] if the address cannot be bound or a persist fails.
 ///
-/// # Panics
-///
-/// Does not panic: the only `expect` is on a static header value.
 pub fn run(
     sequencer: &mut Sequencer,
     store: &Store,
@@ -136,10 +137,11 @@ pub fn run(
     config: &ServerConfig,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(), ServerError> {
-    let server = Server::http(&config.listen).map_err(|e| ServerError::Bind {
-        address: config.listen.clone(),
-        detail: e.to_string(),
-    })?;
+    let server =
+        HttpServer::bind(&config.listen, config.max_body_bytes).map_err(|e| ServerError::Bind {
+            address: config.listen.clone(),
+            detail: e.to_string(),
+        })?;
 
     println!("sena-node listening on http://{}", config.listen);
     println!("  chain            {}", config.chain_id);
@@ -198,15 +200,23 @@ pub fn run(
             )?;
         }
 
-        match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(mut request)) => {
-                let response = serve(sequencer, config, &mut limiter, &mut request);
-                let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .expect("static header is valid");
-                let _ = request.respond(HttpResponse::from_string(response).with_header(header));
+        if let Some(incoming) = server.recv_timeout(Duration::from_millis(200)) {
+            let mut headers = cors_headers(&config.cors_origins, &incoming.request);
+            if incoming.request.method == "OPTIONS" {
+                incoming.respond(HttpResponse {
+                    status: 204,
+                    headers,
+                    body: String::new(),
+                });
+                continue;
             }
-            Ok(None) => {}
-            Err(error) => eprintln!("request error: {error}"),
+            let body = serve(sequencer, config, &mut limiter, &incoming.request);
+            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            incoming.respond(HttpResponse {
+                status: 200,
+                headers,
+                body,
+            });
         }
     }
 
@@ -219,6 +229,29 @@ pub fn run(
     )?;
     println!("state persisted to {}", store.path().display());
     Ok(())
+}
+
+/// The CORS headers for a request: none unless its `Origin` is allowed.
+fn cors_headers(allowed: &[String], request: &HttpRequest) -> Vec<(String, String)> {
+    let Some(origin) = request.header("Origin").map(ToOwned::to_owned) else {
+        return Vec::new();
+    };
+    if !allowed.iter().any(|a| a == "*" || *a == origin) {
+        return Vec::new();
+    }
+    [
+        ("Access-Control-Allow-Origin", origin.as_str()),
+        ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+        (
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        ),
+        ("Access-Control-Max-Age", "600"),
+        ("Vary", "Origin"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+    .collect()
 }
 
 /// Finalizes every assertion whose challenge window has elapsed.
@@ -239,22 +272,17 @@ fn serve(
     sequencer: &mut Sequencer,
     config: &ServerConfig,
     limiter: &mut RateLimiter,
-    request: &mut tiny_http::Request,
+    request: &HttpRequest,
 ) -> String {
-    if *request.method() != Method::Post {
+    if request.method != "POST" {
         return error_json("send a JSON-RPC request as an HTTP POST body");
     }
 
     // Authenticate before doing any work, so an unauthorised caller cannot make
     // the node parse a megabyte of JSON on their behalf.
     if let Some(expected) = &config.auth_token {
-        let presented = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .map(|h| h.value.as_str().to_owned())
-            .unwrap_or_default();
-        let offered = presented.strip_prefix("Bearer ").unwrap_or(&presented);
+        let presented = request.header("Authorization").unwrap_or_default();
+        let offered = presented.strip_prefix("Bearer ").unwrap_or(presented);
         // Length-independent comparison is unnecessary here: the token is a
         // shared secret over a local transport, not a per-message MAC.
         if offered != expected {
@@ -263,30 +291,25 @@ fn serve(
     }
 
     let client = request
-        .remote_addr()
-        .map_or_else(|| "unknown".to_owned(), |addr| addr.ip().to_string());
+        .remote
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
     if !limiter.allow(&client, unix_now(), config.rate_limit_per_minute) {
         return error_json("rate limit exceeded");
     }
 
-    // A body larger than the cap is refused without being read into memory.
-    if let Some(len) = request.body_length() {
-        if len > config.max_body_bytes {
+    // A body larger than the cap was refused without being read into memory.
+    let body = match &request.body {
+        Body::Text(body) => body,
+        Body::TooLarge(len) => {
             return error_json(&format!(
                 "request body of {len} bytes exceeds the {} byte limit",
                 config.max_body_bytes
-            ));
+            ))
         }
-    }
+        Body::Unreadable => return error_json("request body could not be read"),
+    };
 
-    let mut body = String::new();
-    let cap = config.max_body_bytes as u64;
-    let mut capped_reader = std::io::Read::take(request.as_reader(), cap);
-    if std::io::Read::read_to_string(&mut capped_reader, &mut body).is_err() {
-        return error_json("request body could not be read");
-    }
-
-    let parsed: Request = match serde_json::from_str(&body) {
+    let parsed: Request = match serde_json::from_str(body) {
         Ok(request) => request,
         Err(error) => return error_json(&format!("malformed request: {error}")),
     };

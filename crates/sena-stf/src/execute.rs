@@ -17,11 +17,12 @@ use sena_state::{hash_value, MerkleProof, MerkleTrie, ProofError};
 use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, BalanceError};
-use crate::gas::{self, GasError, WhitelistedAsset};
+use crate::gas::{self, FeeMarket, FeeSplit, GasError, WhitelistedAsset};
 use crate::governance::{self, Council, GovernanceError, GovernanceUpdate};
 use crate::instruction::{Instruction, MachineState};
+use crate::keyless::{KeylessConfig, KeylessContext};
 use crate::social::SocialBinding;
-use crate::transaction::{AuthError, Payload, Transaction};
+use crate::transaction::{AuthError, Authenticator, Payload, Transaction};
 
 /// The system-controlled vault that collects fees (REQ-GAS-007).
 ///
@@ -29,13 +30,6 @@ use crate::transaction::{AuthError, Payload, Transaction};
 /// and no signing key maps to it, so the fees it accumulates can only be moved
 /// by a protocol rule, never by whoever holds a private key.
 pub const FEE_VAULT: L2Address = L2Address::from_bytes([0xFE; 32]);
-
-/// The base cost of a transaction, in native units.
-///
-/// Re-exported from [`crate::gas`], where the conversion into a whitelisted
-/// asset is defined. Pricing by the work a transaction actually performs needs
-/// per-instruction metering and is tracked as follow-up work.
-pub use crate::gas::BASE_GAS_NATIVE;
 
 /// Why a single step failed.
 ///
@@ -95,6 +89,51 @@ pub enum StepError {
     /// A governance check failed.
     #[error("governance error: {0}")]
     Governance(#[from] GovernanceError),
+    /// The keyless proof was made against a JWK the network does not accept
+    /// for that issuer, or has retired.
+    #[error("JWK is not accepted for this issuer")]
+    JwkNotAccepted,
+    /// The transaction declared an intrinsic gas the asset does not charge.
+    #[error("declared intrinsic gas {declared} does not match the asset's {on_chain}")]
+    IntrinsicGasMismatch {
+        /// What the transaction claimed.
+        declared: u64,
+        /// What the asset record holds.
+        on_chain: u64,
+    },
+    /// The batch declared a base fee other than the one in force.
+    #[error("batch declared base fee {declared}, but the fee market is at {actual}")]
+    BaseFeeMismatch {
+        /// What the batch declared.
+        declared: u128,
+        /// The base fee in force.
+        actual: u128,
+    },
+    /// The window has no room for the transaction's gas.
+    #[error("the fee market window is full")]
+    WindowFull,
+    /// The fee split in force is not the one declared, or there is none.
+    #[error("the declared fee split is not the one in force")]
+    FeeSplitMismatch,
+}
+
+/// Encodes a JWK acceptance record: one byte, `1` accepted, `0` retired.
+#[must_use]
+pub fn encode_jwk_record(active: bool) -> Vec<u8> {
+    vec![u8::from(active)]
+}
+
+/// Decodes a JWK acceptance record, refusing anything but `0` or `1`.
+///
+/// # Errors
+///
+/// Returns [`StepError::MalformedSlot`] for any other encoding.
+pub fn decode_jwk_record(bytes: &[u8]) -> Result<bool, StepError> {
+    match bytes {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(StepError::MalformedSlot),
+    }
 }
 
 /// The complete semantics of the instruction set.
@@ -159,7 +198,34 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
                 _ => Err(StepError::IdentifierNotHeld),
             }
         }
-        Instruction::VerifyGasAsset { rate, .. } => {
+        Instruction::VerifyGasAsset { .. }
+        | Instruction::ChargeBaseFee { .. }
+        | Instruction::VerifyFeeSplit { .. } => fee_transition(instruction, current),
+        Instruction::VerifyCouncil { .. }
+        | Instruction::SetGasAsset { .. }
+        | Instruction::SetParameter { .. }
+        | Instruction::SetFeeMarket { .. }
+        | Instruction::SetFeeSplit { .. }
+        | Instruction::DisableGasAsset { .. } => governance_transition(instruction, current),
+        Instruction::VerifyJwk { .. } => {
+            let bytes = current.ok_or(StepError::JwkNotAccepted)?;
+            if !decode_jwk_record(bytes)? {
+                return Err(StepError::JwkNotAccepted);
+            }
+            Ok(bytes.to_vec())
+        }
+        Instruction::SetJwk { active, .. } => Ok(encode_jwk_record(*active)),
+    }
+}
+
+/// The fee half of [`transition`]: the checks a transaction's fee rests on.
+fn fee_transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<Vec<u8>, StepError> {
+    match instruction {
+        Instruction::VerifyGasAsset {
+            rate,
+            intrinsic_gas,
+            ..
+        } => {
             let bytes = current.ok_or(StepError::AssetNotWhitelisted)?;
             let record = WhitelistedAsset::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
             if !record.enabled {
@@ -171,16 +237,72 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
                     on_chain: record.rate,
                 });
             }
+            if record.intrinsic_gas != *intrinsic_gas {
+                return Err(StepError::IntrinsicGasMismatch {
+                    declared: *intrinsic_gas,
+                    on_chain: record.intrinsic_gas,
+                });
+            }
             // A read-only step: the slot is written back byte-identical, so the
             // state root is unchanged and the step is still a single-slot write
             // like every other.
             Ok(bytes.to_vec())
         }
-        Instruction::VerifyCouncil { digest, signatures } => {
-            let bytes = current.ok_or(GovernanceError::MalformedCouncil)?;
-            let council = Council::decode(bytes)?;
-            governance::verify_council_signatures(&council, digest, signatures)?;
+        Instruction::ChargeBaseFee {
+            timestamp,
+            base_fee,
+            gas,
+        } => {
+            let mut market = decode_fee_market(current)?.at(*timestamp)?;
+            if market.base_fee != *base_fee {
+                return Err(StepError::BaseFeeMismatch {
+                    declared: *base_fee,
+                    actual: market.base_fee,
+                });
+            }
+            market.window_gas = market
+                .window_gas
+                .checked_add(*gas)
+                .filter(|g| *g <= market.window_limit())
+                .ok_or(StepError::WindowFull)?;
+            Ok(market.encode())
+        }
+        Instruction::VerifyFeeSplit { split } => {
+            let bytes = current.ok_or(StepError::FeeSplitMismatch)?;
+            if bytes != split.encode().as_slice() {
+                return Err(StepError::FeeSplitMismatch);
+            }
             Ok(bytes.to_vec())
+        }
+        _ => unreachable!("only fee instructions are routed here"),
+    }
+}
+
+/// The governance half of [`transition`]: council verification and the two
+/// writes it authorises.
+fn governance_transition(
+    instruction: &Instruction,
+    current: Option<&[u8]>,
+) -> Result<Vec<u8>, StepError> {
+    match instruction {
+        Instruction::VerifyCouncil {
+            epoch,
+            digest,
+            signatures,
+            guardian,
+        } => {
+            let bytes = current.ok_or(GovernanceError::MalformedCouncil)?;
+            let mut council = Council::decode(bytes)?;
+            if council.epoch != *epoch {
+                return Err(GovernanceError::WrongEpoch {
+                    expected: council.epoch,
+                    signed: *epoch,
+                }
+                .into());
+            }
+            governance::verify_council_signatures(&council, digest, signatures, *guardian)?;
+            council.epoch = council.epoch.checked_add(1).ok_or(BalanceError::Overflow)?;
+            Ok(council.encode())
         }
         Instruction::SetGasAsset { record } => {
             GovernanceUpdate::SetGasAsset {
@@ -200,6 +322,48 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             .check_permitted()?;
             Ok(value.to_be_bytes().to_vec())
         }
+        Instruction::SetFeeMarket { floor, target } => {
+            GovernanceUpdate::SetFeeMarket {
+                floor: *floor,
+                target: *target,
+            }
+            .check_permitted()?;
+            let market = decode_fee_market(current)?;
+            Ok(FeeMarket {
+                base_fee: market.base_fee.max(*floor),
+                floor: *floor,
+                target: *target,
+                ..market
+            }
+            .encode())
+        }
+        Instruction::SetFeeSplit { split } => {
+            GovernanceUpdate::SetFeeSplit {
+                split: split.clone(),
+            }
+            .check_permitted()?;
+            Ok(split.encode())
+        }
+        Instruction::DisableGasAsset { .. } => {
+            let bytes = current.ok_or(StepError::AssetNotWhitelisted)?;
+            let mut record =
+                WhitelistedAsset::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+            record.enabled = false;
+            Ok(record.encode())
+        }
+        _ => unreachable!("only governance instructions are routed here"),
+    }
+}
+
+/// The fee market a slot holds; an empty slot is the genesis market, so a
+/// chain started without one behaves as if it had the defaults.
+fn decode_fee_market(current: Option<&[u8]>) -> Result<FeeMarket, StepError> {
+    match current {
+        None => Ok(FeeMarket::genesis(
+            gas::DEFAULT_BASE_FEE_FLOOR,
+            gas::DEFAULT_GAS_TARGET,
+        )),
+        Some(bytes) => FeeMarket::decode(bytes).map_err(|_| StepError::MalformedSlot),
     }
 }
 
@@ -298,14 +462,10 @@ pub enum CompileError {
     /// The transaction is not authorised.
     #[error("authentication failed: {0}")]
     Auth(#[from] AuthError),
-    /// The fee the sender allowed is below what the network charges.
-    #[error("max fee {offered} is below the required fee {required}")]
-    FeeTooLow {
-        /// What the sender was willing to pay.
-        offered: u128,
-        /// What the network charges.
-        required: u128,
-    },
+    /// A fee distribution is malformed: nothing to distribute, or a split
+    /// that does not add up.
+    #[error("fee distribution is malformed")]
+    BadDistribution,
     /// A transfer named the sender as its own recipient.
     ///
     /// Self-transfers are rejected rather than treated as a no-op. Compiled
@@ -321,6 +481,53 @@ pub enum CompileError {
     /// The governance update is not one the council may make.
     #[error("governance error: {0}")]
     Governance(#[from] GovernanceError),
+    /// The transaction exceeds the wire-format limits L1 can adjudicate.
+    #[error("transaction exceeds wire limits: {0}")]
+    Wire(#[from] crate::wire::WireError),
+}
+
+/// What a batch is executed against, besides state.
+///
+/// Both values are part of the published batch data: Aptos L1 compiles a
+/// disputed transaction with the same timestamp and the same keyless
+/// parameters, so they must be fixed per batch rather than read from a clock.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchContext<'a> {
+    /// The batch timestamp (Unix seconds), chosen by the sequencer and bounded
+    /// by L1 when the assertion is posted. Keyless ephemeral keys must not have
+    /// expired at this time, and it names the fee market window.
+    pub timestamp: u64,
+    /// The network's keyless parameters, or `None` if keyless is disabled.
+    pub keyless: Option<&'a KeylessConfig>,
+    /// The base fee the batch pays, in `PRICE_SCALE`ths of a native unit per
+    /// gas — what the fee market holds for `timestamp`. Published in the batch
+    /// header and checked in the trace by [`Instruction::ChargeBaseFee`].
+    pub base_fee: u128,
+    /// Where tips go: the sequencer's account (Ethereum's coinbase).
+    pub fee_recipient: L2Address,
+}
+
+impl BatchContext<'_> {
+    /// A context with keyless accounts disabled, the genesis base fee, and
+    /// tips paid to the fee vault.
+    #[must_use]
+    pub const fn without_keyless(timestamp: u64) -> Self {
+        BatchContext {
+            timestamp,
+            keyless: None,
+            base_fee: gas::DEFAULT_BASE_FEE_FLOOR,
+            fee_recipient: FEE_VAULT,
+        }
+    }
+
+    /// The part of the context a keyless check reads.
+    #[must_use]
+    pub fn keyless_context(&self) -> KeylessContext<'_> {
+        KeylessContext {
+            config: self.keyless,
+            now: self.timestamp,
+        }
+    }
 }
 
 /// Turns an authorised transaction into the instructions that execute it.
@@ -341,45 +548,133 @@ pub enum CompileError {
 /// and why council signatures are checked by [`Instruction::VerifyCouncil`]
 /// rather than during compilation.
 ///
+/// The context — batch timestamp and keyless parameters — is not state: it is
+/// fixed for the whole batch and published with it.
+///
 /// # Errors
 ///
 /// Returns [`CompileError`] if the transaction is unauthorised or malformed.
-pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileError> {
-    transaction.authenticate()?;
-
-    let fee = gas::fee_for(transaction.fee_rate)?;
-    if transaction.max_fee < fee {
-        return Err(CompileError::FeeTooLow {
-            offered: transaction.max_fee,
-            required: fee,
-        });
+pub fn compile(
+    transaction: &Transaction,
+    ctx: &BatchContext<'_>,
+) -> Result<Vec<Instruction>, CompileError> {
+    // Size limits first: Aptos L1 must be able to decode and compile anything
+    // a batch contains, and it refuses what is over these bounds.
+    let encoded_len = transaction.encode().len();
+    if encoded_len > crate::wire::MAX_TRANSACTION_BYTES {
+        return Err(crate::wire::WireError::TooLarge(encoded_len).into());
     }
+    if let Payload::Governance { signatures, .. } = &transaction.payload {
+        if signatures.len() > crate::wire::MAX_COUNCIL_SIGNATURES {
+            return Err(crate::wire::WireError::TooManySignatures.into());
+        }
+    }
+    transaction.authenticate(&ctx.keyless_context())?;
 
     let sender = transaction.sender;
-    let mut instructions = vec![
+    let (charge, payload) = charge_and_payload(transaction, ctx)?;
+
+    let asset = transaction.fee_asset;
+    let mut instructions = Vec::new();
+    // The proof was checked above; whether its JWK is current is state.
+    if let Authenticator::Keyless(sig) = &transaction.authenticator {
+        instructions.push(Instruction::VerifyJwk {
+            iss_hash: sig.iss_hash,
+            jwk_hash: sig.jwk_hash,
+        });
+    }
+    instructions.extend([
         Instruction::ConsumeNonce {
             account: sender,
             expected: transaction.nonce,
         },
-        // Validate the declared rate against the whitelist before charging on
-        // the strength of it.
+        // Validate what the sender declared about the asset, and what the
+        // sequencer declared about the base fee, before charging on them.
         Instruction::VerifyGasAsset {
-            asset: transaction.fee_asset,
+            asset,
             rate: transaction.fee_rate,
+            intrinsic_gas: transaction.fee_intrinsic_gas,
         },
+        Instruction::ChargeBaseFee {
+            timestamp: ctx.timestamp,
+            base_fee: ctx.base_fee,
+            gas: charge.gas_used,
+        },
+        // Celo's debitGasFees: the whole limit, before the payload runs.
         Instruction::Debit {
             account: sender,
-            asset: transaction.fee_asset,
-            amount: fee,
+            asset,
+            amount: charge.hold,
         },
-        Instruction::Credit {
-            account: FEE_VAULT,
-            asset: transaction.fee_asset,
-            amount: fee,
-        },
-    ];
+    ]);
+    instructions.extend(payload);
+    // Celo's creditGasFees, which never credits a zero amount.
+    for (account, amount) in [
+        (sender, charge.refund),
+        (ctx.fee_recipient, charge.tip),
+        (FEE_VAULT, charge.base),
+    ] {
+        if amount > 0 {
+            instructions.push(Instruction::Credit {
+                account,
+                asset,
+                amount,
+            });
+        }
+    }
+    Ok(instructions)
+}
 
-    match &transaction.payload {
+/// The gas a transaction uses, for choosing its gas limit. Needs no signature.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] if the payload does not compile.
+pub fn gas_required(transaction: &Transaction) -> Result<u64, CompileError> {
+    let mut payload = Vec::new();
+    compile_payload(&transaction.payload, transaction.sender, &mut payload)?;
+    Ok(gas::gas_used(transaction, &payload)?)
+}
+
+/// What a transaction pays in a batch with context `ctx`: its hold, refund,
+/// tip and base fee. Needs no signature, so a wallet can quote before signing.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] if the payload does not compile or the fee terms
+/// do not cover the batch's base fee.
+pub fn fee_charge(
+    transaction: &Transaction,
+    ctx: &BatchContext<'_>,
+) -> Result<gas::FeeCharge, CompileError> {
+    Ok(charge_and_payload(transaction, ctx)?.0)
+}
+
+fn charge_and_payload(
+    transaction: &Transaction,
+    ctx: &BatchContext<'_>,
+) -> Result<(gas::FeeCharge, Vec<Instruction>), CompileError> {
+    let mut payload = Vec::new();
+    compile_payload(&transaction.payload, transaction.sender, &mut payload)?;
+    let charge = gas::settle(
+        transaction.gas_limit,
+        gas::gas_used(transaction, &payload)?,
+        transaction.max_fee_per_gas,
+        transaction.max_priority_fee_per_gas,
+        ctx.base_fee,
+        transaction.fee_rate,
+    )?;
+    Ok((charge, payload))
+}
+
+/// Appends the instructions a payload compiles to, between holding the fee and
+/// settling it.
+fn compile_payload(
+    payload: &Payload,
+    sender: L2Address,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    match payload {
         Payload::Transfer { to, asset, amount } => {
             if *to == sender {
                 return Err(CompileError::SelfTransfer);
@@ -414,8 +709,10 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
         } => {
             update.check_permitted()?;
             instructions.push(Instruction::VerifyCouncil {
+                epoch: *epoch,
                 digest: update.signing_digest(*epoch),
                 signatures: signatures.clone(),
+                guardian: update.guardian_may_apply(),
             });
             instructions.push(match update {
                 GovernanceUpdate::SetGasAsset { record } => Instruction::SetGasAsset {
@@ -425,11 +722,69 @@ pub fn compile(transaction: &Transaction) -> Result<Vec<Instruction>, CompileErr
                     name: name.clone(),
                     value: *value,
                 },
+                GovernanceUpdate::SetJwk {
+                    iss_hash,
+                    jwk_hash,
+                    active,
+                } => Instruction::SetJwk {
+                    iss_hash: *iss_hash,
+                    jwk_hash: *jwk_hash,
+                    active: *active,
+                },
+                GovernanceUpdate::SetFeeMarket { floor, target } => Instruction::SetFeeMarket {
+                    floor: *floor,
+                    target: *target,
+                },
+                GovernanceUpdate::SetFeeSplit { split } => Instruction::SetFeeSplit {
+                    split: split.clone(),
+                },
+                GovernanceUpdate::DisableGasAsset { asset } => {
+                    Instruction::DisableGasAsset { asset: *asset }
+                }
             });
+        }
+        Payload::DistributeFees {
+            asset,
+            amount,
+            split,
+        } => {
+            if *amount == 0 || split.check().is_err() {
+                return Err(CompileError::BadDistribution);
+            }
+            compile_distribution(*asset, *amount, split, instructions)?;
         }
     }
 
-    Ok(instructions)
+    Ok(())
+}
+
+/// A fee distribution: check the split, take `amount` from the vault, and pay
+/// each beneficiary its share. What the shares leave, rounding included, is
+/// burned by not being credited anywhere.
+fn compile_distribution(
+    asset: AssetId,
+    amount: u128,
+    split: &FeeSplit,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    instructions.push(Instruction::VerifyFeeSplit {
+        split: split.clone(),
+    });
+    instructions.push(Instruction::Debit {
+        account: FEE_VAULT,
+        asset,
+        amount,
+    });
+    for (account, value) in split.shares_of(amount)? {
+        if value > 0 {
+            instructions.push(Instruction::Credit {
+                account,
+                asset,
+                amount: value,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The full record of executing a batch, and the input to a fraud proof.
@@ -443,9 +798,35 @@ pub struct ExecutionTrace {
     /// `instructions[i]`, and the last entry is the state after the batch.
     /// Bisection indexes into this.
     pub states: Vec<MachineState>,
+    /// Where each transaction's instructions begin, one entry per transaction.
+    /// What the batch commitment's leaves record as `start_pc`.
+    pub tx_starts: Vec<u64>,
 }
 
 impl ExecutionTrace {
+    /// Builds the batch commitment tree for the transactions this trace
+    /// executed, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `transactions` is not the batch the trace was produced from
+    /// (a different count).
+    #[must_use]
+    pub fn batch_tree(&self, transactions: &[Transaction]) -> crate::batch::BatchTree {
+        assert_eq!(
+            transactions.len(),
+            self.tx_starts.len(),
+            "the trace and the batch must match"
+        );
+        let leaves: Vec<(u64, Vec<u8>)> = self
+            .tx_starts
+            .iter()
+            .zip(transactions)
+            .map(|(start, tx)| (*start, tx.encode()))
+            .collect();
+        crate::batch::BatchTree::build(&leaves)
+    }
+
     /// Returns the number of steps in the trace.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -538,14 +919,17 @@ pub enum BatchError {
 /// should execute against a clone.
 pub fn execute_batch(
     trie: &mut MerkleTrie,
+    ctx: &BatchContext<'_>,
     transactions: &[Transaction],
 ) -> Result<ExecutionTrace, BatchError> {
     let mut instructions = Vec::new();
     let mut states = vec![MachineState::start(trie.root())];
+    let mut tx_starts = Vec::with_capacity(transactions.len());
 
     for (index, transaction) in transactions.iter().enumerate() {
+        tx_starts.push(u64::try_from(instructions.len()).expect("trace length fits in u64"));
         let compiled =
-            compile(transaction).map_err(|source| BatchError::Compile { index, source })?;
+            compile(transaction, ctx).map_err(|source| BatchError::Compile { index, source })?;
 
         for instruction in compiled {
             let step = instructions.len();
@@ -565,6 +949,7 @@ pub fn execute_batch(
     Ok(ExecutionTrace {
         instructions,
         states,
+        tx_starts,
     })
 }
 

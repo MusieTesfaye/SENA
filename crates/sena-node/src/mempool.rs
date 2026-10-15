@@ -9,12 +9,24 @@
 //!
 //! Admission therefore runs the same compilation and execution the batch will,
 //! against a speculative copy of the state, and drops anything that fails.
+//!
+//! The pool keeps the state after its whole queue (the *tip*) and checks a
+//! candidate against that alone, so admission costs one transaction's
+//! execution rather than the queue's. Executing a batch is executing its
+//! transactions in order, so this is the same check -- with one exception:
+//! the fee market. A queue can hold more gas than one window, spread over
+//! later batches, so each candidate is charged against the window as the
+//! canonical state has it, not as the queue ahead of it would leave it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use sena_primitives::AssetId;
 use sena_primitives::{Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, Transaction};
+use sena_stf::gas::{DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET};
+use sena_stf::{
+    execute_batch, gas_required, keys, BatchContext, BatchError, FeeMarket, Transaction,
+};
 
 /// Why a transaction was not admitted.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
@@ -39,6 +51,15 @@ pub enum RejectReason {
     },
 }
 
+/// The state after the queue, and the root before each queued transaction.
+#[derive(Clone, Debug)]
+struct Tip {
+    /// `roots[i]` is the state root before `queued[i]`; the last entry is
+    /// the root of `state`. `roots[0]` is the base state the queue builds on.
+    roots: Vec<Hash256>,
+    state: MerkleTrie,
+}
+
 /// A queue of transactions awaiting inclusion.
 #[derive(Clone, Debug)]
 pub struct Mempool {
@@ -46,6 +67,10 @@ pub struct Mempool {
     /// incidental: a verifier replays the batch exactly as published, so
     /// whatever order the sequencer chooses must be reproducible.
     queued: Vec<Transaction>,
+    /// Hashes of the queued transactions.
+    hashes: BTreeSet<Hash256>,
+    /// The speculative state after the queue, if known.
+    tip: Option<Tip>,
     /// Nonces already claimed by queued transactions, by sender.
     claimed: BTreeMap<L2Address, Vec<u64>>,
     capacity: usize,
@@ -57,6 +82,8 @@ impl Mempool {
     pub fn new(capacity: usize) -> Self {
         Self {
             queued: Vec::new(),
+            hashes: BTreeSet::new(),
+            tip: None,
             claimed: BTreeMap::new(),
             capacity,
         }
@@ -89,13 +116,14 @@ impl Mempool {
     pub fn submit(
         &mut self,
         state: &MerkleTrie,
+        ctx: &BatchContext<'_>,
         transaction: Transaction,
     ) -> Result<Hash256, RejectReason> {
         if self.queued.len() >= self.capacity {
             return Err(RejectReason::Full);
         }
         let hash = transaction.hash();
-        if self.queued.iter().any(|t| t.hash() == hash) {
+        if self.hashes.contains(&hash) {
             return Err(RejectReason::Duplicate);
         }
         if let Some(nonces) = self.claimed.get(&transaction.sender) {
@@ -106,18 +134,19 @@ impl Mempool {
             }
         }
 
-        // Execute the whole pending batch plus this candidate against a
-        // throwaway copy. Checking the candidate alone would miss a transaction
-        // that only becomes invalid because of what is already queued -- a
-        // sender spending the same balance twice, for instance.
-        let mut speculative = state.clone();
-        let mut candidate_batch = self.queued.clone();
-        candidate_batch.push(transaction.clone());
-        if let Err(error) = execute_batch(&mut speculative, &candidate_batch) {
-            return Err(RejectReason::WouldNotExecute {
+        // Execute the candidate after everything already queued. Checking it
+        // against `state` alone would miss a transaction that only becomes
+        // invalid because of what is queued -- a sender spending the same
+        // balance twice, for instance.
+        let tip = self.tip_over(state, ctx);
+        let speculative = admit(state, &tip.state, ctx, &transaction).map_err(|error| {
+            RejectReason::WouldNotExecute {
                 reason: error.to_string(),
-            });
-        }
+            }
+        })?;
+        tip.roots.push(speculative.root());
+        tip.state = speculative;
+        self.hashes.insert(hash);
 
         self.claimed
             .entry(transaction.sender)
@@ -127,10 +156,105 @@ impl Mempool {
         Ok(hash)
     }
 
+    /// The tip over `state`, rebuilt if the queue does not build on `state`
+    /// (after a block that dropped or reordered queued transactions, say).
+    /// Rebuilding drops queued transactions that no longer execute.
+    fn tip_over(&mut self, state: &MerkleTrie, ctx: &BatchContext<'_>) -> &mut Tip {
+        let valid = self.tip.as_ref().is_some_and(|t| {
+            t.roots.first() == Some(&state.root()) && t.roots.len() == self.queued.len() + 1
+        });
+        if !valid {
+            let mut tip = Tip {
+                roots: vec![state.root()],
+                state: state.clone(),
+            };
+            let mut kept = Vec::with_capacity(self.queued.len());
+            for transaction in std::mem::take(&mut self.queued) {
+                if let Ok(next) = admit(state, &tip.state, ctx, &transaction) {
+                    tip.roots.push(next.root());
+                    tip.state = next;
+                    kept.push(transaction);
+                }
+            }
+            self.queued = kept;
+            self.reindex();
+            self.tip = Some(tip);
+        }
+        self.tip.as_mut().expect("just set")
+    }
+
+    /// Rebuilds the hash and nonce indexes from the queue.
+    fn reindex(&mut self) {
+        self.hashes = self.queued.iter().map(Transaction::hash).collect();
+        self.claimed.clear();
+        for t in &self.queued {
+            self.claimed.entry(t.sender).or_default().push(t.nonce);
+        }
+    }
+
     /// Removes and returns up to `limit` transactions for inclusion in a batch.
     pub fn take_batch(&mut self, limit: usize) -> Vec<Transaction> {
-        let taken: Vec<_> = self.queued.drain(..limit.min(self.queued.len())).collect();
+        self.take_batch_within(limit, usize::MAX)
+    }
+
+    /// Removes and returns the longest prefix of the queue that fits in
+    /// `limit` transactions, `max_bytes` of encoding and `gas_budget` gas,
+    /// with transactions paying in each asset using at most `asset_cap(asset)`
+    /// gas between them.
+    ///
+    /// Stops at the first transaction that does not fit rather than skipping
+    /// it: anything after it may depend on it (a later nonce, a balance it
+    /// creates), so only a prefix of the queue is known to execute.
+    pub fn take_batch_fitting(
+        &mut self,
+        limit: usize,
+        max_bytes: usize,
+        gas_budget: u64,
+        asset_cap: impl Fn(AssetId) -> u64,
+    ) -> Vec<Transaction> {
+        let mut gas = 0u64;
+        let mut per_asset: BTreeMap<AssetId, u64> = BTreeMap::new();
+        let mut fitting = 0;
+        for transaction in self.queued.iter().take(limit) {
+            let need = gas_required(transaction).unwrap_or(u64::MAX);
+            let asset_gas = per_asset.get(&transaction.fee_asset).copied().unwrap_or(0);
+            let fits = gas.checked_add(need).is_some_and(|g| g <= gas_budget)
+                && asset_gas
+                    .checked_add(need)
+                    .is_some_and(|g| g <= asset_cap(transaction.fee_asset));
+            if !fits {
+                break;
+            }
+            gas += need;
+            per_asset.insert(transaction.fee_asset, asset_gas + need);
+            fitting += 1;
+        }
+        self.take_batch_within(fitting, max_bytes)
+    }
+
+    /// Removes and returns the longest prefix of the queue of at most `limit`
+    /// transactions whose encodings total at most `max_bytes` — always at
+    /// least one transaction if any is queued.
+    ///
+    /// Only a prefix is ever taken: admission checked each transaction after
+    /// everything ahead of it, so a prefix of the queue still executes.
+    pub fn take_batch_within(&mut self, limit: usize, max_bytes: usize) -> Vec<Transaction> {
+        let mut count = 0;
+        let mut size = 0usize;
+        for transaction in self.queued.iter().take(limit) {
+            size = size.saturating_add(transaction.encode().len());
+            if count > 0 && size > max_bytes {
+                break;
+            }
+            count += 1;
+        }
+        let taken: Vec<_> = self.queued.drain(..count).collect();
+        if let Some(tip) = &mut self.tip {
+            // The queue now builds on the state after what was taken.
+            tip.roots.drain(..count);
+        }
         for transaction in &taken {
+            self.hashes.remove(&transaction.hash());
             if let Some(nonces) = self.claimed.get_mut(&transaction.sender) {
                 nonces.retain(|n| *n != transaction.nonce);
             }
@@ -145,6 +269,29 @@ impl Mempool {
     /// longer exists.
     pub fn clear(&mut self) {
         self.queued.clear();
+        self.hashes.clear();
+        self.tip = None;
         self.claimed.clear();
     }
+}
+
+/// Executes `transaction` on top of `tip`, charging its gas against the fee
+/// market window as `base` -- the canonical state -- has it.
+fn admit(
+    base: &MerkleTrie,
+    tip: &MerkleTrie,
+    ctx: &BatchContext<'_>,
+    transaction: &Transaction,
+) -> Result<MerkleTrie, BatchError> {
+    let mut next = tip.clone();
+    let slot = keys::fee_market();
+    let market = base.get(&slot).map_or_else(
+        || FeeMarket::genesis(DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET).encode(),
+        <[u8]>::to_vec,
+    );
+    if next.get(&slot) != Some(market.as_slice()) {
+        next.insert(slot, market);
+    }
+    execute_batch(&mut next, ctx, std::slice::from_ref(transaction))?;
+    Ok(next)
 }

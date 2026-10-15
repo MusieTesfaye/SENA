@@ -60,6 +60,17 @@ impl Channel {
         }
     }
 
+    /// The channel a discriminant names, if any.
+    #[must_use]
+    pub const fn from_discriminant(d: u8) -> Option<Self> {
+        match d {
+            0 => Some(Self::Email),
+            1 => Some(Self::Phone),
+            2 => Some(Self::Handle),
+            _ => None,
+        }
+    }
+
     /// The tag committed to in the identifier hash.
     #[must_use]
     pub const fn tag(self) -> &'static [u8] {
@@ -147,57 +158,6 @@ impl HashedIdentifier {
 impl fmt::Debug for HashedIdentifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HashedIdentifier({}…)", &self.0.to_hex()[..8])
-    }
-}
-
-/// A social identifier obfuscated with an ODIS (Oblivious Decentralized Identity Service)
-/// blinded pepper (Celo SocialConnect model).
-///
-/// # Protection Against Enumeration & Rainbow Tables
-///
-/// Unlike static network-salted hashes, an [`ObfuscatedIdentifier`] can only be computed
-/// by obtaining a pepper derived obliviously from an Oblivious PRF (OPRF).
-/// Because the pepper is derived obliviously from a master secret key held by the network,
-/// an attacker cannot compute candidate hashes offline. A rainbow table across phone
-/// numbers or emails is computationally and economically impossible.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ObfuscatedIdentifier(pub Hash256);
-
-impl ObfuscatedIdentifier {
-    /// Derives an obfuscated identifier from a channel, raw identifier, and an ODIS pepper.
-    #[must_use]
-    pub fn from_odis_pepper(channel: Channel, raw: &str, odis_pepper: &[u8]) -> Self {
-        let normalised = normalise(channel, raw);
-        Self(Hash256::commit(
-            CanonicalEncoder::new(domain::SOCIAL_ODIS)
-                .field(channel.tag())
-                .field(normalised.as_bytes())
-                .field(odis_pepper),
-        ))
-    }
-
-    /// Converts to a standard [`HashedIdentifier`] for storage and trie indexing.
-    #[must_use]
-    pub const fn to_hashed_identifier(&self) -> HashedIdentifier {
-        HashedIdentifier(self.0)
-    }
-
-    /// Returns the underlying digest.
-    #[must_use]
-    pub const fn as_hash(&self) -> &Hash256 {
-        &self.0
-    }
-
-    /// Returns the digest as a trie key.
-    #[must_use]
-    pub const fn as_key(&self) -> Hash256 {
-        self.0
-    }
-}
-
-impl fmt::Debug for ObfuscatedIdentifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ObfuscatedIdentifier({}…)", &self.0.to_hex()[..8])
     }
 }
 

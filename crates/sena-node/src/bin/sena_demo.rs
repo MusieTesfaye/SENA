@@ -17,10 +17,9 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::gas::fee_for;
 use sena_stf::{
-    apply, compile, keys, Account, Authenticator, ExecutionTrace, Instruction, MachineState,
-    Payload, Transaction, WhitelistedAsset, RATE_SCALE,
+    apply, compile, keys, Account, Authenticator, BatchContext, ExecutionTrace, Instruction,
+    MachineState, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
 
 use sena_fraudproof::{
@@ -29,6 +28,10 @@ use sena_fraudproof::{
 use sena_node::{Outcome, Sequencer, VerifierNode};
 
 const USDC: AssetId = AssetId(1);
+
+/// The demo uses only Ed25519 accounts, so the batch timestamp does not affect
+/// any outcome and keyless is off.
+const DEMO_CTX: BatchContext<'static> = BatchContext::without_keyless(0);
 const RATE: u128 = RATE_SCALE;
 const BOND: u128 = 1_000_000;
 
@@ -50,7 +53,7 @@ fn honest_operation() {
     let start = genesis(&[(address(&alice), 5_000_000), (address(&bob), 5_000_000)]);
 
     let mut sequencer = new_sequencer(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     println!("  genesis state root   {}", short(&sequencer.state.root()));
 
@@ -64,10 +67,7 @@ fn honest_operation() {
                 amount: 1_000,
             },
         );
-        sequencer
-            .mempool
-            .submit(&sequencer.state, tx)
-            .expect("admission should accept");
+        sequencer.submit(tx).expect("admission should accept");
     }
     println!("  {} transactions queued", sequencer.mempool.len());
 
@@ -136,12 +136,12 @@ fn fraud_is_caught() {
         .collect();
     let program: Vec<Instruction> = batch
         .iter()
-        .flat_map(|tx| compile(tx).expect("compiles"))
+        .flat_map(|tx| compile(tx, &DEMO_CTX).expect("compiles"))
         .collect();
 
     // The honest trace, which the verifier computes for itself.
     let mut honest_state = start.clone();
-    let honest = sena_stf::execute_batch(&mut honest_state, &batch).expect("executes");
+    let honest = sena_stf::execute_batch(&mut honest_state, &DEMO_CTX, &batch).expect("executes");
 
     // The sequencer's lie: it executes a debit of 1 where the batch says 1,000
     // and pockets the difference. The instruction list is unchanged -- only the
@@ -257,10 +257,7 @@ fn withdrawals_wait_for_finality() {
             amount: 500,
         },
     );
-    sequencer
-        .mempool
-        .submit(&sequencer.state, tx)
-        .expect("admission");
+    sequencer.submit(tx).expect("admission");
     let (_, id) = sequencer
         .produce(100)
         .expect("production")
@@ -342,14 +339,18 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
         sender: address(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE).expect("rate is valid"),
-        fee_rate: RATE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -367,6 +368,7 @@ fn genesis(accounts: &[(L2Address, u128)]) -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".to_owned(),
                 rate: RATE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },
@@ -422,5 +424,8 @@ fn falsify(
     ExecutionTrace {
         instructions: instructions.to_vec(),
         states,
+        // A forged trace over the same program: transaction boundaries are
+        // irrelevant to these tests, which dispute instruction steps.
+        tx_starts: Vec::new(),
     }
 }

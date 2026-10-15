@@ -5,21 +5,128 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
-### End-to-End Keyless Token Transfer with Live Node & Mobile Sync (`sena-node`, `sena-stf`, `sena-light-client`)
+### A browser wallet
 
-- Added canonical Groth16 verification to `Transaction::authenticate` validating keyless transactions against canonical BN254 verification keys and public inputs ($x_1, x_2, x_3$).
-- Implemented `sena-node/tests/keyless_app_e2e.rs`: full simulated client app workflow with Google OIDC logins for Alice and Bob, Ephemeral Key Pair (EPK) generation, 128-byte BN254 Groth16 ZK proof attestation, real HTTP submission to a live `sena-node`, block sealing, on-chain balance confirmation, and ultralight mobile verification via `sena-light-client`.
-- Added runnable CLI demo `sena-keyless-demo` (`crates/sena-node/src/bin/sena_keyless_demo.rs`) demonstrating the entire pipeline live with sub-millisecond mobile verification (<0.25ms).
-- Verified negative security paths: forged ZK proofs, tampered sender addresses, and invalid signatures are strictly rejected by the mempool.
+- `sena-wallet`: the I/O-free wallet logic, moved out of
+  `sena_node::keyless_client`, which now only sends requests.
+- `sena-wasm`: that logic compiled to WebAssembly for browsers
+  (`scripts/build-wasm.sh`), used by github.com/MusieTesfaye/wallet.
+- The node: `--cors-origin` lets named browser origins call it;
+  `sena_getFeeAssets` and `sena_getAccountTransactions`.
+- `scripts/wallet-devnet.py` starts a devnet that accepts Google sign-ins,
+  with four stablecoins and a funded faucet.
 
-### On-Chain Groth16 / BN254 ZK Verifier (`sena-stf`, `move/sena`)
+### Fixed
 
-- Implemented `Bn254Groth16Verifier` in `sena-stf` supporting on-chain pairing checks over the BN254 curve ($e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$).
-- Added `Bn254Proof` with 128-byte compressed and 256-byte uncompressed serialization, and validation against public input vectors.
-- Implemented `derive_keyless_public_inputs` binding the ephemeral key commitment ($x_1$), sender `L2Address` ($x_2$), and identity provider credentials & expiry ($x_3$).
-- Added `Transaction::authenticate_with_groth16` to authenticate keyless transactions via EPK Ed25519 signatures validated against Groth16 ZK proofs.
-- Added `sena::groth16` module to Aptos Move contracts leveraging `aptos_std::bn254_algebra` and `aptos_std::crypto_algebra` for L1 zero-knowledge verification.
-- Added comprehensive unit and integration tests across Rust (`tests/groth16_verification.rs`) and Move (`test_bn254_groth16_verification_pairing`).
+- RPC requests could hang while the node was healthy, when a browser held
+  idle connections open (a lost wakeup in `tiny_http`'s worker pool). The
+  node now uses a small HTTP transport of its own: one request per
+  connection, with timeouts.
+
+### Celo-style fees
+
+- Fees follow Celo's fee abstraction, without a native token
+  ([`docs/FEES.md`](docs/FEES.md)): metered gas (21,000 intrinsic plus each
+  asset's own intrinsic gas plus per-instruction costs), an EIP-1559 base fee
+  per one-second window with a governed floor and target, priced in
+  micro-dollars and converted at each asset's rate, and a hold of
+  `gas_limit ×` the effective price that is settled into refund, tip (to the
+  sequencer) and base fee (to the fee vault), with rounding remainders in the
+  base fee.
+- **Breaking:** transactions replace `max_fee` with `fee_intrinsic_gas`,
+  `gas_limit`, `max_fee_per_gas` and `max_priority_fee_per_gas`; the batch
+  header (and `assertions::post`) carries the base fee and tip recipient;
+  gas asset and council records gain fields. The wire format, signing digest
+  and package all change.
+- A governed fee split with permissionless `DistributeFees` (Celo's
+  `FeeHandler`), and a guardian threshold that may only disable a fee asset.
+- `sena_gasPrice` RPC; `sena-node send` uses it and a `--tip` option, and
+  `--fee-asset` to pay the fee in a different stablecoin from the one moved.
+- Tested with several stablecoins (`scripts/stablecoins-test.py`), and a
+  forged tip in a non-par stablecoin disputed to rejection on an Aptos
+  localnet (`scripts/localnet-dispute.sh fee`).
+- Per-asset block-space caps and window-sized batches in the sequencer.
+- Parameter set `sena-beta-params-2`.
+- Redeployed to Aptos testnet at new addresses.
+
+### On Aptos testnet
+
+- The current package is published on Aptos testnet. `chain-lifecycle.sh
+  testnet` passed 11/11 with real APT bonds, and 1 USDC was deposited into
+  bridge custody (`docs/beta/evidence/04-testnet-deployment.md`).
+- Chunked publishing passes `--large-packages-module-address 0x7`: CLI 7.9.0
+  defaults to the module's old testnet address, where staging fails with
+  `LINKER_ERROR`.
+- `bridge-test.sh` reads APT balances through `coin::balance`; new accounts
+  hold APT as a fungible asset and have no `CoinStore`.
+- `chain-lifecycle.sh` checks both accounts can pay before spending anything,
+  and says what to fund and how to rerun with the same accounts.
+- The Move tests also pass under Aptos CLI 9.0.0 and 9.6.0.
+
+### Disputes settle on Aptos, keyless included
+
+- **Every instruction is adjudicable on L1.** `sena::compiler` decodes,
+  authenticates and compiles the disputed transaction from published batch
+  data, as the node does, so neither party's account of the step is trusted.
+  `VerifyGasAsset`, `VerifyCouncil`, `SetGasAsset` and `SetParameter` no
+  longer abort, and the new `VerifyJwk` and `SetJwk` are adjudicable too.
+- **Keyless on L1.** `sena::keyless` recomputes the circuit's public-input hash
+  with Poseidon-BN254 and verifies the Groth16 proof against the Aptos mainnet
+  ceremony key. One verification exceeds a transaction's execution budget, so
+  `sena::keyless_jobs` computes it across transactions.
+- **Batch data is published on L1** with each assertion, which now carries a
+  batch timestamp; L1 computes the batch root itself. Batch-structure fraud
+  proofs cover uncompilable transactions, start-position gaps and wrong trace
+  lengths without a bisection game.
+- **Bonds and bridge custody move real fungible assets.**
+- A full keyless fraud dispute runs on a local Aptos node to rejection, for
+  4,809 gas units from post to rejection (`scripts/localnet-dispute.sh`).
+
+### An operator's agents
+
+- `sena-node relay` posts blocks with their batch data, defends them in
+  disputes and finalizes them; `sena-node watch` re-executes every assertion
+  from L1 data alone and challenges fraud. Both replace the earlier `relay`
+  command, whose flags have changed.
+- `sena_node::keyless_client`: wallet sessions, OAuth nonces, authenticator
+  assembly with the prover's public-inputs hash cross-checked, and clients
+  for the Aptos pepper and prover services.
+- `scripts/localnet-agents.sh` runs both agents against a localnet; a CI job
+  runs it and the dispute on every change.
+
+### Fixed
+
+- Mempool admission re-executed the whole queue for each transaction
+  (quadratic in a 4096-slot pool); it now checks the candidate against the
+  state after the queue.
+- Blocks are cut to 48 KiB of transaction data, so every batch fits the single
+  Aptos transaction that publishes it.
+- `scripts/chain-lifecycle.sh` and `scripts/bridge-test.sh` use the current
+  contract interfaces and `--chunked-publish`.
+
+### Keyless accounts on the Aptos Keyless circuit
+
+- Keyless verification now targets the audited Aptos Keyless circom circuit
+  (`circuit-v1.0.1`) and the Aptos mainnet ceremony verification key. Poseidon,
+  the public-input hash and every client-side derivation match aptos-core, and
+  Aptos's sample proof verifies end to end.
+- JWKs are L2 state under council governance; `VerifyJwk` checks them in the
+  trace. Batches carry a timestamp, against which ephemeral-key expiry is judged.
+- Keyless addresses are `H(iss_hash, idc)`; the old `derive_from_oidc` is gone.
+- Council signatures are now verified strictly, as L1 will verify them.
+- Genesis gains an optional `keyless` section (setup name and initial JWKs).
+
+### Security
+
+- **Fixed: any key could spend from any Ed25519 account.** Authentication now
+  requires the signing key to be the sender's and verifies strictly, matching
+  Aptos's `signature_verify_strict`.
+- **Withdrawn: the October 2026 keyless prototype.** Its Groth16 verifier used a
+  forgeable verification key, its ceremony and prover were placeholders, its JWK
+  check could be bypassed, and its pepper/ODIS services leaked peppers. The
+  code is quarantined in `attic/unsafe-keyless-2026-10/`; keyless accounts are
+  now built on the Aptos Keyless circuit (above).
+- The relayer no longer records a block as relayed when the L1 post fails.
 
 ### The Move contracts compile
 
@@ -53,11 +160,8 @@ stronger check: `codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust` and
 against what Rust produced. Previously only the Rust side ran, comparing
 constants in two files.
 
-Still true: nothing is deployed to any network, nothing is audited, bond escrow
-is bookkeeping rather than custody, and four instructions
-(`VerifyGasAsset`, `VerifyCouncil`, `SetGasAsset`, `SetParameter`) abort rather
-than being adjudicated — so a dispute over a gas-rate or governance step has no
-L1 resolution path.
+At the time, bond escrow was bookkeeping and four instructions could not be
+adjudicated; both are fixed above.
 
 ### Beta planning baseline No protocol behaviour changed; the parameters were
 already what `sena-params` now freezes, and the binding tests prove it.

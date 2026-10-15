@@ -1,6 +1,6 @@
 //! Transactions and how they are authenticated.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
 use sena_primitives::Writer;
 use sena_primitives::{
@@ -8,7 +8,9 @@ use sena_primitives::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::gas::FeeSplit;
 use crate::governance::{CouncilSignature, GovernanceUpdate};
+use crate::keyless::{self, KeylessContext, KeylessError, KeylessSignature};
 
 /// What a transaction asks the chain to do.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -52,6 +54,18 @@ pub enum Payload {
         /// Council signatures over the update digest.
         signatures: Vec<CouncilSignature>,
     },
+    /// Pay `amount` of collected fees out of the fee vault according to the
+    /// fee split in force (Celo's `FeeHandler.distribute`). Permissionless:
+    /// the split decides who is paid, and the sender pays only its own fee.
+    DistributeFees {
+        /// The asset to distribute.
+        asset: AssetId,
+        /// How much of it to take from the vault.
+        #[serde(with = "u128_string")]
+        amount: u128,
+        /// The split the sender believes is in force; checked in the trace.
+        split: FeeSplit,
+    },
 }
 
 /// How a transaction proves it was authorised.
@@ -67,30 +81,9 @@ pub enum Authenticator {
         #[serde(with = "bytes_64")]
         signature: [u8; 64],
     },
-    /// An OIDC keyless authorisation (REQ-AUTH-003, REQ-AUTH-004).
-    ///
-    /// # Not yet implemented
-    ///
-    /// The ephemeral key signature is checked, but the zero-knowledge proof that
-    /// binds that ephemeral key to a genuine Web2 JWT is **not**. Accepting this
-    /// scheme as-is would let anyone spend from any keyless account by
-    /// generating their own ephemeral key, so [`Transaction::authenticate`]
-    /// rejects it outright rather than verifying the part that is implemented
-    /// and quietly skipping the part that is not.
-    ///
-    /// The variant exists so that the wire format, address derivation and
-    /// transaction plumbing can be built and tested ahead of proof verification
-    /// landing. It is deliberately inert until then.
-    Keyless {
-        /// The ephemeral public key that signed this transaction.
-        #[serde(with = "bytes_32")]
-        ephemeral_public_key: [u8; 32],
-        /// The ephemeral key's signature over the transaction.
-        #[serde(with = "bytes_64")]
-        signature: [u8; 64],
-        /// The proof binding the ephemeral key to a JWT. Not yet verified.
-        zk_proof: Vec<u8>,
-    },
+    /// An OIDC keyless authorisation over the Aptos Keyless circuit
+    /// (REQ-AUTH-003, REQ-AUTH-004). See [`crate::keyless`].
+    Keyless(Box<KeylessSignature>),
 }
 
 /// A transaction as submitted to the sequencer.
@@ -100,11 +93,8 @@ pub struct Transaction {
     pub sender: L2Address,
     /// The sender's expected nonce. Must equal the account's current nonce.
     pub nonce: u64,
-    /// The asset the fee is paid in (REQ-GAS-001).
+    /// The asset the fee is paid in (REQ-GAS-001) — Celo's `feeCurrency`.
     pub fee_asset: AssetId,
-    /// The maximum fee the sender will pay, in units of `fee_asset`.
-    #[serde(with = "u128_string")]
-    pub max_fee: u128,
     /// The exchange rate the sender believes applies to `fee_asset`, in units
     /// per [`RATE_SCALE`](crate::gas::RATE_SCALE) native units.
     ///
@@ -114,22 +104,22 @@ pub struct Transaction {
     /// [`crate::gas`].
     #[serde(with = "u128_string")]
     pub fee_rate: u128,
+    /// The intrinsic gas the sender believes `fee_asset` charges; checked in
+    /// the trace alongside the rate.
+    pub fee_intrinsic_gas: u64,
+    /// The most gas the transaction may use.
+    pub gas_limit: u64,
+    /// The most the sender pays per gas, base fee and tip together, in
+    /// [`PRICE_SCALE`](crate::gas::PRICE_SCALE)ths of a unit of `fee_asset`.
+    #[serde(with = "u128_string")]
+    pub max_fee_per_gas: u128,
+    /// The most tip the sender pays per gas, in the same units.
+    #[serde(with = "u128_string")]
+    pub max_priority_fee_per_gas: u128,
     /// What to do.
     pub payload: Payload,
     /// Proof of authorisation.
     pub authenticator: Authenticator,
-}
-
-/// Discriminants for the canonical payload encoding.
-///
-/// Fixed explicitly rather than derived from declaration order: the signing
-/// digest depends on them, so reordering the enum would invalidate every
-/// signature ever produced.
-mod payload_tag {
-    pub const TRANSFER: u8 = 0;
-    pub const BIND_IDENTIFIER: u8 = 1;
-    pub const UNBIND_IDENTIFIER: u8 = 2;
-    pub const GOVERNANCE: u8 = 3;
 }
 
 impl Payload {
@@ -147,43 +137,7 @@ impl Payload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        match self {
-            Self::Transfer { to, asset, amount } => {
-                w.u8(payload_tag::TRANSFER);
-                w.bytes32(to.as_bytes());
-                w.u32(asset.get());
-                w.u128(*amount);
-            }
-            Self::BindIdentifier {
-                channel,
-                identifier,
-            } => {
-                w.u8(payload_tag::BIND_IDENTIFIER);
-                w.u8(channel.discriminant());
-                w.bytes32(identifier.as_hash().as_bytes());
-            }
-            Self::UnbindIdentifier { identifier } => {
-                w.u8(payload_tag::UNBIND_IDENTIFIER);
-                w.bytes32(identifier.as_hash().as_bytes());
-            }
-            Self::Governance {
-                epoch,
-                update,
-                signatures,
-            } => {
-                w.u8(payload_tag::GOVERNANCE);
-                w.u64(*epoch);
-                w.bytes(&update.encode());
-                w.u32(
-                    u32::try_from(signatures.len())
-                        .expect("a payload cannot carry 2^32 signatures"),
-                );
-                for signature in signatures {
-                    w.u32(signature.index);
-                    w.bytes(&signature.signature);
-                }
-            }
-        }
+        crate::wire::write_payload(&mut w, self);
         w.finish()
     }
 }
@@ -207,110 +161,94 @@ impl Transaction {
                 .field(self.sender.as_bytes())
                 .u64(self.nonce)
                 .u64(u64::from(self.fee_asset.get()))
-                .u128(self.max_fee)
                 .u128(self.fee_rate)
+                .u64(self.fee_intrinsic_gas)
+                .u64(self.gas_limit)
+                .u128(self.max_fee_per_gas)
+                .u128(self.max_priority_fee_per_gas)
                 .field(&payload),
         )
     }
 
-    /// Returns the transaction's identifier.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialising the transaction fails, which cannot occur.
+    /// Returns the transaction's identifier: the hash of its canonical
+    /// encoding, authenticator included.
     #[must_use]
     pub fn hash(&self) -> Hash256 {
-        let encoded = serde_json::to_vec(self).expect("transaction serialisation cannot fail");
-        Hash256::digest(&encoded)
+        Hash256::digest(&self.encode())
+    }
+
+    /// Encodes the transaction canonically, as batches publish it.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        crate::wire::encode(self)
+    }
+
+    /// Decodes a canonically encoded transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::wire::WireError`] unless `bytes` is exactly a canonical
+    /// encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode(bytes)
     }
 
     /// Checks that the transaction is authorised.
     ///
+    /// An Ed25519 account's address *is* its public key, so the key that signed
+    /// must be the sender's own. Checking only that the signature matches the
+    /// key carried alongside it would let any keypair spend from any account.
+    /// A keyless account's address is derived from the identity the proof
+    /// attests to, and [`keyless::verify`] checks the same binding.
+    ///
+    /// Signature verification is strict (canonical `S`, no small-order keys),
+    /// because the Aptos one-step verifier uses
+    /// `ed25519::signature_verify_strict`. A lenient check here would accept
+    /// signatures L1 refuses, and the two would decide disputes differently.
+    ///
+    /// Stateless. A keyless transaction additionally needs its JWK to be
+    /// current, which [`crate::Instruction::VerifyJwk`] checks in the trace.
+    ///
     /// # Errors
     ///
-    /// Returns [`AuthError`] if the signature is malformed or does not verify,
-    /// or if the scheme is not yet supported.
-    pub fn authenticate(&self) -> Result<(), AuthError> {
+    /// Returns [`AuthError`] if the key is not the sender's, or a signature or
+    /// proof does not verify.
+    pub fn authenticate(&self, keyless_ctx: &KeylessContext<'_>) -> Result<(), AuthError> {
         match &self.authenticator {
             Authenticator::Ed25519 {
                 public_key,
                 signature,
             } => {
-                let key =
-                    VerifyingKey::from_bytes(public_key).map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)
-            }
-            Authenticator::Keyless {
-                ephemeral_public_key,
-                signature,
-                zk_proof,
-            } => {
-                let key = VerifyingKey::from_bytes(ephemeral_public_key)
-                    .map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)?;
-
-                if zk_proof.len() == 128 {
-                    let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
-                        .map_err(|_| AuthError::InvalidZkProof)?;
-                    let public_inputs = crate::groth16::canonical_keyless_public_inputs(
-                        ephemeral_public_key,
-                        &self.sender,
-                    );
-                    crate::groth16::canonical_verifier()
-                        .verify_raw(&proof, &public_inputs)
-                        .map_err(|_| AuthError::InvalidZkProof)?;
-                    Ok(())
-                } else {
-                    Err(AuthError::KeylessNotImplemented)
+                if self.sender != L2Address::from_bytes(*public_key) {
+                    return Err(AuthError::WrongSigner);
                 }
+                verify_ed25519_strict(public_key, signature, &self.signing_digest())
             }
-        }
-    }
-
-    /// Verifies that a transaction is authenticated, validating Groth16 ZK proofs for keyless accounts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AuthError`] if the signature does not verify, or if the ZK proof is invalid or malformed.
-    pub fn authenticate_with_groth16(
-        &self,
-        verifier: &crate::groth16::Bn254Groth16Verifier,
-        public_inputs: &[ark_bn254::Fr],
-    ) -> Result<(), AuthError> {
-        match &self.authenticator {
-            Authenticator::Keyless {
-                ephemeral_public_key,
-                signature,
-                zk_proof,
-            } => {
-                let key = VerifyingKey::from_bytes(ephemeral_public_key)
-                    .map_err(|_| AuthError::MalformedKey)?;
-                let sig = Signature::from_bytes(signature);
-                key.verify(self.signing_digest().as_bytes(), &sig)
-                    .map_err(|_| AuthError::BadSignature)?;
-
-                if zk_proof.is_empty() {
-                    return Err(AuthError::KeylessNotImplemented);
-                }
-
-                let proof = crate::groth16::Bn254Proof::from_bytes(zk_proof)
-                    .map_err(|_| AuthError::InvalidZkProof)?;
-                verifier
-                    .verify_raw(&proof, public_inputs)
-                    .map_err(|_| AuthError::InvalidZkProof)?;
-                Ok(())
+            Authenticator::Keyless(sig) => {
+                keyless::verify(sig, &self.sender, &self.signing_digest(), keyless_ctx)
+                    .map_err(AuthError::Keyless)
             }
-            Authenticator::Ed25519 { .. } => self.authenticate(),
         }
     }
 }
 
+/// Strict Ed25519 verification of `digest`, as Aptos L1 performs it.
+pub(crate) fn verify_ed25519_strict(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    digest: &Hash256,
+) -> Result<(), AuthError> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| AuthError::MalformedKey)?;
+    if key.is_weak() {
+        return Err(AuthError::MalformedKey);
+    }
+    let sig = Signature::from_bytes(signature);
+    key.verify_strict(digest.as_bytes(), &sig)
+        .map_err(|_| AuthError::BadSignature)
+}
+
 /// Why a transaction failed authentication.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 pub enum AuthError {
     /// The public key is not a valid Ed25519 point.
     #[error("malformed public key")]
@@ -318,14 +256,10 @@ pub enum AuthError {
     /// The signature did not verify against the signing digest.
     #[error("signature does not verify")]
     BadSignature,
-    /// Keyless authentication is not yet available.
-    #[error(
-        "keyless authentication is not implemented: the ZK proof binding the \
-             ephemeral key to a JWT is not yet verified, so the scheme is rejected \
-             rather than accepted unchecked"
-    )]
-    KeylessNotImplemented,
-    /// The zero-knowledge proof did not verify against the public inputs.
-    #[error("zero-knowledge proof does not verify")]
-    InvalidZkProof,
+    /// The signing key does not belong to the sender.
+    #[error("the signing key is not the sender's")]
+    WrongSigner,
+    /// The keyless authorisation was refused.
+    #[error("keyless authorisation refused: {0}")]
+    Keyless(#[from] KeylessError),
 }

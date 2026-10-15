@@ -101,6 +101,12 @@ impl Writer {
         self
     }
 
+    /// Appends bytes with no length prefix, for fixed-width values.
+    pub fn raw(&mut self, value: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(value);
+        self
+    }
+
     /// Appends a length-prefixed byte string.
     ///
     /// # Panics
@@ -223,6 +229,19 @@ impl<'a> Reader<'a> {
     /// Does not panic: the slice is taken at a fixed width before conversion.
     pub fn bytes32(&mut self) -> Result<[u8; 32], DecodeError> {
         Ok(self.take(32)?.try_into().expect("slice is 32 bytes"))
+    }
+
+    /// Reads a fixed-width array of `N` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Truncated`] if fewer than `N` bytes remain.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: the slice is taken at a fixed width before conversion.
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        Ok(self.take(N)?.try_into().expect("slice is N bytes"))
     }
 
     /// Reads a 32-byte hash.

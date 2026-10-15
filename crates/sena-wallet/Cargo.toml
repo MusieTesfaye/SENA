@@ -1,0 +1,25 @@
+[package]
+name = "sena-wallet"
+description = "Wallet logic for the SENA Network without I/O: keyless sign-in, building and signing transactions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sena-primitives.workspace = true
+sena-stf.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+base64 = "0.22"
+rand_core = "0.6"
+
+[dev-dependencies]
+rand.workspace = true
+
+[lints]
+workspace = true

@@ -14,21 +14,38 @@ use rand::SeedableRng;
 use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use sena_stf::execute::{genesis_credit, StepWitness};
-use sena_stf::gas::fee_for;
+use sena_stf::gas::{native_to_asset, DEFAULT_ASSET_INTRINSIC_GAS, DEFAULT_BASE_FEE_FLOOR};
 use sena_stf::{
-    apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchError,
-    CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction, MachineState, Payload,
-    SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT, RATE_SCALE,
+    apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchContext,
+    BatchError, CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction,
+    MachineState, Payload, SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT,
+    RATE_SCALE,
 };
+use sena_stf::{fee_charge, gas_required, GasError};
 
+/// Ed25519 accounts only; keyless is off.
+const CTX: BatchContext<'static> = BatchContext::without_keyless(0);
 const USDC: AssetId = AssetId(1);
 
 /// The rate USDC is whitelisted at in these tests: one-to-one with native units.
 const USDC_RATE: u128 = RATE_SCALE;
 
-/// The fee a transaction costs at [`USDC_RATE`].
-fn fee() -> u128 {
-    fee_for(USDC_RATE).unwrap()
+/// What a transaction pays, net of its refund: the base fee (tips go to the
+/// fee vault too under [`CTX`]).
+fn fee_of(tx: &Transaction) -> u128 {
+    let c = fee_charge(tx, &CTX).unwrap();
+    c.base + c.tip
+}
+
+/// Sets a transaction's fee terms: the gas it needs, at the base fee.
+fn with_fees(mut tx: Transaction) -> Transaction {
+    tx.fee_intrinsic_gas = DEFAULT_ASSET_INTRINSIC_GAS;
+    tx.max_fee_per_gas = DEFAULT_BASE_FEE_FLOOR;
+    tx.max_priority_fee_per_gas = 0;
+    tx.gas_limit = 0;
+    // Payloads that are meant not to compile still get a usable limit.
+    tx.gas_limit = gas_required(&tx).unwrap_or(100_000);
+    tx
 }
 
 /// A deterministic test signer. The seed is fixed so failures reproduce.
@@ -43,18 +60,21 @@ fn address_of(key: &SigningKey) -> L2Address {
 
 /// Builds a signed transaction.
 fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
-    let mut tx = Transaction {
+    let mut tx = with_fees(Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee(),
         fee_rate: USDC_RATE,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
         },
-    };
+    });
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -89,16 +109,19 @@ fn whitelist(trie: &mut MerkleTrie, asset: AssetId, symbol: &str, rate: u128, en
         asset,
         symbol: symbol.to_owned(),
         rate,
+        intrinsic_gas: DEFAULT_ASSET_INTRINSIC_GAS,
         enabled,
     };
     apply(trie, &Instruction::SetGasAsset { record }).unwrap();
 }
 
-/// Installs a council with the given members and threshold.
+/// Installs a council with the given members and threshold, at epoch 1.
 fn install_council(trie: &mut MerkleTrie, keys: &[SigningKey], threshold: u32) {
     let council = Council {
         members: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
         threshold,
+        epoch: 1,
+        guardian_threshold: 0,
     };
     trie.insert(keys::council(), council.encode());
 }
@@ -140,14 +163,15 @@ fn a_transfer_moves_value_and_charges_a_fee() {
             amount: 2_500,
         },
     );
-    execute_batch(&mut trie, &[tx]).expect("transfer should execute");
+    let fee = fee_of(&tx);
+    execute_batch(&mut trie, &CTX, &[tx]).expect("transfer should execute");
 
     assert_eq!(account_in(&trie, &bob).balance(USDC), 2_500);
     assert_eq!(
         account_in(&trie, &address_of(&alice)).balance(USDC),
-        10_000 - 2_500 - fee()
+        10_000 - 2_500 - fee
     );
-    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee());
+    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee);
     assert_eq!(account_in(&trie, &address_of(&alice)).nonce, 1);
 }
 
@@ -180,7 +204,7 @@ fn value_is_conserved_across_a_batch() {
             },
         ),
     ];
-    execute_batch(&mut trie, &batch).unwrap();
+    execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     let total_after = account_in(&trie, &address_of(&alice)).balance(USDC)
         + account_in(&trie, &address_of(&bob)).balance(USDC)
@@ -202,7 +226,7 @@ fn a_transfer_beyond_the_balance_invalidates_the_batch() {
             amount: 1_000_000,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(matches!(err, BatchError::Step { .. }), "got {err:?}");
 }
 
@@ -218,7 +242,7 @@ fn a_self_transfer_is_rejected() {
             amount: 1,
         },
     );
-    assert_eq!(compile(&tx).unwrap_err(), CompileError::SelfTransfer);
+    assert_eq!(compile(&tx, &CTX).unwrap_err(), CompileError::SelfTransfer);
 }
 
 // --- Authentication and replay ----------------------------------------------
@@ -243,7 +267,7 @@ fn a_tampered_transaction_does_not_authenticate() {
         asset: USDC,
         amount: 1,
     };
-    assert!(compile(&tx).is_err());
+    assert!(compile(&tx, &CTX).is_err());
 }
 
 #[test]
@@ -258,10 +282,10 @@ fn raising_the_fee_after_signing_is_detected() {
             amount: 1,
         },
     );
-    tx.max_fee = u128::MAX;
+    tx.max_fee_per_gas += 1;
     assert!(
-        compile(&tx).is_err(),
-        "max_fee must be covered by the signature"
+        compile(&tx, &CTX).is_err(),
+        "the fee terms must be covered by the signature"
     );
 }
 
@@ -280,8 +304,8 @@ fn a_transaction_cannot_be_replayed() {
         },
     );
 
-    execute_batch(&mut trie, std::slice::from_ref(&tx)).expect("first execution succeeds");
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    execute_batch(&mut trie, &CTX, std::slice::from_ref(&tx)).expect("first execution succeeds");
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -295,9 +319,10 @@ fn a_transaction_cannot_be_replayed() {
 }
 
 #[test]
-fn keyless_authentication_is_refused_rather_than_partially_checked() {
-    // Accepting a keyless transaction on the strength of its ephemeral signature
-    // alone would let anyone spend from any keyless account.
+fn keyless_is_refused_on_a_network_without_it() {
+    // A network that has not configured keyless parameters must refuse the
+    // scheme outright; the proof is never looked at. (Proof verification
+    // itself is covered against Aptos's vectors in keyless_aptos_vectors.rs.)
     let alice = signer(1);
     let mut tx = signed(
         &alice,
@@ -308,15 +333,98 @@ fn keyless_authentication_is_refused_rather_than_partially_checked() {
             amount: 1,
         },
     );
-    tx.authenticator = Authenticator::Keyless {
+    tx.authenticator = Authenticator::Keyless(Box::new(sena_stf::KeylessSignature {
+        iss_hash: [0; 32],
+        idc: [0; 32],
         ephemeral_public_key: alice.verifying_key().to_bytes(),
-        signature: alice.sign(tx.signing_digest().as_bytes()).to_bytes(),
-        zk_proof: vec![0xAA; 32],
-    };
+        ephemeral_signature: alice.sign(tx.signing_digest().as_bytes()).to_bytes(),
+        exp_date_secs: u64::MAX,
+        exp_horizon_secs: 0,
+        jwt_header_hash: [0; 32],
+        jwk_hash: [0; 32],
+        extra_field_hash: None,
+        proof: [0; 128],
+    }));
     assert_eq!(
-        compile(&tx).unwrap_err(),
-        CompileError::Auth(sena_stf::AuthError::KeylessNotImplemented)
+        compile(&tx, &CTX).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::Keyless(
+            sena_stf::KeylessError::Disabled
+        ))
     );
+}
+
+/// The key that signs must be the sender's own key.
+///
+/// Regression test: authentication once checked only that the signature
+/// matched the key carried in the transaction, so any keypair could spend from
+/// any account by naming it as the sender.
+#[test]
+fn a_key_cannot_spend_from_an_account_it_does_not_own() {
+    let victim = signer(1);
+    let thief = signer(66);
+    let mut trie = funded_trie(&[(address_of(&victim), 10_000)]);
+
+    let theft = resign(
+        &thief,
+        Transaction {
+            sender: address_of(&victim),
+            ..signed(
+                &thief,
+                0,
+                Payload::Transfer {
+                    to: address_of(&thief),
+                    asset: USDC,
+                    amount: 9_000,
+                },
+            )
+        },
+    );
+
+    assert_eq!(
+        compile(&theft, &CTX).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::WrongSigner)
+    );
+    assert!(execute_batch(&mut trie, &CTX, &[theft]).is_err());
+    assert_eq!(
+        account_in(&trie, &address_of(&victim)).balance(USDC),
+        10_000
+    );
+}
+
+/// A small-order public key is refused even with a "valid" signature.
+///
+/// The identity point verifies the all-zero-`R` signature for every message
+/// under lenient verification. Aptos L1 uses strict verification, so the node
+/// must too or the two would disagree in a dispute.
+#[test]
+fn a_small_order_key_is_refused() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1; // compressed Edwards identity
+    let mut signature = [0u8; 64];
+    signature[0] = 1; // R = identity, S = 0
+    let tx = Transaction {
+        sender: L2Address::from_bytes(identity),
+        nonce: 0,
+        fee_asset: USDC,
+        fee_rate: USDC_RATE,
+        fee_intrinsic_gas: DEFAULT_ASSET_INTRINSIC_GAS,
+        gas_limit: 100_000,
+        max_fee_per_gas: DEFAULT_BASE_FEE_FLOOR,
+        max_priority_fee_per_gas: 0,
+        payload: Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+        authenticator: Authenticator::Ed25519 {
+            public_key: identity,
+            signature,
+        },
+    };
+    assert!(matches!(
+        compile(&tx, &CTX).unwrap_err(),
+        CompileError::Auth(sena_stf::AuthError::MalformedKey | sena_stf::AuthError::BadSignature)
+    ));
 }
 
 // --- Social Connect ----------------------------------------------------------
@@ -339,7 +447,7 @@ fn an_identifier_resolves_to_its_owner() {
             identifier: id,
         },
     );
-    execute_batch(&mut trie, &[tx]).unwrap();
+    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     let stored = trie
         .get(&keys::social_by_identifier(&id))
@@ -359,6 +467,7 @@ fn an_identifier_cannot_be_taken_from_its_owner() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &alice,
             0,
@@ -378,7 +487,7 @@ fn an_identifier_cannot_be_taken_from_its_owner() {
             identifier: id,
         },
     );
-    let err = execute_batch(&mut trie, &[theft]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[theft]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -400,6 +509,7 @@ fn releasing_an_identifier_frees_it_for_someone_else() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[
             signed(
                 &alice,
@@ -438,6 +548,7 @@ fn releasing_an_identifier_you_do_not_hold_fails() {
 
     execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &alice,
             0,
@@ -451,6 +562,7 @@ fn releasing_an_identifier_you_do_not_hold_fails() {
 
     let err = execute_batch(
         &mut trie,
+        &CTX,
         &[signed(
             &mallory,
             0,
@@ -487,13 +599,15 @@ fn the_trace_records_a_state_for_every_step_boundary() {
             amount: 5,
         },
     );
-    let trace = execute_batch(&mut trie, &[tx]).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     assert_eq!(trace.states.len(), trace.instructions.len() + 1);
     assert_eq!(trace.initial().state_root, pre_root);
     assert_eq!(trace.final_state().state_root, trie.root());
-    // nonce, gas-asset check, fee debit, fee credit, transfer debit, transfer credit
-    assert_eq!(trace.len(), 6);
+    // nonce, gas-asset check, base fee charge, fee hold, transfer debit,
+    // transfer credit, base fee credit. No refund (the limit is exactly the gas
+    // used) and no tip, so neither is credited.
+    assert_eq!(trace.len(), 7);
 }
 
 #[test]
@@ -521,8 +635,8 @@ fn determinism_the_same_batch_yields_the_same_root() {
 
     let mut first = funded_trie(&[(address_of(&alice), 50_000)]);
     let mut second = funded_trie(&[(address_of(&alice), 50_000)]);
-    let a = execute_batch(&mut first, &batch).unwrap();
-    let b = execute_batch(&mut second, &batch).unwrap();
+    let a = execute_batch(&mut first, &CTX, &batch).unwrap();
+    let b = execute_batch(&mut second, &CTX, &batch).unwrap();
 
     println!("root={}", a.final_state().state_root);
     assert_eq!(a.final_state().state_root, b.final_state().state_root);
@@ -579,7 +693,7 @@ fn l1_verification_agrees_with_node_execution() {
     // Replay the batch one step at a time, and at each step check that the
     // stateless verifier derives exactly the state the node did.
     let mut replay = funded_trie(&[(address_of(&alice), 90_000), (address_of(&bob), 90_000)]);
-    let trace = execute_batch(&mut trie, &batch).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
     for (index, instruction) in trace.instructions.iter().enumerate() {
         let witness = witness_for(&replay, instruction);
@@ -705,7 +819,7 @@ proptest! {
 
         let mut trie = funded_trie(&[(address_of(&alice), funding)]);
         let mut replay = funded_trie(&[(address_of(&alice), funding)]);
-        let trace = execute_batch(&mut trie, &batch).unwrap();
+        let trace = execute_batch(&mut trie, &CTX, &batch).unwrap();
 
         for (index, instruction) in trace.instructions.iter().enumerate() {
             let witness = witness_for(&replay, instruction);
@@ -732,14 +846,15 @@ fn a_fee_is_charged_in_the_declared_stablecoin() {
             amount: 10,
         },
     );
-    execute_batch(&mut trie, &[tx]).unwrap();
+    let fee = fee_of(&tx);
+    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
     // No native token was needed at any point (REQ-GAS-002).
     assert_eq!(
         account_in(&trie, &address_of(&alice)).balance(AssetId::NATIVE),
         0
     );
-    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee());
+    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), fee);
 }
 
 #[test]
@@ -760,7 +875,7 @@ fn an_unlisted_asset_cannot_pay_fees() {
     tx.fee_asset = AssetId(77);
     let tx = resign(&alice, tx);
 
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -788,7 +903,7 @@ fn a_disabled_asset_cannot_pay_fees() {
             amount: 1,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -817,11 +932,12 @@ fn a_transaction_cannot_declare_a_cheaper_rate_than_the_chain_holds() {
             amount: 1,
         },
     );
-    tx.fee_rate = 1;
-    tx.max_fee = 1;
+    // A rate other than the whitelisted one, with fee terms that cover it.
+    tx.fee_rate = 2 * USDC_RATE;
+    tx.max_fee_per_gas = 2 * DEFAULT_BASE_FEE_FLOOR;
     let tx = resign(&alice, tx);
 
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -835,7 +951,7 @@ fn a_transaction_cannot_declare_a_cheaper_rate_than_the_chain_holds() {
 }
 
 #[test]
-fn a_max_fee_below_the_real_cost_is_refused_at_compile_time() {
+fn a_max_fee_below_the_base_fee_is_refused_at_compile_time() {
     let alice = signer(1);
     let mut tx = signed(
         &alice,
@@ -846,11 +962,11 @@ fn a_max_fee_below_the_real_cost_is_refused_at_compile_time() {
             amount: 1,
         },
     );
-    tx.max_fee = fee() - 1;
+    tx.max_fee_per_gas = DEFAULT_BASE_FEE_FLOOR - 1;
     let tx = resign(&alice, tx);
     assert!(matches!(
-        compile(&tx).unwrap_err(),
-        CompileError::FeeTooLow { .. }
+        compile(&tx, &CTX).unwrap_err(),
+        CompileError::Gas(GasError::FeeBelowBaseFee { .. })
     ));
 }
 
@@ -859,8 +975,8 @@ fn a_cheaper_asset_costs_proportionally_more_units() {
     // An asset worth half a native unit should cost twice as many units.
     let half_value = RATE_SCALE * 2;
     assert_eq!(
-        fee_for(half_value).unwrap(),
-        2 * fee_for(RATE_SCALE).unwrap()
+        native_to_asset(DEFAULT_BASE_FEE_FLOOR, half_value).unwrap(),
+        2 * native_to_asset(DEFAULT_BASE_FEE_FLOOR, RATE_SCALE).unwrap()
     );
 }
 
@@ -879,6 +995,7 @@ fn the_council_can_whitelist_a_new_gas_asset() {
             asset: AssetId(2),
             symbol: "EURC".to_owned(),
             rate: RATE_SCALE,
+            intrinsic_gas: DEFAULT_ASSET_INTRINSIC_GAS,
             enabled: true,
         },
     };
@@ -893,7 +1010,7 @@ fn the_council_can_whitelist_a_new_gas_asset() {
             signatures,
         },
     );
-    execute_batch(&mut trie, &[tx]).expect("a quorum-signed update should apply");
+    execute_batch(&mut trie, &CTX, &[tx]).expect("a quorum-signed update should apply");
 
     let stored = trie.get(&keys::asset(2)).expect("record should exist");
     assert_eq!(WhitelistedAsset::decode(stored).unwrap().symbol, "EURC");
@@ -908,7 +1025,7 @@ fn an_update_without_a_quorum_is_refused() {
     install_council(&mut trie, &[m1.clone(), m2], 2);
 
     let update = GovernanceUpdate::SetParameter {
-        name: "gas.base_native".to_owned(),
+        name: "batch.max_transactions".to_owned(),
         value: 5,
     };
     let signatures = council_sign(&[(0, &m1)], &update, 1); // one of two
@@ -922,7 +1039,7 @@ fn an_update_without_a_quorum_is_refused() {
             signatures,
         },
     );
-    let err = execute_batch(&mut trie, &[tx]).unwrap_err();
+    let err = execute_batch(&mut trie, &CTX, &[tx]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -944,7 +1061,7 @@ fn a_forged_council_signature_is_refused() {
     install_council(&mut trie, std::slice::from_ref(&m1), 1);
 
     let update = GovernanceUpdate::SetParameter {
-        name: "gas.base_native".to_owned(),
+        name: "batch.max_transactions".to_owned(),
         value: 5,
     };
     let signatures = council_sign(&[(0, &impostor)], &update, 1);
@@ -958,7 +1075,7 @@ fn a_forged_council_signature_is_refused() {
             signatures,
         },
     );
-    assert!(execute_batch(&mut trie, &[tx]).is_err());
+    assert!(execute_batch(&mut trie, &CTX, &[tx]).is_err());
 }
 
 #[test]
@@ -969,7 +1086,7 @@ fn a_governance_payload_cannot_be_replayed_in_a_later_epoch() {
     install_council(&mut trie, std::slice::from_ref(&m1), 1);
 
     let update = GovernanceUpdate::SetParameter {
-        name: "gas.base_native".to_owned(),
+        name: "batch.max_transactions".to_owned(),
         value: 5,
     };
     let signatures = council_sign(&[(0, &m1)], &update, 1);
@@ -984,7 +1101,49 @@ fn a_governance_payload_cannot_be_replayed_in_a_later_epoch() {
             signatures,
         },
     );
-    assert!(execute_batch(&mut trie, &[replayed]).is_err());
+    assert!(execute_batch(&mut trie, &CTX, &[replayed]).is_err());
+}
+
+/// Regression test: the epoch was signed over but never checked against state,
+/// so an applied payload could be re-submitted indefinitely — re-enabling an
+/// asset the council had since disabled, for instance.
+#[test]
+fn an_applied_governance_payload_cannot_be_applied_again() {
+    let alice = signer(1);
+    let m1 = signer(10);
+    let mut trie = funded_trie(&[(address_of(&alice), 100_000)]);
+    install_council(&mut trie, std::slice::from_ref(&m1), 1);
+
+    let update = GovernanceUpdate::SetParameter {
+        name: "batch.max_transactions".to_owned(),
+        value: 5,
+    };
+    let signatures = council_sign(&[(0, &m1)], &update, 1);
+    let payload = Payload::Governance {
+        epoch: 1,
+        update,
+        signatures,
+    };
+    execute_batch(&mut trie, &CTX, &[signed(&alice, 0, payload.clone())])
+        .expect("first application succeeds");
+
+    let council = Council::decode(trie.get(&keys::council()).unwrap()).unwrap();
+    assert_eq!(council.epoch, 2, "applying a payload consumes its epoch");
+
+    let err = execute_batch(&mut trie, &CTX, &[signed(&alice, 1, payload)]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::Governance(sena_stf::GovernanceError::WrongEpoch {
+                    expected: 2,
+                    signed: 1
+                }),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -1015,7 +1174,7 @@ fn the_council_cannot_reach_the_dispute_system() {
         );
 
         assert!(
-            execute_batch(&mut trie.clone(), &[tx]).is_err(),
+            execute_batch(&mut trie.clone(), &CTX, &[tx]).is_err(),
             "'{name}' must be unreachable by governance"
         );
     }
@@ -1035,18 +1194,18 @@ fn governance_changes_are_covered_by_the_execution_trace() {
         name: "batch.max_transactions".to_owned(),
         value: 512,
     };
-    let signatures = council_sign(&[(0, &m1)], &update, 7);
+    let signatures = council_sign(&[(0, &m1)], &update, 1);
     let tx = signed(
         &alice,
         0,
         Payload::Governance {
-            epoch: 7,
+            epoch: 1,
             update,
             signatures,
         },
     );
 
-    let trace = execute_batch(&mut trie, &[tx]).unwrap();
+    let trace = execute_batch(&mut trie, &CTX, &[tx]).unwrap();
     for (index, instruction) in trace.instructions.iter().enumerate() {
         let witness = witness_for(&replay, instruction);
         let derived = verify_step(&trace.states[index], instruction, &witness)
@@ -1054,4 +1213,287 @@ fn governance_changes_are_covered_by_the_execution_trace() {
         assert_eq!(derived, trace.states[index + 1]);
         apply(&mut replay, instruction).unwrap();
     }
+}
+
+// --- The fee market ---------------------------------------------------------
+
+fn market_in(trie: &MerkleTrie) -> sena_stf::FeeMarket {
+    trie.get(&keys::fee_market()).map_or(
+        sena_stf::FeeMarket::genesis(DEFAULT_BASE_FEE_FLOOR, sena_stf::gas::DEFAULT_GAS_TARGET),
+        |b| sena_stf::FeeMarket::decode(b).unwrap(),
+    )
+}
+
+fn transfer_of(key: &SigningKey, nonce: u64, amount: u128) -> Transaction {
+    signed(
+        key,
+        nonce,
+        Payload::Transfer {
+            to: address_of(&signer(99)),
+            asset: USDC,
+            amount,
+        },
+    )
+}
+
+#[test]
+fn unused_gas_is_refunded_the_tip_paid_and_the_base_fee_collected() {
+    let alice = signer(1);
+    let sequencer = address_of(&signer(50));
+    let mut trie = funded_trie(&[(address_of(&alice), 1_000_000)]);
+    let mut tx = transfer_of(&alice, 0, 7);
+    let used = tx.gas_limit;
+    tx.gas_limit = used + 40_000;
+    tx.max_fee_per_gas = 3 * DEFAULT_BASE_FEE_FLOOR;
+    tx.max_priority_fee_per_gas = DEFAULT_BASE_FEE_FLOOR / 5;
+    let tx = resign(&alice, tx);
+    let ctx = BatchContext {
+        fee_recipient: sequencer,
+        ..CTX
+    };
+
+    let c = fee_charge(&tx, &ctx).unwrap();
+    // Effective price: base + tip = 1.2 × floor; the 3 × floor cap is not charged.
+    let price = DEFAULT_BASE_FEE_FLOOR * 6 / 5;
+    assert_eq!(
+        c.hold,
+        u128::from(tx.gas_limit) * price / sena_stf::PRICE_SCALE
+    );
+    assert_eq!(c.refund + c.tip + c.base, c.hold);
+    assert!(c.refund > 0 && c.tip > 0);
+
+    execute_batch(&mut trie, &ctx, &[tx]).unwrap();
+    assert_eq!(
+        account_in(&trie, &address_of(&alice)).balance(USDC),
+        1_000_000 - 7 - c.tip - c.base
+    );
+    assert_eq!(account_in(&trie, &sequencer).balance(USDC), c.tip);
+    assert_eq!(account_in(&trie, &FEE_VAULT).balance(USDC), c.base);
+    assert_eq!(market_in(&trie).window_gas, used);
+}
+
+#[test]
+fn the_base_fee_follows_demand_between_windows() {
+    let alice = signer(1);
+    let mut trie = funded_trie(&[(address_of(&alice), 10_000_000)]);
+    // A tiny target, so one transfer overshoots it.
+    apply(
+        &mut trie,
+        &Instruction::SetFeeMarket {
+            floor: DEFAULT_BASE_FEE_FLOOR,
+            target: 1_000,
+        },
+    )
+    .unwrap();
+    let busy = BatchContext::without_keyless(10);
+    let mut tx = transfer_of(&alice, 0, 1);
+    tx.gas_limit = 0; // recomputed below
+    let tx = resign(&alice, with_fees(tx));
+    // One transaction can use at most twice the target.
+    assert!(matches!(
+        execute_batch(&mut trie.clone(), &busy, std::slice::from_ref(&tx)).unwrap_err(),
+        BatchError::Step {
+            source: StepError::WindowFull,
+            ..
+        }
+    ));
+    apply(
+        &mut trie,
+        &Instruction::SetFeeMarket {
+            floor: DEFAULT_BASE_FEE_FLOOR,
+            target: tx.gas_limit,
+        },
+    )
+    .unwrap();
+    // Two transfers fill the window to its limit: the next window costs 1/8 more.
+    let second = resign(&alice, with_fees(transfer_of(&alice, 1, 1)));
+    execute_batch(&mut trie, &busy, &[tx, second]).unwrap();
+    let next = market_in(&trie).base_fee_at(11).unwrap();
+    assert_eq!(next, DEFAULT_BASE_FEE_FLOOR + DEFAULT_BASE_FEE_FLOOR / 8);
+
+    // A batch declaring the old base fee in the new window is fraud.
+    let third = transfer_of(&alice, 2, 1);
+    let stale = BatchContext::without_keyless(11);
+    assert!(matches!(
+        execute_batch(&mut trie.clone(), &stale, std::slice::from_ref(&third)).unwrap_err(),
+        BatchError::Step {
+            source: StepError::BaseFeeMismatch { .. },
+            ..
+        }
+    ));
+    let mut priced = third;
+    priced.max_fee_per_gas = next;
+    let priced = resign(&alice, priced);
+    let right = BatchContext {
+        base_fee: next,
+        ..stale
+    };
+    execute_batch(&mut trie, &right, &[priced]).unwrap();
+    // That window used exactly its target, so the fee holds; after a window
+    // with nothing in it, it falls by 1/8 -- but never below the floor.
+    let held = market_in(&trie).at(12).unwrap();
+    assert_eq!(held.base_fee, next);
+    assert_eq!(held.at(13).unwrap().base_fee, DEFAULT_BASE_FEE_FLOOR);
+}
+
+#[test]
+fn an_undeclared_intrinsic_gas_is_refused_in_the_trace() {
+    let alice = signer(1);
+    let mut trie = funded_trie(&[(address_of(&alice), 1_000_000)]);
+    let mut tx = transfer_of(&alice, 0, 1);
+    tx.fee_intrinsic_gas = 0;
+    tx.gas_limit = gas_required(&tx).unwrap();
+    let tx = resign(&alice, tx);
+    assert!(matches!(
+        execute_batch(&mut trie, &CTX, &[tx]).unwrap_err(),
+        BatchError::Step {
+            source: StepError::IntrinsicGasMismatch { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn collected_fees_are_distributed_by_the_governed_split() {
+    let alice = signer(1);
+    let treasury = address_of(&signer(60));
+    let ops = address_of(&signer(61));
+    let mut trie = funded_trie(&[(address_of(&alice), 1_000_000), (FEE_VAULT, 1_000)]);
+    let split = sena_stf::FeeSplit {
+        beneficiaries: vec![(treasury, 700_000), (ops, 200_000)],
+        burn: 100_000,
+    };
+    let distribute = |nonce, split: &sena_stf::FeeSplit| {
+        signed(
+            &alice,
+            nonce,
+            Payload::DistributeFees {
+                asset: USDC,
+                amount: 999,
+                split: split.clone(),
+            },
+        )
+    };
+    // No split in force yet: nothing can be distributed.
+    let tx = distribute(0, &split);
+    assert!(matches!(
+        execute_batch(&mut trie.clone(), &CTX, &[tx]).unwrap_err(),
+        BatchError::Step {
+            source: StepError::FeeSplitMismatch,
+            ..
+        }
+    ));
+    apply(
+        &mut trie,
+        &Instruction::SetFeeSplit {
+            split: split.clone(),
+        },
+    )
+    .unwrap();
+    let tx = distribute(0, &split);
+    let fee = fee_of(&tx);
+    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
+    assert_eq!(account_in(&trie, &treasury).balance(USDC), 699);
+    assert_eq!(account_in(&trie, &ops).balance(USDC), 199);
+    // 999 left the vault; 101 of it (the burn and the rounding) went nowhere;
+    // the distributor's own fee arrived.
+    assert_eq!(
+        account_in(&trie, &FEE_VAULT).balance(USDC),
+        1_000 - 999 + fee
+    );
+    // Declaring another split is refused.
+    let other = sena_stf::FeeSplit {
+        beneficiaries: vec![(address_of(&alice), 1_000_000)],
+        burn: 0,
+    };
+    assert!(execute_batch(&mut trie, &CTX, &[distribute(1, &other)]).is_err());
+}
+
+#[test]
+fn guardians_can_trip_the_breaker_but_not_reset_it() {
+    let alice = signer(1);
+    let m: Vec<_> = (10..13).map(signer).collect();
+    let mut trie = funded_trie(&[(address_of(&alice), 1_000_000)]);
+    let council = Council {
+        members: m.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+        threshold: 3,
+        epoch: 1,
+        guardian_threshold: 1,
+    };
+    trie.insert(keys::council(), council.encode());
+
+    let disable = GovernanceUpdate::DisableGasAsset { asset: USDC };
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Governance {
+            epoch: 1,
+            signatures: council_sign(&[(2, &m[2])], &disable, 1),
+            update: disable,
+        },
+    );
+    execute_batch(&mut trie, &CTX, &[tx]).expect("one guardian disables");
+    // USDC can no longer pay fees.
+    assert!(matches!(
+        execute_batch(&mut trie.clone(), &CTX, &[transfer_of(&alice, 1, 1)]).unwrap_err(),
+        BatchError::Step {
+            source: StepError::AssetDisabled,
+            ..
+        }
+    ));
+    // Re-enabling with one signature is refused (and could not pay its fee in
+    // USDC anyway; a second asset pays it here).
+    whitelist(&mut trie, AssetId(2), "EURC", RATE_SCALE, true);
+    genesis_credit(&mut trie, address_of(&alice), AssetId(2), 1_000_000);
+    let enable = GovernanceUpdate::SetGasAsset {
+        record: WhitelistedAsset {
+            asset: USDC,
+            symbol: "USDC".to_owned(),
+            rate: RATE_SCALE,
+            intrinsic_gas: DEFAULT_ASSET_INTRINSIC_GAS,
+            enabled: true,
+        },
+    };
+    let mut tx = signed(
+        &alice,
+        1,
+        Payload::Governance {
+            epoch: 2,
+            signatures: council_sign(&[(2, &m[2])], &enable, 2),
+            update: enable,
+        },
+    );
+    tx.fee_asset = AssetId(2);
+    let tx = resign(&alice, tx);
+    assert!(matches!(
+        execute_batch(&mut trie, &CTX, &[tx]).unwrap_err(),
+        BatchError::Step {
+            source: StepError::Governance(sena_stf::GovernanceError::ThresholdNotMet {
+                required: 3,
+                ..
+            }),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_council_sets_the_base_fee_floor() {
+    let mut trie = funded_trie(&[]);
+    let floor = 2 * DEFAULT_BASE_FEE_FLOOR;
+    apply(&mut trie, &Instruction::SetFeeMarket { floor, target: 7 }).unwrap();
+    let m = market_in(&trie);
+    assert_eq!(
+        (m.floor, m.target, m.base_fee),
+        (floor, 7, floor),
+        "raised to the new floor"
+    );
+    assert!(apply(
+        &mut trie,
+        &Instruction::SetFeeMarket {
+            floor: 0,
+            target: 7
+        }
+    )
+    .is_err());
 }

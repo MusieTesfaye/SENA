@@ -1,19 +1,59 @@
 //! Block production and assertion posting.
 
-use sena_primitives::Hash256;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
-use sena_stf::{execute_batch, BatchError, ExecutionTrace, Transaction};
+use sena_stf::batch::{self, BatchTree};
+use sena_stf::gas::{DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET};
+use sena_stf::{
+    execute_batch, keys, BatchContext, BatchError, ExecutionTrace, FeeMarket, KeylessConfig,
+    Transaction, FEE_VAULT,
+};
 use serde::{Deserialize, Serialize};
 
 use sena_fraudproof::{Assertion, AssertionChain, AssertionId, ChainError, PartyId};
 
-use crate::mempool::Mempool;
+use crate::mempool::{Mempool, RejectReason};
+
+/// How far ahead of the clock mempool admission judges keyless expiry.
+///
+/// A transaction admitted at `t` is sealed a little later. Without a margin an
+/// ephemeral key expiring in between would make the whole batch fail.
+pub const ADMISSION_EXPIRY_MARGIN_SECS: u64 = 60;
+
+/// The most transaction bytes one batch may carry.
+///
+/// A batch is published in full by a single `assertions::post` transaction,
+/// and Aptos refuses transactions over 64 KiB. A batch that cannot be posted
+/// can never be asserted, so blocks are cut to fit, with room left for the
+/// post's other arguments and per-element encoding overhead.
+pub const MAX_BATCH_BYTES: usize = 48 * 1024;
+
+/// Seconds since the Unix epoch, from the system clock.
+///
+/// Only the sequencer reads a clock, to choose a batch timestamp; the state
+/// transition function never does (REQ-FRAUD-031).
+#[must_use]
+pub fn system_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// A produced L2 block.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
     /// Height, counting from one.
     pub height: u64,
+    /// The batch timestamp (Unix seconds). Part of the batch data: keyless
+    /// expiry is judged against it, and it never decreases.
+    pub timestamp: u64,
+    /// The base fee per gas the batch paid (part of the batch header).
+    pub base_fee: u128,
+    /// Where the batch's tips went (part of the batch header).
+    pub fee_recipient: L2Address,
     /// The transactions, in the order they were executed.
     ///
     /// This *is* the published batch data (REQ-FRAUD-007). A verifier
@@ -30,16 +70,35 @@ pub struct Block {
 }
 
 impl Block {
-    /// Returns the commitment to this block's batch data.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// The batch commitment tree over this block's transactions.
+    #[must_use]
+    pub fn batch_tree(&self) -> BatchTree {
+        self.trace.batch_tree(&self.transactions)
+    }
+
+    /// Returns the commitment to this block's batch data, as the covering
+    /// assertion carries it and `sena::assertions::post` recomputes it.
     #[must_use]
     pub fn batch_commitment(&self) -> Hash256 {
-        let encoded =
-            serde_json::to_vec(&self.transactions).expect("batch serialisation cannot fail");
-        Hash256::digest(&encoded)
+        let tree = self.batch_tree();
+        batch::header_commitment(
+            self.timestamp,
+            self.base_fee,
+            &self.fee_recipient,
+            tree.tx_count(),
+            &tree.root(),
+        )
+    }
+
+    /// The context the block was executed in.
+    #[must_use]
+    pub fn context<'a>(&self, keyless: Option<&'a KeylessConfig>) -> BatchContext<'a> {
+        BatchContext {
+            timestamp: self.timestamp,
+            keyless,
+            base_fee: self.base_fee,
+            fee_recipient: self.fee_recipient,
+        }
     }
 }
 
@@ -102,6 +161,18 @@ pub struct Sequencer {
     assertions: Vec<AssertionId>,
     /// Most recent assertion, which the next one builds on.
     head: AssertionId,
+    /// The network's keyless parameters, or `None` if keyless is disabled.
+    keyless: Option<Arc<KeylessConfig>>,
+    /// Where batch timestamps come from.
+    clock: fn() -> u64,
+    /// Where tips go: this sequencer's L2 account.
+    fee_recipient: L2Address,
+    /// The share of a window's gas each fee asset may use, in permille
+    /// (Celo's `celo.feecurrency.limits`). Assets not listed may use it all.
+    fee_asset_limits: BTreeMap<AssetId, u32>,
+    /// The fee assets wallets are told about (`sena_getFeeAssets`): those
+    /// whitelisted at genesis. Their current records are read from state.
+    fee_assets: Vec<AssetId>,
 }
 
 impl Sequencer {
@@ -127,7 +198,201 @@ impl Sequencer {
             bond,
             assertions: Vec::new(),
             head,
+            keyless: None,
+            clock: system_clock,
+            fee_recipient: FEE_VAULT,
+            fee_asset_limits: BTreeMap::new(),
+            fee_assets: Vec::new(),
         }
+    }
+
+    /// The fee assets to list to wallets.
+    #[must_use]
+    pub fn with_fee_assets(mut self, assets: Vec<AssetId>) -> Self {
+        self.fee_assets = assets;
+        self
+    }
+
+    /// The fee assets listed to wallets.
+    #[must_use]
+    pub fn fee_assets(&self) -> &[AssetId] {
+        &self.fee_assets
+    }
+
+    /// Sends tips to `account` instead of the fee vault.
+    #[must_use]
+    pub const fn with_fee_recipient(mut self, account: L2Address) -> Self {
+        self.fee_recipient = account;
+        self
+    }
+
+    /// Caps the share of each window's gas that transactions paying in an
+    /// asset may use, in permille.
+    #[must_use]
+    pub fn with_fee_asset_limits(mut self, limits: BTreeMap<AssetId, u32>) -> Self {
+        self.fee_asset_limits = limits;
+        self
+    }
+
+    /// The fee market as state holds it; absent, the genesis market.
+    #[must_use]
+    pub fn fee_market(&self) -> FeeMarket {
+        self.state
+            .get(&keys::fee_market())
+            .and_then(|b| FeeMarket::decode(b).ok())
+            .unwrap_or_else(|| FeeMarket::genesis(DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET))
+    }
+
+    /// The context a batch stamped `timestamp` executes in: the base fee the
+    /// fee market holds for it, and this sequencer as tip recipient.
+    #[must_use]
+    pub fn batch_context(&self, timestamp: u64) -> BatchContext<'_> {
+        let market = self.fee_market();
+        BatchContext {
+            timestamp,
+            keyless: self.keyless.as_deref(),
+            // Batch timestamps never fall behind the market's window.
+            base_fee: market.base_fee_at(timestamp).unwrap_or(market.base_fee),
+            fee_recipient: self.fee_recipient,
+        }
+    }
+
+    /// Rebuilds a sequencer from its data directory: replays every saved
+    /// batch from `genesis`, reconstructing each block, its trace and the
+    /// assertion covering it, so the node can serve and defend blocks it
+    /// produced before restarting.
+    ///
+    /// Nothing is taken on trust: each batch must reach the root it was saved
+    /// with, each assertion must be one `chain` holds, and the result must be
+    /// `saved_state_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first disagreement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a trace exceeds `u64::MAX` steps, which no batch can reach.
+    pub fn resume(
+        genesis: MerkleTrie,
+        chain: AssertionChain,
+        identity: PartyId,
+        bond: u128,
+        keyless: Option<Arc<KeylessConfig>>,
+        batches: &[crate::store::StoredBatch],
+        saved_state_root: Hash256,
+    ) -> Result<Self, String> {
+        let genesis_id = Assertion {
+            parent: AssertionId::GENESIS,
+            proposer: PartyId(0),
+            pre_state_root: Hash256::ZERO,
+            post_state_root: genesis.root(),
+            batch_commitment: Hash256::ZERO,
+            trace_length: 0,
+            bond: 0,
+        }
+        .id();
+        let mut seq = Self::new(genesis, chain, identity, bond).with_keyless(keyless);
+        seq.head = genesis_id;
+        for (i, batch) in batches.iter().enumerate() {
+            let height = i as u64 + 1;
+            let pre_state_root = seq.state.root();
+            let ctx = BatchContext {
+                timestamp: batch.timestamp,
+                keyless: seq.keyless.as_deref(),
+                base_fee: batch.base_fee,
+                fee_recipient: batch.fee_recipient,
+            };
+            let mut next = seq.state.clone();
+            let trace = execute_batch(&mut next, &ctx, &batch.transactions)
+                .map_err(|e| format!("saved block {height} no longer executes: {e}"))?;
+            if next.root() != batch.post_state_root {
+                return Err(format!(
+                    "saved block {height} re-executes to a different root"
+                ));
+            }
+            let block = Block {
+                height,
+                timestamp: batch.timestamp,
+                base_fee: batch.base_fee,
+                fee_recipient: batch.fee_recipient,
+                transactions: batch.transactions.clone(),
+                pre_state_root,
+                post_state_root: next.root(),
+                trace,
+            };
+            let id = Assertion {
+                parent: seq.head,
+                proposer: identity,
+                pre_state_root,
+                post_state_root: block.post_state_root,
+                batch_commitment: block.batch_commitment(),
+                trace_length: block.trace.len() as u64,
+                bond,
+            }
+            .id();
+            if seq.chain.get(&id).is_none() {
+                return Err(format!(
+                    "the saved chain has no assertion for block {height}"
+                ));
+            }
+            seq.state = next;
+            seq.head = id;
+            seq.blocks.push(block);
+            seq.assertions.push(id);
+        }
+        if seq.state.root() != saved_state_root {
+            return Err("replaying the saved blocks does not reach the saved state".to_owned());
+        }
+        Ok(seq)
+    }
+
+    /// Enables keyless accounts with the network's parameters.
+    #[must_use]
+    pub fn with_keyless(mut self, keyless: Option<Arc<KeylessConfig>>) -> Self {
+        self.keyless = keyless;
+        self
+    }
+
+    /// Replaces the clock batch timestamps are read from (for tests).
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The network's keyless parameters.
+    #[must_use]
+    pub fn keyless(&self) -> Option<&Arc<KeylessConfig>> {
+        self.keyless.as_ref()
+    }
+
+    /// The timestamp the next batch will carry: the clock, but never earlier
+    /// than the previous batch.
+    #[must_use]
+    pub fn next_timestamp(&self) -> u64 {
+        let last = self.blocks.last().map_or(0, |b| b.timestamp);
+        (self.clock)().max(last)
+    }
+
+    /// Offers a transaction to the mempool.
+    ///
+    /// Admission executes it, after everything already queued, with a batch
+    /// time [`ADMISSION_EXPIRY_MARGIN_SECS`] ahead of the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`] if the mempool refuses it.
+    pub fn submit(&mut self, transaction: Transaction) -> Result<Hash256, RejectReason> {
+        let keyless = self.keyless.clone();
+        let ctx = BatchContext {
+            keyless: keyless.as_deref(),
+            ..self.batch_context(
+                self.next_timestamp()
+                    .saturating_add(ADMISSION_EXPIRY_MARGIN_SECS),
+            )
+        };
+        self.mempool.submit(&self.state, &ctx, transaction)
     }
 
     /// Produces a block from up to `limit` queued transactions and posts a
@@ -140,20 +405,60 @@ impl Sequencer {
     /// Returns [`ProduceError`] if the batch fails to execute or the assertion
     /// is refused by the chain.
     pub fn produce(&mut self, limit: usize) -> Result<Option<(Block, AssertionId)>, ProduceError> {
-        let transactions = self.mempool.take_batch(limit);
+        let timestamp = self.next_timestamp();
+        // The window may already hold gas from an earlier batch with the same
+        // timestamp; only what is left of its limit is available.
+        let window = self
+            .fee_market()
+            .at(timestamp)
+            .unwrap_or_else(|_| self.fee_market());
+        let budget = window.window_limit().saturating_sub(window.window_gas);
+        let caps = |asset: AssetId| {
+            self.fee_asset_limits
+                .get(&asset)
+                .map_or(window.window_limit(), |permille| {
+                    window.window_limit() / 1_000 * u64::from(*permille)
+                })
+        };
+        let transactions = self
+            .mempool
+            .take_batch_fitting(limit, MAX_BATCH_BYTES, budget, caps);
         if transactions.is_empty() {
             return Ok(None);
         }
 
         let pre_state_root = self.state.root();
+        let ctx = self.batch_context(timestamp);
+        let (base_fee, fee_recipient) = (ctx.base_fee, ctx.fee_recipient);
 
         // Execute against a copy: on failure the canonical state must be left
         // untouched, since execute_batch leaves a partially applied trie behind.
-        let mut next = self.state.clone();
-        let trace = execute_batch(&mut next, &transactions)?;
+        //
+        // A transaction admitted earlier can stop compiling by sealing time —
+        // a keyless ephemeral key that expired despite the admission margin.
+        // Including it would make the whole batch invalid, so it is dropped
+        // and the rest retried. Any other failure is an admission bug and is
+        // reported rather than papered over.
+        let mut transactions = transactions;
+        let (next, trace) = loop {
+            let mut next = self.state.clone();
+            match execute_batch(&mut next, &ctx, &transactions) {
+                Ok(trace) => break (next, trace),
+                Err(BatchError::Compile { index, .. }) => {
+                    transactions.remove(index);
+                    if transactions.is_empty() {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         let block = Block {
             height: self.blocks.len() as u64 + 1,
+            timestamp,
+            base_fee,
+            fee_recipient,
             transactions,
             pre_state_root,
             post_state_root: next.root(),

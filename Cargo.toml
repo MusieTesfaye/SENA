@@ -17,6 +17,7 @@ sena-state      = { path = "crates/sena-state" }
 sena-stf        = { path = "crates/sena-stf" }
 sena-fraudproof = { path = "crates/sena-fraudproof" }
 sena-light-client = { path = "crates/sena-light-client" }
+sena-wallet     = { path = "crates/sena-wallet" }
 
 sha2        = { version = "0.10", default-features = false }
 serde       = { version = "1", features = ["derive"] }

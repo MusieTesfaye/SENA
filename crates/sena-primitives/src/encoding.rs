@@ -17,14 +17,11 @@
 /// unique tag guarantees that a digest computed for one purpose can never be
 /// replayed as a valid digest for another.
 pub mod domain {
-    /// Derivation of an L2 address from OIDC claims (REQ-AUTH-002).
-    pub const OIDC_ADDRESS: &[u8] = b"SENA:v1:oidc-address";
-    /// Derivation of a unified identity-scoped L2 address (Aptos Keyless model: iss + sub + pepper).
-    pub const OIDC_ADDRESS_UNIFIED: &[u8] = b"SENA:v1:oidc-address-unified";
+    /// Derivation of a keyless account address from an issuer hash and an
+    /// identity commitment (REQ-AUTH-002).
+    pub const KEYLESS_ADDRESS: &[u8] = b"SENA:v1:keyless-address";
     /// Hashing of a human-readable social identifier (REQ-SOCIAL-002).
     pub const SOCIAL_IDENTIFIER: &[u8] = b"SENA:v1:social-identifier";
-    /// Hashing of a social identifier using ODIS blinded pepper (Celo SocialConnect model).
-    pub const SOCIAL_ODIS: &[u8] = b"SENA:v1:social-odis";
     /// Interior node of the sparse Merkle trie.
     pub const TRIE_INTERNAL: &[u8] = b"SENA:v1:trie-internal";
     /// Leaf of the sparse Merkle trie.
@@ -51,8 +48,8 @@ pub mod domain {
 ///
 /// // Framing makes these two field splits distinguishable, where naive
 /// // concatenation would not.
-/// let a = CanonicalEncoder::new(domain::OIDC_ADDRESS).field(b"google").field(b"12").finish();
-/// let b = CanonicalEncoder::new(domain::OIDC_ADDRESS).field(b"google1").field(b"2").finish();
+/// let a = CanonicalEncoder::new(domain::KEYLESS_ADDRESS).field(b"google").field(b"12").finish();
+/// let b = CanonicalEncoder::new(domain::KEYLESS_ADDRESS).field(b"google1").field(b"2").finish();
 /// assert_ne!(a, b);
 /// ```
 #[derive(Debug, Clone)]
@@ -125,7 +122,7 @@ mod tests {
 
     #[test]
     fn distinct_domains_never_share_a_preimage() {
-        let a = CanonicalEncoder::new(domain::OIDC_ADDRESS)
+        let a = CanonicalEncoder::new(domain::KEYLESS_ADDRESS)
             .field(b"x")
             .finish();
         let b = CanonicalEncoder::new(domain::SOCIAL_IDENTIFIER)

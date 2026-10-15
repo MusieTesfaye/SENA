@@ -143,6 +143,29 @@ and L1 funding economics — risk without additional proof.
 
 ---
 
+## D-07 — Fee model
+
+| | |
+|---|---|
+| **Options** | Flat fee per transaction · Celo-style fee abstraction · launch a native token |
+| **Selected** | Celo-style fee abstraction, without a native token |
+| **Status** | Implemented (`9442900`), parameter set `sena-beta-params-2` |
+| **Affects** | REQ-GAS-001 to REQ-GAS-010 |
+
+**Rationale.** A flat fee does not price work, so a cheap transaction and an
+expensive one paid the same, and nothing rose with demand. Celo's model —
+metered gas, an EIP-1559 base fee with a floor, a hold settled into refund,
+tip and base fee, governed fee recipients — is proven in production and keeps
+"pay in stablecoins" intact. Its CELO denomination is replaced by a unit of
+account (micro-dollars) converted at governed rates, because a native token
+would bring back the gas-token friction SENA exists to remove and has no job
+yet: bonds are in APT, governance is a council, and the sequencer is single.
+A token can be added later as one more fee asset. Mento is not copied: SENA
+uses Circle's USDC rather than issuing a stablecoin. See
+[`docs/FEES.md`](../FEES.md).
+
+---
+
 ## Open — awaiting inputs the codebase does not contain
 
 | Decision | Options | Blocks | Needs |
@@ -159,3 +182,4 @@ and L1 funding economics — risk without additional proof.
 | Date | Change |
 |---|---|
 | 2026-09-20 | D-01 to D-06 proposed; parameter set `sena-beta-params-1` frozen |
+| 2026-10-15 | D-07: Celo-style fees; `base_gas_native` replaced by `intrinsic_gas`, `base_fee_floor`, `gas_target`, `gas_price_scale`; parameter set `sena-beta-params-2` |

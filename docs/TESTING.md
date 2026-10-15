@@ -1,16 +1,20 @@
 # Testing SENA
 
-Four layers, cheapest first. Each tests something the one before it cannot.
+Layers, cheapest first. Each tests something the one before it cannot.
+For a guided run through all of them, see [`END_TO_END.md`](END_TO_END.md).
 
 | Layer | Command | Time | What it proves |
 |---|---|---|---|
 | Rust suite | `cargo test --workspace` | ~1 min | The protocol logic is correct in isolation |
 | Demo | `cargo run --bin sena-demo` | ~30 s | Fraud is caught, end to end |
 | Live node | `sena-node run` + `send` | ~2 min | It works as a service over HTTP |
+| Stablecoins | `scripts/stablecoins-test.py` | ~15 s | Fees in four stablecoins, each paid in itself, every balance checked to the unit |
 | Move contracts | `aptos move test` | ~1 min | Aptos computes the same answers |
 | On chain | `scripts/chain-lifecycle.sh` | ~3 min | Aptos *enforces* the safety rules |
+| Disputes on chain | `scripts/localnet-dispute.sh [fee]` | ~3 min | Aptos *adjudicates* fraud, keyless proof and all; with `fee`, a forged tip in a non-par stablecoin |
+| Agents on chain | `scripts/localnet-agents.sh` | ~2 min | The relayer and watcher binaries work against Aptos |
 
-The last one is the only layer where something other than our own code is
+The last three are the only layers where something other than our own code is
 deciding anything.
 
 ---
@@ -22,16 +26,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-265 tests. The ones worth reading rather than just running:
-
-```sh
-cargo test -p sena-stf --test groth16_verification
-```
-
-`test_groth16_bn254_verifier_soundness` and `test_transaction_keyless_authentication_with_groth16`
-verify the on-chain BN254 Groth16 pairing check $e(A, B) = e(\alpha, \beta) \cdot e(L, \gamma) \cdot e(C, \delta)$,
-confirming that forged EPK nonces, tampered sender addresses, or manipulated transaction payloads
-are mathematically rejected.
+The ones worth reading rather than just running:
 
 ```sh
 cargo test -p sena-fraudproof --test dispute -- --nocapture
@@ -111,12 +106,17 @@ Requires Aptos CLI **7.9.0** specifically — see [`../move/README.md`](../move/
 aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 ```
 
-52 tests. Two groups matter:
+76 tests. Three groups matter:
 
 - **Conformance** — `codec::sha256_matches_rust`, `trie::leaf_hash_matches_rust`,
   `osp::machine_commitment_matches_rust` compute values in Move and compare them
   against what Rust produced. A divergence here would make Aptos decide disputes
   wrongly.
+- **Generated vectors** — `tests/vectors.move` is written by the Rust node
+  (`SENA_WRITE_MOVE_VECTORS=1 cargo test -p sena-fraudproof --test
+  move_vectors`): transactions, their compiled programs and executed steps,
+  keyless included. `dispute_e2e_test.move` checks L1 compiles and executes
+  every one exactly as Rust does.
 - **Lifecycle** — `lifecycle_test.move` drives the contracts the way an account
   does. These exist because the module tests call Move functions directly, which
   is why they did not catch that `disputes::Registry` was never created by
@@ -124,8 +124,10 @@ aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 
 ## 5. On chain
 
+Start a local node first (`aptos node run-localnet`), or name a public network:
+
 ```sh
-scripts/chain-lifecycle.sh devnet     # or testnet
+scripts/chain-lifecycle.sh local      # or devnet, testnet
 ```
 
 Deploys to a fresh account and exercises the lifecycle, asserting an expected
@@ -133,6 +135,7 @@ outcome at every step. The two that matter are failures:
 
 ```
 finalize inside the challenge window  →  E_WINDOW_OPEN
+challenge your own assertion          →  E_SELF_CHALLENGE
 finalize while challenged             →  E_WRONG_STATUS
 ```
 
@@ -144,6 +147,31 @@ encoding rather than reading them back from the chain, so a mismatch between the
 Move and Rust hashing shows up as a rejected argument.
 
 Devnet resets periodically. Use `testnet` for evidence you want to keep.
+
+### A dispute, played on chain
+
+```sh
+scripts/localnet-dispute.sh
+```
+
+Publishes the package to fresh accounts and replays a plan from
+`cargo run -p sena-fraudproof --example dispute_plan`: a batch whose keyless
+transfer the proposer credits a thousandfold. The script posts it with its
+batch data, challenges, plays the bisection, computes the keyless verdict with
+`keyless_jobs` (Aptos verifies the Groth16 proof), submits the one-step proof,
+and requires the assertion to end rejected. It prints the gas of every move.
+
+### The relayer and watcher, on chain
+
+```sh
+cargo build -p sena-node && scripts/localnet-agents.sh
+```
+
+Starts a sequencer, has `sena-node relay` post its block to L1, and has
+`sena-node watch` -- given only the genesis file and L1 -- re-execute and verify
+it. Fails if the watcher challenges an honest block. The fraud paths of both
+agents are covered by `cargo test -p sena-node --test l1_agents`, against an
+in-memory model of the contracts.
 
 ### Access control
 
@@ -236,19 +264,18 @@ encode `u128`, and a JSON number above 2^53 would be silently rounded. Try
 
 ## What no test here covers
 
-- **Bonds have not been posted on a live network.** They are escrowed, slashed
-  and refunded in Move, with balances checked by test, but no bond has been put
-  at risk on devnet or testnet.
-- **The withdrawal path has not been driven end to end.** The node produces a
-  proof and the contract accepts the shape of one, but nobody has yet taken a
-  proof from `sena_getWithdrawalProof` and spent it against a finalized
-  assertion on chain.
-- **No dispute has been played to completion on chain.** Bisection and one-step
-  adjudication run in Rust and in Move unit tests, not against a live network.
-- **No batch data is published to L1.** A verifier gets it from the sequencer's
-  RPC, so a sequencer that withheld it could not be challenged.
-- **Four instructions cannot be adjudicated.** `VerifyGasAsset`,
-  `VerifyCouncil`, `SetGasAsset` and `SetParameter` abort in `osp`.
+- **On testnet, only the lifecycle and a deposit have run**
+  ([evidence](beta/evidence/04-testnet-deployment.md)); disputes and the
+  agents have run on a local node only.
+- **The withdrawal path has not been driven end to end on chain.** The node
+  produces a proof and the contract verifies it and pays out in Move tests, but
+  nobody has yet spent a proof from `sena_getWithdrawalProof` against a
+  finalized assertion on a live network.
+- **No live keyless sign-in.** The wallet client is tested with Aptos's sample
+  proof and fixture responses, not against the Aptos prover and pepper
+  services with a real identity provider.
+- **The watcher's fraud paths run against a model of L1**, not a live one; the
+  dispute itself is proven on chain separately, by `localnet-dispute.sh`.
 - **Nothing has been audited or fuzzed.**
 
 [`../STATUS.md`](../STATUS.md) keeps the full list.

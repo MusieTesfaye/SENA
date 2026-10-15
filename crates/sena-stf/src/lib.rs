@@ -36,25 +36,26 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod account;
+pub mod batch;
 pub mod execute;
 pub mod gas;
 pub mod governance;
-pub mod groth16;
 pub mod instruction;
 pub mod keyless;
 pub mod keys;
+pub mod poseidon;
 pub mod social;
 pub mod transaction;
+pub mod wire;
 
 pub use account::{Account, BalanceError};
 pub use execute::{
-    apply, compile, execute_batch, transition, verify_step, BatchError, CompileError,
-    ExecutionTrace, StepError, StepWitness, BASE_GAS_NATIVE, FEE_VAULT,
+    apply, compile, execute_batch, fee_charge, gas_required, transition, verify_step, BatchContext,
+    BatchError, CompileError, ExecutionTrace, StepError, StepWitness, FEE_VAULT,
 };
-pub use gas::{GasError, WhitelistedAsset, RATE_SCALE};
+pub use gas::{FeeMarket, FeeSplit, GasError, WhitelistedAsset, PRICE_SCALE, RATE_SCALE};
 pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
-pub use groth16::{derive_keyless_public_inputs, hash_to_fr, Bn254Groth16Verifier, Bn254Proof};
 pub use instruction::{Instruction, MachineState};
-pub use keyless::{KeylessAuth, KeylessError, KeylessPolicy, KeylessVerifier, NoVerifier};
+pub use keyless::{KeylessConfig, KeylessError, KeylessSignature};
 pub use social::{MalformedBinding, SocialBinding};
 pub use transaction::{AuthError, Authenticator, Payload, Transaction};

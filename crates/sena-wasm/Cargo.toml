@@ -1,0 +1,27 @@
+[package]
+name = "sena-wasm"
+description = "SENA wallet logic for browsers: keyless sign-in and transaction signing, compiled to WebAssembly."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sena-primitives.workspace = true
+sena-stf.workspace = true
+sena-wallet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+wasm-bindgen = "=0.2.100"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+base64 = "0.22"

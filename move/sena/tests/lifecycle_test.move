@@ -22,11 +22,21 @@ module sena::lifecycle_test {
     use aptos_framework::timestamp;
 
     use sena::assertions;
+    use sena::batch;
     use sena::disputes;
+    use sena::keyless;
 
+    /// The batch header's base fee and tip recipient; posting does not check
+    /// them (the trace does), so any values serve.
+    const BASE_FEE: u128 = 25000000000;
+    const TIPS: vector<u8> = x"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
     const GENESIS_ROOT: vector<u8> = x"1111111111111111111111111111111111111111111111111111111111111111";
     const NEXT_ROOT: vector<u8> = x"2222222222222222222222222222222222222222222222222222222222222222";
-    const BATCH: vector<u8> = x"3333333333333333333333333333333333333333333333333333333333333333";
+    /// Placeholder batch data: these tests exercise the assertion lifecycle,
+    /// not the transactions. A batch of one transaction, ten steps long.
+    const TX: vector<u8> = b"opaque transaction bytes";
+    const TRACE: u64 = 10;
+    const MAX_BATCH_AGE: u64 = 3600;
 
     const WINDOW: u64 = 604800;
     const BOND: u128 = 1000000;
@@ -87,8 +97,8 @@ module sena::lifecycle_test {
         timestamp::set_time_has_started_for_testing(aptos);
         account::create_account_for_test(signer::address_of(admin));
         let (mint_ref, metadata) = create_asset(admin);
-        assertions::initialize(admin, GENESIS_ROOT, WINDOW, BOND, metadata, TREASURY);
-        disputes::initialize(admin, signer::address_of(admin));
+        assertions::initialize(admin, GENESIS_ROOT, WINDOW, BOND, metadata, TREASURY, MAX_BATCH_AGE);
+        disputes::initialize(admin, signer::address_of(admin), keyless::setup_disabled());
         account::create_account_for_test(TREASURY);
         (mint_ref, metadata)
     }
@@ -97,15 +107,23 @@ module sena::lifecycle_test {
         assertions::assertion_id(zero32(), 0, zero32(), GENESIS_ROOT, zero32(), 0, 0)
     }
 
+    fun commitment(): vector<u8> {
+        batch::header_commitment(0, BASE_FEE, TIPS, 1, batch::root_of(&vector[TX], &vector[0]))
+    }
+
     fun child_id(): vector<u8> {
-        assertions::assertion_id(genesis_id(), 0, GENESIS_ROOT, NEXT_ROOT, BATCH, 10, BOND)
+        assertions::assertion_id(genesis_id(), 0, GENESIS_ROOT, NEXT_ROOT, commitment(), TRACE, BOND)
     }
 
     fun post_one(proposer: &signer, admin_addr: address) {
         assertions::post(
             proposer, admin_addr, genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, BATCH, 10, BOND,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
         );
+    }
+
+    fun dispute_of(challenger: &signer): vector<u8> {
+        disputes::dispute_id(child_id(), signer::address_of(challenger))
     }
 
     // --- Bonds --------------------------------------------------------------
@@ -155,12 +173,11 @@ module sena::lifecycle_test {
 
         post_one(proposer, admin_addr);
         assertions::open_challenge(challenger, admin_addr, child_id(), BOND);
-        disputes::open(challenger, admin_addr, child_id(), child_id(), p, 64,
-                       GENESIS_ROOT, NEXT_ROOT, WINDOW);
+        disputes::open(challenger, admin_addr, child_id());
 
         // The defender stops responding and forfeits.
         timestamp::fast_forward_seconds(WINDOW);
-        disputes::claim_timeout(anyone, admin_addr, child_id());
+        disputes::claim_timeout(anyone, admin_addr, dispute_of(challenger));
 
         assert!(assertions::status(admin_addr, child_id()) == assertions::status_rejected(), 0);
 
@@ -191,14 +208,13 @@ module sena::lifecycle_test {
 
         post_one(proposer, admin_addr);
         assertions::open_challenge(challenger, admin_addr, child_id(), BOND);
-        disputes::open(challenger, admin_addr, child_id(), child_id(), p, 64,
-                       GENESIS_ROOT, NEXT_ROOT, WINDOW);
+        disputes::open(challenger, admin_addr, child_id());
 
         // The challenger opened and then went silent; the defender's dissection
         // is due first, so move past the challenger's own deadline instead.
-        disputes::dissect(proposer, admin_addr, child_id(), dissection_for(0, 64));
+        disputes::dissect(proposer, admin_addr, dispute_of(challenger), dissection_for(0, TRACE));
         timestamp::fast_forward_seconds(WINDOW);
-        disputes::claim_timeout(anyone, admin_addr, child_id());
+        disputes::claim_timeout(anyone, admin_addr, dispute_of(challenger));
 
         // Assertion survives and returns to pending.
         assert!(assertions::status(admin_addr, child_id()) == assertions::status_pending(), 0);
@@ -277,7 +293,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            GENESIS_ROOT, NEXT_ROOT, BATCH, 10, BOND - 1,
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND - 1,
         );
     }
 
@@ -290,7 +306,7 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
         assertions::post(
             proposer, signer::address_of(admin), genesis_id(),
-            NEXT_ROOT, NEXT_ROOT, BATCH, 10, BOND,
+            NEXT_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
         );
     }
 
@@ -351,9 +367,10 @@ module sena::lifecycle_test {
         account::create_account_for_test(signer::address_of(outsider));
         let admin_addr = signer::address_of(admin);
 
-        disputes::open(challenger, admin_addr, BATCH, BATCH,
-                       signer::address_of(proposer), 64, GENESIS_ROOT, NEXT_ROOT, WINDOW);
-        disputes::dissect(outsider, admin_addr, BATCH, vector::empty<vector<u8>>());
+        post_one(proposer, admin_addr);
+        assertions::open_challenge(challenger, admin_addr, child_id(), BOND);
+        disputes::open(challenger, admin_addr, child_id());
+        disputes::dissect(outsider, admin_addr, dispute_of(challenger), dissection_for(0, TRACE));
     }
 
     #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, challenger = @0xB0B)]
@@ -366,8 +383,87 @@ module sena::lifecycle_test {
         fund(&mint_ref, metadata, signer::address_of(challenger), FUNDING);
         let admin_addr = signer::address_of(admin);
 
-        disputes::open(challenger, admin_addr, BATCH, BATCH,
-                       signer::address_of(proposer), 64, GENESIS_ROOT, NEXT_ROOT, WINDOW);
-        disputes::select(challenger, admin_addr, BATCH, 0);
+        post_one(proposer, admin_addr);
+        assertions::open_challenge(challenger, admin_addr, child_id(), BOND);
+        disputes::open(challenger, admin_addr, child_id());
+        disputes::select(challenger, admin_addr, dispute_of(challenger), 0);
+    }
+
+    // Regression test: `open` used to take the defender, trace length and
+    // commitments from the caller. Anyone could name a sock-puppet defender
+    // who never answered, win by timeout, and reject a sound assertion. Now
+    // there is nothing to name, and opening requires a bonded challenge.
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, mallory = @0xBAD)]
+    #[expected_failure(abort_code = 59, location = sena::disputes)]
+    fun a_dispute_cannot_be_opened_without_a_challenge(
+        aptos: &signer, admin: &signer, proposer: &signer, mallory: &signer,
+    ) {
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        account::create_account_for_test(signer::address_of(mallory));
+        let admin_addr = signer::address_of(admin);
+
+        post_one(proposer, admin_addr);
+        disputes::open(mallory, admin_addr, child_id());
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE, challenger = @0xB0B)]
+    fun the_defender_is_always_the_proposer(
+        aptos: &signer, admin: &signer, proposer: &signer, challenger: &signer,
+    ) {
+        // The proposer, and only the proposer, can make the defender's move.
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        fund(&mint_ref, metadata, signer::address_of(challenger), FUNDING);
+        let admin_addr = signer::address_of(admin);
+
+        post_one(proposer, admin_addr);
+        assertions::open_challenge(challenger, admin_addr, child_id(), BOND);
+        disputes::open(challenger, admin_addr, child_id());
+        disputes::dissect(proposer, admin_addr, dispute_of(challenger), dissection_for(0, TRACE));
+    }
+
+    // --- Timestamps and batch shape -------------------------------------------
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE)]
+    #[expected_failure(abort_code = 66, location = sena::assertions)]
+    fun a_stale_batch_is_refused(aptos: &signer, admin: &signer, proposer: &signer) {
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        timestamp::fast_forward_seconds(MAX_BATCH_AGE + 1);
+        post_one(proposer, signer::address_of(admin));
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE)]
+    #[expected_failure(abort_code = 65, location = sena::assertions)]
+    fun a_future_batch_is_refused(aptos: &signer, admin: &signer, proposer: &signer) {
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        assertions::post(
+            proposer, signer::address_of(admin), genesis_id(),
+            GENESIS_ROOT, NEXT_ROOT, 3600, BASE_FEE, TIPS, vector[TX], vector[0], TRACE, BOND,
+        );
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE)]
+    #[expected_failure(abort_code = 67, location = sena::assertions)]
+    fun start_positions_must_begin_at_zero(aptos: &signer, admin: &signer, proposer: &signer) {
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        assertions::post(
+            proposer, signer::address_of(admin), genesis_id(),
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector[TX], vector[1], TRACE, BOND,
+        );
+    }
+
+    #[test(aptos = @0x1, admin = @sena, proposer = @0xA11CE)]
+    #[expected_failure(abort_code = 67, location = sena::assertions)]
+    fun an_empty_batch_cannot_change_state(aptos: &signer, admin: &signer, proposer: &signer) {
+        let (mint_ref, metadata) = setup(aptos, admin);
+        fund(&mint_ref, metadata, signer::address_of(proposer), FUNDING);
+        assertions::post(
+            proposer, signer::address_of(admin), genesis_id(),
+            GENESIS_ROOT, NEXT_ROOT, 0, BASE_FEE, TIPS, vector::empty(), vector::empty(), 0, BOND,
+        );
     }
 }

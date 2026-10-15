@@ -22,10 +22,14 @@ on:
     branches: [main]
     paths:
       - 'move/**'
+      - 'crates/**'
+      - 'scripts/localnet-*'
       - '.github/workflows/move.yml'
   pull_request:
     paths:
       - 'move/**'
+      - 'crates/**'
+      - 'scripts/localnet-*'
       - '.github/workflows/move.yml'
   workflow_dispatch:
 
@@ -117,4 +121,58 @@ jobs:
         with:
           name: move-build-evidence
           path: artifacts/
+          retention-days: 90
+
+  localnet:
+    # Unit tests run the contracts in the Move VM's test harness, with no gas
+    # meter, no transaction size limit and no execution budget. This job runs
+    # them on a real Aptos node: a keyless fraud dispute played through real
+    # transactions until L1 verifies the Groth16 proof and rejects the
+    # assertion, and the relayer and watcher binaries posting and verifying an
+    # honest block.
+    name: localnet dispute and agents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Aptos CLI ${{ env.APTOS_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v${APTOS_CLI_VERSION}/aptos-cli-${APTOS_CLI_VERSION}-Linux-x86_64.zip"
+          curl -sSL -o aptos-cli.zip "$url"
+          unzip -q aptos-cli.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the node
+        run: cargo build -p sena-node
+
+      - name: Start a localnet
+        run: |
+          set -euo pipefail
+          nohup aptos node run-localnet --force-restart --assume-yes --test-dir "$RUNNER_TEMP/localnet" \
+            > "$RUNNER_TEMP/localnet.log" 2>&1 &
+          for _ in $(seq 120); do
+            curl -sf http://127.0.0.1:8080/v1 >/dev/null && curl -sf http://127.0.0.1:8081/ >/dev/null && exit 0
+            sleep 2
+          done
+          tail -50 "$RUNNER_TEMP/localnet.log"
+          exit 1
+
+      - name: Keyless fraud dispute on chain
+        run: scripts/localnet-dispute.sh 2>&1 | tee dispute.log
+
+      - name: Relayer and watcher against L1
+        run: scripts/localnet-agents.sh 2>&1 | tee agents.log
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: localnet-evidence
+          path: |
+            dispute.log
+            agents.log
           retention-days: 90

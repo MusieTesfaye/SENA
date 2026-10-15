@@ -6,7 +6,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
-use sena_stf::gas::fee_for;
 use sena_stf::{
     apply, Authenticator, Instruction, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
 };
@@ -33,14 +32,18 @@ fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
-        max_fee: fee_for(RATE).unwrap(),
-        fee_rate: RATE,
+        fee_rate: 0,
+        fee_intrinsic_gas: 0,
+        gas_limit: 0,
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
         payload,
         authenticator: Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
         },
     };
+    sena_stf::gas::fill_default_fees(&mut tx);
     let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),
@@ -58,6 +61,7 @@ fn genesis(accounts: &[(L2Address, u128)]) -> MerkleTrie {
                 asset: USDC,
                 symbol: "USDC".to_owned(),
                 rate: RATE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             },
         },
@@ -97,7 +101,7 @@ fn a_valid_transaction_is_admitted() {
             amount: 10,
         },
     );
-    assert!(seq.mempool.submit(&seq.state, tx).is_ok());
+    assert!(seq.submit(tx).is_ok());
     assert_eq!(seq.mempool.len(), 1);
 }
 
@@ -118,9 +122,115 @@ fn an_unfunded_transaction_is_refused_at_admission() {
         },
     );
     assert!(matches!(
-        seq.mempool.submit(&seq.state, tx),
+        seq.submit(tx),
         Err(RejectReason::WouldNotExecute { .. })
     ));
+}
+
+/// Whitelists `asset` for fees.
+fn whitelist(trie: &mut MerkleTrie, asset: AssetId, rate: u128, intrinsic_gas: u64, on: bool) {
+    let record = WhitelistedAsset {
+        asset,
+        symbol: format!("A{}", asset.get()),
+        rate,
+        intrinsic_gas,
+        enabled: on,
+    };
+    apply(trie, &Instruction::SetGasAsset { record }).unwrap();
+}
+
+/// A transfer of `asset` paying its fee in `fee_asset`, declared at `rate`
+/// and `intrinsic_gas`.
+fn paying_in(
+    key: &SigningKey,
+    nonce: u64,
+    asset: AssetId,
+    fee_asset: AssetId,
+    rate: u128,
+    intrinsic_gas: u64,
+) -> Transaction {
+    let mut tx = signed(
+        key,
+        nonce,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset,
+            amount: 10,
+        },
+    );
+    tx.fee_asset = fee_asset;
+    let max_fee =
+        2 * sena_stf::gas::native_to_asset(sena_stf::gas::DEFAULT_BASE_FEE_FLOOR, rate).unwrap();
+    sena_stf::gas::fill_fees(&mut tx, rate, intrinsic_gas, max_fee);
+    let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
+    tx.authenticator = Authenticator::Ed25519 {
+        public_key: key.verifying_key().to_bytes(),
+        signature,
+    };
+    tx
+}
+
+#[test]
+fn only_an_enabled_fee_asset_declared_as_whitelisted_is_admitted() {
+    // The node's own admission, not just a wallet's quote, must refuse a fee
+    // that the trace would reject: a disabled asset, an unlisted one, and a
+    // listed one declared at the wrong rate or intrinsic gas.
+    const USDT: AssetId = AssetId(2);
+    const EURC: AssetId = AssetId(3);
+    const DAI: AssetId = AssetId(4);
+    const EURC_RATE: u128 = 925_000;
+    let alice = signer(1);
+    let mut trie = genesis(&[]);
+    whitelist(&mut trie, USDT, RATE, 10_000, true);
+    whitelist(&mut trie, EURC, EURC_RATE, 15_000, true);
+    whitelist(&mut trie, DAI, RATE, 10_000, false);
+    for asset in [USDC, USDT, EURC, DAI] {
+        let credit = Instruction::Credit {
+            account: address_of(&alice),
+            asset,
+            amount: 1_000_000,
+        };
+        apply(&mut trie, &credit).unwrap();
+    }
+    let mut seq = node(trie);
+
+    let refused = [
+        ("disabled", paying_in(&alice, 0, DAI, DAI, RATE, 10_000)),
+        (
+            "unlisted",
+            paying_in(&alice, 0, USDC, AssetId(9), RATE, 10_000),
+        ),
+        ("wrong rate", paying_in(&alice, 0, USDT, EURC, RATE, 15_000)),
+        (
+            "wrong intrinsic gas",
+            paying_in(&alice, 0, USDT, EURC, EURC_RATE, 10_000),
+        ),
+    ];
+    for (why, tx) in refused {
+        assert!(
+            matches!(
+                handle(
+                    &mut seq,
+                    "sena-test-1",
+                    Request::SubmitTransaction(Box::new(tx))
+                ),
+                Response::Error { .. }
+            ),
+            "a {why} fee asset was admitted"
+        );
+    }
+    assert!(seq.mempool.is_empty());
+
+    // Correctly declared, every enabled stablecoin pays, including for a
+    // transfer of another asset, and a disabled one can still be moved.
+    seq.submit(paying_in(&alice, 0, USDT, EURC, EURC_RATE, 15_000))
+        .unwrap();
+    seq.submit(paying_in(&alice, 1, DAI, USDT, RATE, 10_000))
+        .unwrap();
+    seq.submit(paying_in(&alice, 2, USDC, USDC, RATE, 10_000))
+        .unwrap();
+    let (block, _) = seq.produce(100).unwrap().expect("a block");
+    assert_eq!(block.transactions.len(), 3);
 }
 
 #[test]
@@ -129,39 +239,44 @@ fn admission_accounts_for_what_is_already_queued() {
     // Checking the candidate in isolation would let the batch become invalid.
     let alice = signer(1);
     let bob = address_of(&signer(2));
-    let funds = fee_for(RATE).unwrap() * 2 + 1_500;
+    // Enough for two fees but only one of the two transfers.
+    let probe = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 1_000,
+        },
+    );
+    let hold = sena_stf::fee_charge(&probe, &sena_stf::BatchContext::without_keyless(0))
+        .unwrap()
+        .hold;
+    let funds = hold * 2 + 1_500;
     let mut seq = node(genesis(&[(address_of(&alice), funds)]));
 
     assert!(seq
-        .mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 1_000
-                }
-            )
-        )
+        .submit(signed(
+            &alice,
+            0,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1_000
+            }
+        ))
         .is_ok());
     assert!(
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    1,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 1_000
-                    }
-                )
-            )
-            .is_err(),
+        seq.submit(signed(
+            &alice,
+            1,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1_000
+            }
+        ))
+        .is_err(),
         "the second transfer is unaffordable once the first is queued"
     );
 }
@@ -179,11 +294,8 @@ fn a_duplicate_transaction_is_refused() {
             amount: 10,
         },
     );
-    seq.mempool.submit(&seq.state, tx.clone()).unwrap();
-    assert_eq!(
-        seq.mempool.submit(&seq.state, tx),
-        Err(RejectReason::Duplicate)
-    );
+    seq.submit(tx.clone()).unwrap();
+    assert_eq!(seq.submit(tx), Err(RejectReason::Duplicate));
 }
 
 #[test]
@@ -191,33 +303,26 @@ fn a_repeated_nonce_is_refused_while_queued() {
     let alice = signer(1);
     let bob = address_of(&signer(2));
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     assert!(matches!(
-        seq.mempool.submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 2
-                }
-            )
-        ),
+        seq.submit(signed(
+            &alice,
+            0,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 2
+            }
+        )),
         Err(RejectReason::NonceQueued { nonce: 0 })
     ));
 }
@@ -231,20 +336,16 @@ fn producing_a_block_advances_state_and_posts_an_assertion() {
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
     let before = seq.state.root();
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: bob,
-                    asset: USDC,
-                    amount: 500,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 500,
+        },
+    ))
+    .unwrap();
     let (block, id) = seq
         .produce(100)
         .unwrap()
@@ -279,7 +380,7 @@ fn a_block_is_not_final_until_its_window_elapses() {
         },
     );
     let hash = tx.hash();
-    seq.mempool.submit(&seq.state, tx).unwrap();
+    seq.submit(tx).unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     assert_eq!(
@@ -305,20 +406,16 @@ fn several_blocks_chain_together() {
     let mut seq = node(genesis(&[(address_of(&alice), 5_000_000)]));
 
     for nonce in 0..3 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 100,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 100,
+            },
+        ))
+        .unwrap();
         seq.produce(1).unwrap().unwrap();
     }
 
@@ -339,23 +436,19 @@ fn a_verifier_reproduces_an_honest_sequencers_state() {
     let bob = address_of(&signer(2));
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     for nonce in 0..5 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: bob,
-                        asset: USDC,
-                        amount: 250,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 250,
+            },
+        ))
+        .unwrap();
     }
     let (block, id) = seq.produce(100).unwrap().unwrap();
     let assertion = seq.chain.get(&id).unwrap().assertion.clone();
@@ -373,22 +466,18 @@ fn a_verifier_rejects_a_falsified_root_and_does_not_adopt_it() {
     let alice = signer(1);
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start.clone(), PartyId(2));
+    let mut verifier = VerifierNode::new(start.clone(), PartyId(2), None);
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (block, id) = seq.produce(100).unwrap().unwrap();
 
     let mut lying = seq.chain.get(&id).unwrap().assertion.clone();
@@ -408,23 +497,19 @@ fn a_verifier_can_open_a_dispute_over_what_it_found() {
     let alice = signer(1);
     let start = genesis(&[(address_of(&alice), 5_000_000)]);
     let mut seq = node(start.clone());
-    let mut verifier = VerifierNode::new(start, PartyId(2));
+    let mut verifier = VerifierNode::new(start, PartyId(2), None);
 
     for nonce in 0..4 {
-        seq.mempool
-            .submit(
-                &seq.state,
-                signed(
-                    &alice,
-                    nonce,
-                    Payload::Transfer {
-                        to: address_of(&signer(2)),
-                        asset: USDC,
-                        amount: 10,
-                    },
-                ),
-            )
-            .unwrap();
+        seq.submit(signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: address_of(&signer(2)),
+                asset: USDC,
+                amount: 10,
+            },
+        ))
+        .unwrap();
     }
     let (block, id) = seq.produce(100).unwrap().unwrap();
 
@@ -484,19 +569,15 @@ fn rpc_resolves_a_social_identifier() {
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
     let id = HashedIdentifier::new(Channel::Handle, "@alice", &NetworkSalt::new(*b"test-salt"));
 
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::BindIdentifier {
-                    channel: Channel::Handle,
-                    identifier: id,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::BindIdentifier {
+            channel: Channel::Handle,
+            identifier: id,
+        },
+    ))
+    .unwrap();
     seq.produce(100).unwrap().unwrap();
 
     match handle(
@@ -557,20 +638,16 @@ fn rpc_reports_an_assertions_remaining_window() {
     // to challenge -- and how long until a withdrawal is safe.
     let alice = signer(1);
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     match handle(&mut seq, "sena-test-1", Request::GetAssertion { id }) {
@@ -607,20 +684,16 @@ fn rpc_reports_an_assertions_remaining_window() {
 fn rpc_reports_whether_the_current_root_is_withdrawable() {
     let alice = signer(1);
     let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    seq.mempool
-        .submit(
-            &seq.state,
-            signed(
-                &alice,
-                0,
-                Payload::Transfer {
-                    to: address_of(&signer(2)),
-                    asset: USDC,
-                    amount: 1,
-                },
-            ),
-        )
-        .unwrap();
+    seq.submit(signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    ))
+    .unwrap();
     let (_, id) = seq.produce(100).unwrap().unwrap();
 
     match handle(&mut seq, "sena-test-1", Request::GetStateRoot) {
@@ -756,4 +829,238 @@ fn the_signing_digest_does_not_depend_on_json() {
         payload_bytes[0], b'{',
         "the payload encoding must be binary"
     );
+}
+
+#[test]
+fn blocks_are_cut_to_fit_one_l1_transaction() {
+    let alice = signer(1);
+    let bob = address_of(&signer(2));
+    let mut sequencer = node(genesis(&[(address_of(&alice), 1_000_000_000)]));
+    let transfer = |nonce| {
+        signed(
+            &alice,
+            nonce,
+            Payload::Transfer {
+                to: bob,
+                asset: USDC,
+                amount: 1,
+            },
+        )
+    };
+    let per_tx = transfer(0).encode().len();
+    let count = sena_node::sequencer::MAX_BATCH_BYTES / per_tx + 10;
+    for nonce in 0..count as u64 {
+        sequencer.submit(transfer(nonce)).unwrap();
+    }
+
+    let (block, _) = sequencer.produce(usize::MAX).unwrap().unwrap();
+    let size: usize = block.transactions.iter().map(|t| t.encode().len()).sum();
+    assert!(size <= sena_node::sequencer::MAX_BATCH_BYTES);
+    assert_eq!(
+        block.transactions.len(),
+        sena_node::sequencer::MAX_BATCH_BYTES / per_tx
+    );
+    // The rest stays queued, in order, for the next block.
+    let (next, _) = sequencer.produce(usize::MAX).unwrap().unwrap();
+    assert_eq!(next.transactions[0].nonce, block.transactions.len() as u64);
+}
+
+// --- Fees ----------------------------------------------------------------------
+
+fn transfer(key: &SigningKey, nonce: u64, amount: u128) -> Transaction {
+    signed(
+        key,
+        nonce,
+        Payload::Transfer {
+            to: address_of(&signer(77)),
+            asset: USDC,
+            amount,
+        },
+    )
+}
+
+fn balance(seq: &Sequencer, who: &L2Address) -> u128 {
+    seq.state
+        .get(&sena_stf::keys::account(who))
+        .map_or(0, |b| sena_stf::Account::decode(b).unwrap().balance(USDC))
+}
+
+#[test]
+fn tips_reach_the_sequencer_and_the_base_fee_the_vault() {
+    let alice = signer(1);
+    let operator = address_of(&signer(40));
+    let mut seq = node(genesis(&[(address_of(&alice), 10_000_000)])).with_fee_recipient(operator);
+    let mut tx = transfer(&alice, 0, 5);
+    tx.max_priority_fee_per_gas = sena_stf::PRICE_SCALE / 100;
+    let tx = {
+        let s = alice.sign(tx.signing_digest().as_bytes()).to_bytes();
+        tx.authenticator = Authenticator::Ed25519 {
+            public_key: alice.verifying_key().to_bytes(),
+            signature: s,
+        };
+        tx
+    };
+    let ctx = seq.batch_context(seq.next_timestamp());
+    let charge = sena_stf::fee_charge(&tx, &ctx).unwrap();
+    seq.submit(tx).unwrap();
+    let (block, _) = seq.produce(16).unwrap().unwrap();
+    assert_eq!(block.fee_recipient, operator);
+    assert!(charge.tip > 0);
+    assert_eq!(balance(&seq, &operator), charge.tip);
+    assert_eq!(balance(&seq, &sena_stf::FEE_VAULT), charge.base);
+    assert_eq!(
+        balance(&seq, &address_of(&alice)),
+        10_000_000 - 5 - charge.tip - charge.base
+    );
+}
+
+#[test]
+fn the_gas_price_rpc_quotes_the_next_batch() {
+    let mut seq = node(genesis(&[]));
+    let Response::GasPrice {
+        rate,
+        intrinsic_gas,
+        base_fee_native,
+        base_fee_per_gas,
+        suggested_max_fee_per_gas,
+        ..
+    } = handle(&mut seq, "test", Request::GasPrice { asset: USDC })
+    else {
+        panic!("expected a gas price");
+    };
+    assert_eq!(rate, RATE);
+    assert_eq!(intrinsic_gas, sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS);
+    assert_eq!(base_fee_native, sena_stf::gas::DEFAULT_BASE_FEE_FLOOR);
+    assert_eq!(base_fee_per_gas, base_fee_native); // one-to-one rate
+    assert_eq!(suggested_max_fee_per_gas, 2 * base_fee_per_gas);
+    assert!(matches!(
+        handle(&mut seq, "test", Request::GasPrice { asset: AssetId(9) }),
+        Response::Error { .. }
+    ));
+}
+
+#[test]
+fn a_batch_is_cut_to_the_fee_window() {
+    let alice = signer(1);
+    let mut state = genesis(&[(address_of(&alice), 10_000_000)]);
+    let per_tx = sena_stf::gas_required(&transfer(&alice, 0, 1)).unwrap();
+    // A window that fits five transfers: target 2.5, elastic limit 5.
+    apply(
+        &mut state,
+        &Instruction::SetFeeMarket {
+            floor: sena_stf::gas::DEFAULT_BASE_FEE_FLOOR,
+            target: per_tx * 5 / 2,
+        },
+    )
+    .unwrap();
+    let mut seq = node(state).with_clock(|| 100);
+    for nonce in 0..8 {
+        seq.submit(transfer(&alice, nonce, 1)).unwrap();
+    }
+    let (first, _) = seq.produce(64).unwrap().unwrap();
+    assert_eq!(first.transactions.len(), 5, "only a full window's worth");
+    // The same second's window is full: nothing more until the next second.
+    assert!(seq.produce(64).unwrap().is_none());
+    assert_eq!(seq.mempool.len(), 3);
+}
+
+#[test]
+fn a_fee_asset_cannot_take_more_than_its_share_of_a_window() {
+    let alice = signer(1);
+    let mut state = genesis(&[(address_of(&alice), 10_000_000)]);
+    let per_tx = sena_stf::gas_required(&transfer(&alice, 0, 1)).unwrap();
+    apply(
+        &mut state,
+        &Instruction::SetFeeMarket {
+            floor: sena_stf::gas::DEFAULT_BASE_FEE_FLOOR,
+            target: per_tx * 5,
+        },
+    )
+    .unwrap();
+    // USDC may use 30% of the 10-transfer window: three transfers.
+    let limits = std::iter::once((USDC, 300)).collect();
+    let mut seq = node(state).with_clock(|| 100).with_fee_asset_limits(limits);
+    for nonce in 0..6 {
+        seq.submit(transfer(&alice, nonce, 1)).unwrap();
+    }
+    let (block, _) = seq.produce(64).unwrap().unwrap();
+    assert_eq!(block.transactions.len(), 3);
+}
+
+#[test]
+fn rpc_lists_fee_assets_as_state_holds_them() {
+    let mut trie = genesis(&[]);
+    whitelist(&mut trie, AssetId(3), 925_000, 15_000, false);
+    let mut seq = node(trie).with_fee_assets(vec![USDC, AssetId(3), AssetId(9)]);
+    match handle(&mut seq, "sena-test-1", Request::GetFeeAssets) {
+        Response::FeeAssets { assets } => {
+            // Asset 9 has no record, so it is not listed.
+            let listed: Vec<_> = assets
+                .iter()
+                .map(|a| (a.asset, a.rate, a.intrinsic_gas, a.enabled))
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    (USDC, RATE, sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS, true),
+                    (AssetId(3), 925_000, 15_000, false),
+                ]
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn rpc_reports_an_accounts_sent_and_received_transactions() {
+    let alice = signer(1);
+    let bob = signer(2);
+    let carol = address_of(&signer(3));
+    let mut seq = node(genesis(&[
+        (address_of(&alice), 1_000_000),
+        (address_of(&bob), 1_000_000),
+    ]));
+    let to = |who: L2Address, amount| Payload::Transfer {
+        to: who,
+        asset: USDC,
+        amount,
+    };
+    seq.submit(signed(&alice, 0, to(address_of(&bob), 5)))
+        .unwrap();
+    seq.submit(signed(&bob, 0, to(carol, 7))).unwrap();
+    seq.produce(100).unwrap().expect("a block");
+    let queued = signed(&alice, 1, to(carol, 9));
+    seq.submit(queued.clone()).unwrap();
+
+    let history = |seq: &mut Sequencer, who: L2Address| match handle(
+        seq,
+        "sena-test-1",
+        Request::GetAccountTransactions {
+            address: who,
+            limit: None,
+        },
+    ) {
+        Response::AccountTransactions { transactions } => transactions,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    // Bob received from Alice and sent to Carol, both in block 1.
+    let bobs = history(&mut seq, address_of(&bob));
+    assert_eq!(bobs.len(), 2);
+    assert!(bobs
+        .iter()
+        .all(|t| t.confirmation == Confirmation::SoftConfirmed { height: 1 }));
+    // His own transfer paid a fee; the one he received was paid by Alice.
+    assert!(bobs.iter().all(|t| t.fee_paid == Some(1_025)));
+
+    // Alice's queued transfer comes first, still pending.
+    let alices = history(&mut seq, address_of(&alice));
+    assert_eq!(alices.len(), 2);
+    assert_eq!(alices[0].hash, queued.hash());
+    assert_eq!(alices[0].confirmation, Confirmation::Pending);
+    assert_eq!(alices[0].fee_paid, None);
+
+    // Amounts and fees travel as strings.
+    let json = serde_json::to_value(&alices[1]).unwrap();
+    assert_eq!(json["fee_paid"], "1025");
 }

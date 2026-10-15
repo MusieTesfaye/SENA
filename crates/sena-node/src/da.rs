@@ -1,80 +1,105 @@
-//! Data Availability (DA) pipeline and canonical batch calldata anchoring (REQ-FRAUD-007..010).
+//! Published batch data and its local store (REQ-FRAUD-007..010).
 //!
-//! Provides canonical serialization, cryptographic commitment, storage,
-//! and independent verification of rollup batches.
+//! A [`DaBlob`] is what a verifier needs to re-execute a batch. Today blobs are
+//! served by the node that produced them and kept on its disk; publishing them
+//! somewhere the sequencer cannot withhold them from is tracked in `STATUS.md`.
 
+use sena_primitives::Hash256;
+use sena_state::MerkleTrie;
+use sena_stf::{execute_batch, BatchContext, KeylessConfig, Transaction};
+
+use sena_stf::batch::{header_commitment, BatchTree};
+
+use crate::sequencer::Block;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sena_primitives::Hash256;
-use sena_stf::{execute_batch, Transaction};
-use sena_state::MerkleTrie;
-use serde::{Deserialize, Serialize};
 
-/// A canonical data availability batch blob.
+/// The published data of one batch: everything a verifier needs to re-execute
+/// it and check the assertion that covers it.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DaBlob {
-    /// Rollup block height.
+    /// Block height.
     pub height: u64,
-    /// Root before batch execution.
-    pub pre_state_root: Hash256,
-    /// Asserted root after batch execution.
-    pub post_state_root: Hash256,
-    /// Cryptographic commitment (SHA-256 of canonical JSON serialized transactions).
-    pub batch_commitment: Hash256,
-    /// Number of transactions in batch.
-    pub tx_count: usize,
-    /// The transactions in exact ordered sequence.
-    pub transactions: Vec<Transaction>,
-    /// Creation timestamp (Unix seconds).
+    /// The batch timestamp, part of the batch data (keyless expiry is judged
+    /// against it).
     pub timestamp: u64,
+    /// The base fee per gas the batch paid.
+    #[serde(with = "sena_primitives::serde_hex::u128_string")]
+    pub base_fee: u128,
+    /// Where the batch's tips went.
+    pub fee_recipient: sena_primitives::L2Address,
+    /// Root before the batch.
+    pub pre_state_root: Hash256,
+    /// Asserted root after the batch.
+    pub post_state_root: Hash256,
+    /// The commitment the L1 assertion carries; see [`Block::batch_commitment`].
+    pub batch_commitment: Hash256,
+    /// The transactions, in execution order.
+    pub transactions: Vec<Transaction>,
+    /// Where each transaction's instructions begin in the trace — the
+    /// `start_pc` of each leaf of the batch commitment.
+    pub tx_starts: Vec<u64>,
 }
 
 impl DaBlob {
-    /// Creates and commits a new DA blob from executed block components.
+    /// The blob for a sealed block.
     #[must_use]
-    pub fn new(
-        height: u64,
-        pre_state_root: Hash256,
-        post_state_root: Hash256,
-        transactions: Vec<Transaction>,
-    ) -> Self {
-        let batch_bytes = serde_json::to_vec(&transactions).unwrap_or_default();
-        let batch_commitment = Hash256::digest(&batch_bytes);
-        let tx_count = transactions.len();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+    pub fn from_block(block: &Block) -> Self {
         Self {
-            height,
-            pre_state_root,
-            post_state_root,
-            batch_commitment,
-            tx_count,
-            transactions,
-            timestamp,
+            height: block.height,
+            timestamp: block.timestamp,
+            base_fee: block.base_fee,
+            fee_recipient: block.fee_recipient,
+            pre_state_root: block.pre_state_root,
+            post_state_root: block.post_state_root,
+            batch_commitment: block.batch_commitment(),
+            transactions: block.transactions.clone(),
+            tx_starts: block.trace.tx_starts.clone(),
         }
     }
 
-    /// Verifies the internal integrity of the blob (commitment matches transactions).
+    /// The commitment these transactions and timestamp actually produce.
     #[must_use]
-    pub fn verify_integrity(&self) -> bool {
-        let batch_bytes = match serde_json::to_vec(&self.transactions) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        Hash256::digest(&batch_bytes) == self.batch_commitment
+    pub fn computed_commitment(&self) -> Hash256 {
+        let leaves: Vec<(u64, Vec<u8>)> = self
+            .tx_starts
+            .iter()
+            .zip(&self.transactions)
+            .map(|(start, tx)| (*start, tx.encode()))
+            .collect();
+        let tree = BatchTree::build(&leaves);
+        header_commitment(
+            self.timestamp,
+            self.base_fee,
+            &self.fee_recipient,
+            tree.tx_count(),
+            &tree.root(),
+        )
     }
 
-    /// Independently re-executes the blob against a starting state and verifies the resulting post-state root.
+    /// Whether the stated commitment matches the contents.
+    #[must_use]
+    pub fn verify_integrity(&self) -> bool {
+        self.tx_starts.len() == self.transactions.len()
+            && self.computed_commitment() == self.batch_commitment
+    }
+
+    /// Re-executes the blob from `starting_state` and checks it reaches the
+    /// asserted root.
     ///
     /// # Errors
-    /// Returns an error string if integrity check fails, starting root doesn't match,
-    /// or execution does not reproduce `post_state_root`.
-    pub fn verify_execution(&self, starting_state: &mut MerkleTrie) -> Result<Hash256, String> {
+    ///
+    /// Returns an error if the commitment does not match, the starting root is
+    /// not the blob's pre-state, the batch does not execute, or it executes to
+    /// a different root.
+    pub fn verify_execution(
+        &self,
+        starting_state: &mut MerkleTrie,
+        keyless: Option<&KeylessConfig>,
+    ) -> Result<Hash256, String> {
         if !self.verify_integrity() {
-            return Err("DA blob commitment does not match contained transactions".to_string());
+            return Err("DA blob commitment does not match its contents".to_string());
         }
         if starting_state.root() != self.pre_state_root {
             return Err(format!(
@@ -84,8 +109,17 @@ impl DaBlob {
             ));
         }
 
-        execute_batch(starting_state, &self.transactions)
-            .map_err(|e| format!("STF batch execution failed: {e:?}"))?;
+        let ctx = BatchContext {
+            timestamp: self.timestamp,
+            keyless,
+            base_fee: self.base_fee,
+            fee_recipient: self.fee_recipient,
+        };
+        let trace = execute_batch(starting_state, &ctx, &self.transactions)
+            .map_err(|e| format!("batch execution failed: {e}"))?;
+        if trace.tx_starts != self.tx_starts {
+            return Err("the committed transaction start positions are wrong".to_string());
+        }
 
         let final_root = starting_state.root();
         if final_root != self.post_state_root {
@@ -158,13 +192,12 @@ impl DaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::{Allocation, GasAsset, GenesisConfig};
     use ed25519_dalek::{Signer as DalekSigner, SigningKey};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use sena_primitives::{AssetId, L2Address};
-    use sena_stf::gas::fee_for;
     use sena_stf::{Authenticator, Payload, RATE_SCALE};
-    use crate::genesis::{Allocation, GasAsset, GenesisConfig};
 
     const USDC: AssetId = AssetId(1);
 
@@ -177,13 +210,15 @@ mod tests {
     }
 
     fn signed_tx(key: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
-        let rate = RATE_SCALE;
         let mut tx = Transaction {
             sender: address_of(key),
             nonce,
             fee_asset: USDC,
-            max_fee: fee_for(rate).unwrap(),
-            fee_rate: rate,
+            fee_rate: 0,
+            fee_intrinsic_gas: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
             payload: Payload::Transfer {
                 to,
                 asset: USDC,
@@ -194,6 +229,7 @@ mod tests {
                 signature: [0; 64],
             },
         };
+        sena_stf::gas::fill_default_fees(&mut tx);
         let signature = key.sign(tx.signing_digest().as_bytes()).to_bytes();
         tx.authenticator = Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
@@ -218,6 +254,7 @@ mod tests {
                 asset: 1,
                 symbol: "USDC".to_string(),
                 rate: RATE_SCALE,
+                intrinsic_gas: sena_stf::gas::DEFAULT_ASSET_INTRINSIC_GAS,
                 enabled: true,
             }],
             allocations: vec![Allocation {
@@ -226,6 +263,9 @@ mod tests {
                 amount: 1_000_000_000,
             }],
             council: None,
+            keyless: None,
+            fee_market: None,
+            fee_split: None,
         };
 
         let starting_state = genesis.build_state().unwrap();
@@ -233,22 +273,48 @@ mod tests {
 
         let tx = signed_tx(&alice_key, 0, bob, 500);
 
+        let ctx = BatchContext::without_keyless(1_700_000_000);
         let mut exec_state = starting_state.clone();
-        execute_batch(&mut exec_state, &[tx.clone()]).unwrap();
+        let transactions = vec![tx];
+        let trace = execute_batch(&mut exec_state, &ctx, &transactions).unwrap();
         let post_root = exec_state.root();
 
-        let blob = DaBlob::new(1, pre_root, post_root, vec![tx]);
-        assert!(blob.verify_integrity());
+        let tree = trace.batch_tree(&transactions);
+        let da_blob = DaBlob {
+            height: 1,
+            timestamp: ctx.timestamp,
+            base_fee: ctx.base_fee,
+            fee_recipient: ctx.fee_recipient,
+            pre_state_root: pre_root,
+            post_state_root: post_root,
+            batch_commitment: header_commitment(
+                ctx.timestamp,
+                ctx.base_fee,
+                &ctx.fee_recipient,
+                tree.tx_count(),
+                &tree.root(),
+            ),
+            transactions,
+            tx_starts: trace.tx_starts.clone(),
+        };
+        assert!(da_blob.verify_integrity());
 
         // Independent replay from starting state
         let mut verifier_state = starting_state.clone();
-        let executed_root = blob.verify_execution(&mut verifier_state).unwrap();
+        let executed_root = da_blob.verify_execution(&mut verifier_state, None).unwrap();
         assert_eq!(executed_root, post_root);
 
+        // The timestamp is committed to: changing it breaks integrity.
+        let mut retimed = da_blob.clone();
+        retimed.timestamp += 1;
+        assert!(!retimed.verify_integrity());
+
         // Tampering test: modify commitment
-        let mut tampered = blob.clone();
+        let mut tampered = da_blob.clone();
         tampered.batch_commitment = Hash256::ZERO;
         assert!(!tampered.verify_integrity());
-        assert!(tampered.verify_execution(&mut verifier_state).is_err());
+        assert!(tampered
+            .verify_execution(&mut verifier_state, None)
+            .is_err());
     }
 }

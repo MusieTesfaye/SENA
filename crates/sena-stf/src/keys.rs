@@ -19,6 +19,9 @@ mod region {
     pub const ASSET: &[u8] = b"SENA:v1:state:asset";
     pub const PARAMETER: &[u8] = b"SENA:v1:state:parameter";
     pub const COUNCIL: &[u8] = b"SENA:v1:state:council";
+    pub const JWK: &[u8] = b"SENA:v1:state:jwk";
+    pub const FEE_MARKET: &[u8] = b"SENA:v1:state:fee-market";
+    pub const FEE_SPLIT: &[u8] = b"SENA:v1:state:fee-split";
 }
 
 /// Key of an account's state.
@@ -63,6 +66,31 @@ pub fn parameter(name: &str) -> Hash256 {
 #[must_use]
 pub fn council() -> Hash256 {
     Hash256::commit(CanonicalEncoder::new(region::COUNCIL))
+}
+
+/// Key of the fee market record (the base fee and its window).
+#[must_use]
+pub fn fee_market() -> Hash256 {
+    Hash256::commit(CanonicalEncoder::new(region::FEE_MARKET))
+}
+
+/// Key of the fee split record.
+#[must_use]
+pub fn fee_split() -> Hash256 {
+    Hash256::commit(CanonicalEncoder::new(region::FEE_SPLIT))
+}
+
+/// Key of a JWK's acceptance record, for one issuer (REQ-AUTH-003).
+///
+/// Keyed by both hashes so that a JWK accepted for one issuer can never
+/// authorise an account of another.
+#[must_use]
+pub fn jwk(iss_hash: &[u8; 32], jwk_hash: &[u8; 32]) -> Hash256 {
+    Hash256::commit(
+        CanonicalEncoder::new(region::JWK)
+            .field(iss_hash)
+            .field(jwk_hash),
+    )
 }
 
 #[cfg(test)]

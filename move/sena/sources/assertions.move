@@ -20,6 +20,7 @@ module sena::assertions {
     use std::vector;
     use aptos_std::table::{Self, Table};
     use aptos_framework::dispatchable_fungible_asset;
+    use aptos_framework::event;
     use aptos_framework::fungible_asset::{Self, FungibleStore, Metadata};
     use aptos_framework::object::{Self, Object, ExtendRef};
     use aptos_framework::primary_fungible_store;
@@ -54,6 +55,15 @@ module sena::assertions {
     const E_ALREADY_CHALLENGING: u64 = 62;
     /// The proposer may not challenge their own assertion.
     const E_SELF_CHALLENGE: u64 = 63;
+    /// The batch timestamp runs backwards from the parent's.
+    const E_TIMESTAMP_REGRESSES: u64 = 64;
+    /// The batch timestamp is ahead of L1 time.
+    const E_TIMESTAMP_IN_FUTURE: u64 = 65;
+    /// The batch is older than the chain allows a batch to be when posted.
+    const E_BATCH_TOO_OLD: u64 = 66;
+    /// The batch data is malformed: mismatched lengths, start positions that
+    /// do not begin at zero and increase, or a trace inconsistent with them.
+    const E_BAD_BATCH_DATA: u64 = 67;
 
     /// Share of a slashed bond paid to the winner, as a percentage.
     ///
@@ -76,6 +86,30 @@ module sena::assertions {
     /// past here.
     const CHALLENGE_WINDOW_FLOOR: u64 = 86400;
 
+    /// How far a batch timestamp may run ahead of L1 time, for clock skew.
+    const MAX_FUTURE_DRIFT_SECS: u64 = 60;
+
+    /// Bounds on how old a batch may be when its assertion is posted.
+    ///
+    /// The batch timestamp is what keyless ephemeral-key expiry is judged
+    /// against. A sequencer free to post arbitrarily old timestamps could keep
+    /// accepting an ephemeral key long after it expired; bounding the age
+    /// bounds that window.
+    const MIN_MAX_BATCH_AGE_SECS: u64 = 600;
+    const MAX_MAX_BATCH_AGE_SECS: u64 = 86400;
+
+    #[event]
+    /// The batch data behind an assertion. This *is* the data availability
+    /// layer: verifiers rebuild L2 state from these events alone.
+    struct BatchPublished has drop, store {
+        assertion: vector<u8>,
+        timestamp: u64,
+        base_fee: u128,
+        fee_recipient: vector<u8>,
+        tx_bytes: vector<vector<u8>>,
+        tx_starts: vector<u64>,
+    }
+
     /// A bonded challenge against an assertion.
     struct Challenge has store, copy, drop {
         challenger: address,
@@ -88,6 +122,14 @@ module sena::assertions {
         pre_state_root: vector<u8>,
         post_state_root: vector<u8>,
         batch_commitment: vector<u8>,
+        /// The batch header the commitment is computed from.
+        timestamp: u64,
+        /// The base fee per gas the batch declared, checked in its trace.
+        base_fee: u128,
+        /// Where the batch's tips go: an L2 address.
+        fee_recipient: vector<u8>,
+        tx_count: u64,
+        tx_root: vector<u8>,
         trace_length: u64,
         bond: u128,
         posted_at: u64,
@@ -113,6 +155,8 @@ module sena::assertions {
         escrow_extend: ExtendRef,
         /// Receives the share of a slashed bond not paid to the winner.
         treasury: address,
+        /// The oldest a batch may be when its assertion is posted.
+        max_batch_age: u64,
     }
 
     /// Computes an assertion's identifier.
@@ -153,11 +197,19 @@ module sena::assertions {
         minimum_bond: u128,
         bond_metadata: Object<Metadata>,
         treasury: address,
+        max_batch_age: u64,
     ) {
         let window = if (challenge_window < CHALLENGE_WINDOW_FLOOR) {
             CHALLENGE_WINDOW_FLOOR
         } else {
             challenge_window
+        };
+        let max_batch_age = if (max_batch_age < MIN_MAX_BATCH_AGE_SECS) {
+            MIN_MAX_BATCH_AGE_SECS
+        } else if (max_batch_age > MAX_MAX_BATCH_AGE_SECS) {
+            MAX_MAX_BATCH_AGE_SECS
+        } else {
+            max_batch_age
         };
 
         let zero = vector::empty<u8>();
@@ -170,6 +222,11 @@ module sena::assertions {
             pre_state_root: zero,
             post_state_root: genesis_root,
             batch_commitment: zero,
+            timestamp: 0,
+            base_fee: 0,
+            fee_recipient: zero,
+            tx_count: 0,
+            tx_root: zero,
             trace_length: 0,
             bond: 0,
             posted_at: 0,
@@ -199,6 +256,7 @@ module sena::assertions {
             escrow,
             escrow_extend,
             treasury,
+            max_batch_age,
         });
     }
 
@@ -246,10 +304,17 @@ module sena::assertions {
         parent: vector<u8>,
         pre_state_root: vector<u8>,
         post_state_root: vector<u8>,
-        batch_commitment: vector<u8>,
+        timestamp: u64,
+        base_fee: u128,
+        fee_recipient: vector<u8>,
+        tx_bytes: vector<vector<u8>>,
+        tx_starts: vector<u64>,
         trace_length: u64,
         bond: u128,
     ) acquires Chain {
+        let tx_count = vector::length(&tx_bytes);
+        assert!(vector::length(&fee_recipient) == 32, E_BAD_BATCH_DATA);
+        check_batch_shape(&tx_starts, tx_count, trace_length, &pre_state_root, &post_state_root);
         let proposer_addr = signer::address_of(proposer);
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, parent), E_UNKNOWN_PARENT);
@@ -258,6 +323,22 @@ module sena::assertions {
         assert!(parent_record.status != STATUS_REJECTED, E_PARENT_REJECTED);
         assert!(parent_record.post_state_root == pre_state_root, E_BROKEN_CHAIN);
         assert!(bond >= chain.minimum_bond, E_BOND_TOO_SMALL);
+
+        // The batch timestamp is batch data: keyless expiry is judged against
+        // it. It may not run backwards, run ahead of L1, or be stale.
+        let now = timestamp::now_seconds();
+        assert!(timestamp >= parent_record.timestamp, E_TIMESTAMP_REGRESSES);
+        assert!(timestamp <= now + MAX_FUTURE_DRIFT_SECS, E_TIMESTAMP_IN_FUTURE);
+        assert!(now <= timestamp + chain.max_batch_age, E_BATCH_TOO_OLD);
+
+        // The batch data is published here, on L1, and the root is computed
+        // from it. A sequencer that could post a bare root could commit to
+        // leaves no one can open, and steps covered by them could never be
+        // adjudicated. Publishing the data makes every leaf provable.
+        let tx_root = sena::batch::root_of(&tx_bytes, &tx_starts);
+        let batch_commitment = sena::batch::header_commitment(
+            timestamp, base_fee, fee_recipient, tx_count, tx_root
+        );
 
         let id = assertion_id(
             parent, 0, pre_state_root, post_state_root, batch_commitment, trace_length, bond
@@ -274,14 +355,48 @@ module sena::assertions {
             pre_state_root,
             post_state_root,
             batch_commitment,
+            timestamp,
+            base_fee,
+            fee_recipient,
+            tx_count,
+            tx_root,
             trace_length,
             bond,
-            posted_at: timestamp::now_seconds(),
+            posted_at: now,
             status: STATUS_PENDING,
             open_challenges: 0,
         });
         vector::push_back(&mut chain.order, id);
+
+        event::emit(BatchPublished { assertion: id, timestamp, base_fee, fee_recipient, tx_bytes, tx_starts });
     }
+
+    /// Checks the shape of published batch data that L1 can check without
+    /// compiling anything. What needs compilation -- that consecutive start
+    /// positions match each transaction's instruction count -- is left to the
+    /// batch-structure fraud proofs in `sena::disputes`.
+    fun check_batch_shape(
+        tx_starts: &vector<u64>,
+        tx_count: u64,
+        trace_length: u64,
+        pre_state_root: &vector<u8>,
+        post_state_root: &vector<u8>,
+    ) {
+        assert!(vector::length(tx_starts) == tx_count, E_BAD_BATCH_DATA);
+        if (tx_count == 0) {
+            // An empty batch changes nothing.
+            assert!(trace_length == 0 && *pre_state_root == *post_state_root, E_BAD_BATCH_DATA);
+            return
+        };
+        assert!(*vector::borrow(tx_starts, 0) == 0, E_BAD_BATCH_DATA);
+        let i = 1;
+        while (i < tx_count) {
+            assert!(*vector::borrow(tx_starts, i) > *vector::borrow(tx_starts, i - 1), E_BAD_BATCH_DATA);
+            i = i + 1;
+        };
+        assert!(trace_length > *vector::borrow(tx_starts, tx_count - 1), E_BAD_BATCH_DATA);
+    }
+
 
     /// Records that a challenge has opened.
     ///
@@ -403,22 +518,46 @@ module sena::assertions {
         // posting fraud and challenging it yourself is not profitable.
         pay_from_escrow(chain, winner, challenger_bond);
         distribute_slashed(chain, winner, proposer_bond);
+        // Anyone else who challenged it was right too: their bonds come back
+        // rather than sitting in escrow behind an assertion that no longer
+        // accepts outcomes.
+        refund_challenges(chain, id);
 
         // Rejecting only the disputed assertion would leave its children
-        // claiming to continue from a state that was never reached.
+        // claiming to continue from a state that was never reached. Their
+        // proposers built on an unfinalized claim and forfeit to the treasury;
+        // their challengers are refunded.
         let i = 0;
         let len = vector::length(&chain.order);
         while (i < len) {
             let candidate = *vector::borrow(&chain.order, i);
-            let parent = table::borrow(&chain.assertions, candidate).parent;
-            if (table::contains(&chain.assertions, parent)) {
-                let parent_status = table::borrow(&chain.assertions, parent).status;
-                if (parent_status == STATUS_REJECTED) {
-                    let record = table::borrow_mut(&mut chain.assertions, candidate);
-                    record.status = STATUS_REJECTED;
-                    record.open_challenges = 0;
-                };
+            let (parent, status, bond) = {
+                let r = table::borrow(&chain.assertions, candidate);
+                (r.parent, r.status, r.bond)
             };
+            if (status != STATUS_REJECTED && status != STATUS_FINALIZED
+                && table::contains(&chain.assertions, parent)
+                && table::borrow(&chain.assertions, parent).status == STATUS_REJECTED) {
+                let record = table::borrow_mut(&mut chain.assertions, candidate);
+                record.status = STATUS_REJECTED;
+                record.open_challenges = 0;
+                let treasury = chain.treasury;
+                pay_from_escrow(chain, treasury, bond);
+                refund_challenges(chain, candidate);
+            };
+            i = i + 1;
+        };
+    }
+
+    /// Returns every open challenge's bond on `id` to its challenger.
+    fun refund_challenges(chain: &mut Chain, id: vector<u8>) {
+        if (!table::contains(&chain.challenges, id)) { return };
+        let list = *table::borrow(&chain.challenges, id);
+        *table::borrow_mut(&mut chain.challenges, id) = vector::empty<Challenge>();
+        let i = 0;
+        while (i < vector::length(&list)) {
+            let c = *vector::borrow(&list, i);
+            pay_from_escrow(chain, c.challenger, c.bond);
             i = i + 1;
         };
     }
@@ -457,6 +596,90 @@ module sena::assertions {
         pay_from_escrow(chain, proposer, bond);
     }
 
+    /// What the dispute module needs to know about an assertion, all of it
+    /// read from the record rather than taken from a caller.
+    public fun dispute_view(chain_addr: address, id: vector<u8>): (
+        address, vector<u8>, vector<u8>, u64, u64, vector<u8>, u64, u8
+    ) acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        let r = table::borrow(&chain.assertions, id);
+        (
+            r.proposer, r.pre_state_root, r.post_state_root, r.timestamp, r.tx_count,
+            r.tx_root, r.trace_length, r.status,
+        )
+    }
+
+    /// The fee half of an assertion's batch header: `(base_fee,
+    /// fee_recipient)`, which a disputed transaction compiles against.
+    public fun fee_header(chain_addr: address, id: vector<u8>): (u128, vector<u8>) acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        let r = table::borrow(&chain.assertions, id);
+        (r.base_fee, r.fee_recipient)
+    }
+
+    /// Whether `who` has an open, bonded challenge against `id`.
+    public fun has_open_challenge(chain_addr: address, id: vector<u8>, who: address): bool acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        if (!table::contains(&chain.challenges, id)) { return false };
+        let list = table::borrow(&chain.challenges, id);
+        let i = 0;
+        while (i < vector::length(list)) {
+            if (vector::borrow(list, i).challenger == who) { return true };
+            i = i + 1;
+        };
+        false
+    }
+
+    #[view]
+    /// How many assertions the chain holds, genesis included.
+    public fun assertion_count(chain_addr: address): u64 acquires Chain {
+        vector::length(&borrow_global<Chain>(chain_addr).order)
+    }
+
+    #[view]
+    /// The id of the `index`-th assertion, in posting order.
+    public fun assertion_at(chain_addr: address, index: u64): vector<u8> acquires Chain {
+        *vector::borrow(&borrow_global<Chain>(chain_addr).order, index)
+    }
+
+    #[view]
+    /// An assertion's record: (parent, proposer, pre-state root, post-state
+    /// root, batch timestamp, tx count, tx root, trace length, bond, posted at,
+    /// status).
+    public fun record(chain_addr: address, id: vector<u8>): (
+        vector<u8>, address, vector<u8>, vector<u8>, u64, u64, vector<u8>, u64, u128, u64, u8
+    ) acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
+        let r = table::borrow(&chain.assertions, id);
+        (
+            r.parent, r.proposer, r.pre_state_root, r.post_state_root, r.timestamp, r.tx_count,
+            r.tx_root, r.trace_length, r.bond, r.posted_at, r.status,
+        )
+    }
+
+    #[view]
+    /// Everyone with an open challenge against an assertion.
+    public fun challengers(chain_addr: address, id: vector<u8>): vector<address> acquires Chain {
+        let chain = borrow_global<Chain>(chain_addr);
+        let out = vector::empty<address>();
+        if (!table::contains(&chain.challenges, id)) { return out };
+        let list = table::borrow(&chain.challenges, id);
+        let i = 0;
+        while (i < vector::length(list)) {
+            vector::push_back(&mut out, vector::borrow(list, i).challenger);
+            i = i + 1;
+        };
+        out
+    }
+
+    #[view]
+    public fun minimum_bond(chain_addr: address): u128 acquires Chain {
+        borrow_global<Chain>(chain_addr).minimum_bond
+    }
+
     #[view]
     public fun status(chain_addr: address, id: vector<u8>): u8 acquires Chain {
         let chain = borrow_global<Chain>(chain_addr);
@@ -486,6 +709,7 @@ module sena::assertions {
     public fun status_finalized(): u8 { STATUS_FINALIZED }
     public fun status_rejected(): u8 { STATUS_REJECTED }
     public fun challenge_window_floor(): u64 { CHALLENGE_WINDOW_FLOOR }
+    public fun max_future_drift_secs(): u64 { MAX_FUTURE_DRIFT_SECS }
     public fun slash_reward_percent(): u128 { SLASH_REWARD_PERCENT }
 
     #[view]

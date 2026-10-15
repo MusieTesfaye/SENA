@@ -1,5 +1,12 @@
 # Evidence — Aptos devnet deployment and assertion lifecycle
 
+> **Superseded.** This records an earlier contract version: before bonds moved
+> assets, before batch data was published on L1, and before keyless
+> adjudication. Its `initialize`, `post` and `open_challenge` signatures no
+> longer match, devnet has since reset, and the reproduction commands below
+> will not run against the current package. Current on-chain evidence comes
+> from `scripts/localnet-dispute.sh` and `scripts/localnet-agents.sh`, run by CI.
+
 **Date:** 2026-09-23
 **Network:** Aptos devnet
 **Account:** `0xe0d32e3206d4cf64b4ed64bc8dae05107dfb4a356acb8306e9ccf6d06a4803f3`

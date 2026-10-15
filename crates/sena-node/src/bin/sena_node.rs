@@ -64,6 +64,14 @@ enum Command {
         /// Requests allowed per client per minute.
         #[arg(long, default_value_t = 600)]
         rate_limit: u32,
+        /// This sequencer's L2 account, where tips are paid. Without it tips
+        /// go to the fee vault with the base fee.
+        #[arg(long)]
+        fee_recipient: Option<String>,
+        /// Let a web page at this origin call the node (CORS), e.g.
+        /// `http://localhost:5173`; repeatable. Without it, browsers cannot.
+        #[arg(long)]
+        cors_origin: Vec<String>,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -93,9 +101,15 @@ enum Command {
         /// Sender's next nonce.
         #[arg(long)]
         nonce: u64,
-        /// Asset to move, and to pay fees in.
+        /// Asset to move.
         #[arg(long, default_value_t = 1)]
         asset: u32,
+        /// Whitelisted asset to pay the fee in; the moved asset if absent.
+        #[arg(long)]
+        fee_asset: Option<u32>,
+        /// Tip per gas for the sequencer, in `PRICE_SCALE`ths of a unit.
+        #[arg(long, default_value_t = 0)]
+        tip: u128,
     },
     /// Query a node.
     Query {
@@ -106,36 +120,82 @@ enum Command {
         #[command(subcommand)]
         what: Query,
     },
-    /// Run the automated Aptos L1 Relayer daemon.
+    /// Post this sequencer's blocks to Aptos L1 as bonded assertions,
+    /// defend them in disputes, and finalize them.
     Relay {
-        /// L2 RPC endpoint.
+        /// L2 RPC endpoint of the sequencer.
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
-        /// Aptos network (testnet, devnet, local).
-        #[arg(long, default_value = "testnet")]
-        network: String,
-        /// Aptos REST endpoint.
-        #[arg(long, default_value = "https://api.testnet.aptoslabs.com/v1")]
-        aptos_rpc: String,
-        /// Deployed rollup contract address on Aptos.
-        #[arg(long, default_value = "0x1")]
-        contract: String,
-        /// Aptos CLI profile to use.
-        #[arg(long, default_value = "default")]
-        profile: String,
-        /// Proposer address on Aptos L1.
-        #[arg(long, default_value = "0x1")]
-        proposer: String,
-        /// Bond per assertion in micro-units.
+        /// Bearer token for the L2 RPC.
+        #[arg(long)]
+        rpc_token: Option<String>,
+        #[command(flatten)]
+        aptos: AptosArgs,
+        /// Bond per assertion, in the bond asset's smallest unit.
         #[arg(long, default_value_t = 1_000_000)]
         bond: u128,
-        /// Seconds between polling checks.
-        #[arg(long, default_value_t = 2)]
-        poll_interval: u64,
-        /// Dry run mode.
-        #[arg(long)]
-        dry_run: bool,
+        /// Where progress is persisted.
+        #[arg(long, default_value = "./sena-data/relayer.json")]
+        state: String,
     },
+    /// Watch Aptos L1, re-execute every assertion from the batch data
+    /// published there, and challenge any that is wrong.
+    Watch {
+        /// Data directory holding the genesis to verify against.
+        #[arg(long, default_value = "./sena-data")]
+        data_dir: String,
+        #[command(flatten)]
+        aptos: AptosArgs,
+        /// Bond per challenge, in the bond asset's smallest unit.
+        #[arg(long, default_value_t = 1_000_000)]
+        bond: u128,
+        /// Where progress is persisted.
+        #[arg(long, default_value = "./sena-data/watcher.json")]
+        state: String,
+        /// Poseidon steps per keyless-verdict transaction. The most expensive
+        /// steps must fit one Aptos transaction's execution budget.
+        #[arg(long, default_value_t = 12)]
+        keyless_steps_per_tx: u64,
+    },
+}
+
+/// How to reach and sign for Aptos L1.
+#[derive(clap::Args)]
+struct AptosArgs {
+    /// Aptos fullnode REST endpoint.
+    #[arg(long, default_value = "https://api.testnet.aptoslabs.com/v1")]
+    aptos_url: String,
+    /// Address the SENA package is published at.
+    #[arg(long)]
+    contract: String,
+    /// Aptos CLI profile that signs (from `.aptos/config.yaml`).
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// The profile's account address.
+    #[arg(long)]
+    account: String,
+    /// Path to the `aptos` binary.
+    #[arg(long, default_value = "aptos")]
+    aptos_bin: String,
+    /// Most gas units one transaction may use.
+    #[arg(long, default_value_t = 2_000_000)]
+    max_gas: u64,
+    /// Seconds between rounds.
+    #[arg(long, default_value_t = 10)]
+    poll_interval: u64,
+}
+
+impl AptosArgs {
+    fn client(&self) -> sena_node::l1::AptosCli {
+        sena_node::l1::AptosCli {
+            binary: self.aptos_bin.clone(),
+            profile: self.profile.clone(),
+            rest_url: self.aptos_url.clone(),
+            contract: self.contract.clone(),
+            account: self.account.clone(),
+            max_gas: self.max_gas,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -182,13 +242,20 @@ fn main() {
             run_for,
             auth_token,
             rate_limit,
+            fee_recipient,
+            cors_origin,
         } => serve(
             &data_dir,
-            &listen,
-            block_interval,
             run_for,
-            auth_token,
-            rate_limit,
+            fee_recipient.as_deref(),
+            ServerConfig {
+                listen,
+                block_interval_secs: block_interval,
+                auth_token,
+                rate_limit_per_minute: rate_limit,
+                cors_origins: cors_origin,
+                ..ServerConfig::default()
+            },
         ),
         Command::Verify { data_dir, rpc } => verify(&data_dir, &rpc),
         Command::Keygen => {
@@ -202,35 +269,35 @@ fn main() {
             amount,
             nonce,
             asset,
-        } => send(&rpc, &secret, &to, amount, nonce, asset),
+            fee_asset,
+            tip,
+        } => send(
+            &rpc,
+            &secret,
+            &Transfer {
+                to,
+                amount,
+                nonce,
+                asset,
+                fee_asset: fee_asset.unwrap_or(asset),
+                tip,
+            },
+        ),
         Command::Query { rpc, what } => query(&rpc, &what),
         Command::Relay {
             rpc,
-            network,
-            aptos_rpc,
-            contract,
-            profile,
-            proposer,
+            rpc_token,
+            aptos,
             bond,
-            poll_interval,
-            dry_run,
-        } => {
-            let config = sena_node::RelayerConfig {
-                sena_rpc_url: rpc,
-                aptos_network: network,
-                aptos_rest_url: aptos_rpc,
-                contract_address: contract,
-                profile,
-                proposer_address: proposer,
-                bond_amount: bond,
-                poll_interval_secs: poll_interval,
-                auto_finalize: true,
-                dry_run,
-            };
-            let mut relayer = sena_node::AptosRelayer::new(config);
-            let running = Arc::new(AtomicBool::new(true));
-            relayer.run_daemon(running)
-        }
+            state,
+        } => relay(rpc, rpc_token, &aptos, bond, state),
+        Command::Watch {
+            data_dir,
+            aptos,
+            bond,
+            state,
+            keyless_steps_per_tx,
+        } => watch(&data_dir, &aptos, bond, state, keyless_steps_per_tx),
     };
 
     if let Err(message) = result {
@@ -282,11 +349,9 @@ fn genesis(data_dir: &str, dev: bool, fund: &[String]) -> Result<(), String> {
 
 fn serve(
     data_dir: &str,
-    listen: &str,
-    block_interval: u64,
     run_for: u64,
-    auth_token: Option<String>,
-    rate_limit: u32,
+    fee_recipient: Option<&str>,
+    server_config: ServerConfig,
 ) -> Result<(), String> {
     let store = Store::open(data_dir).map_err(|e| e.to_string())?;
     let config = store
@@ -294,12 +359,25 @@ fn serve(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no genesis.json in {data_dir}; run `sena-node genesis` first"))?;
 
+    let keyless = config.keyless_config().map_err(|e| e.to_string())?;
+    match &keyless {
+        Some(k) => println!("keyless accounts enabled ({})", k.name),
+        None => println!("keyless accounts disabled (no `keyless` section in genesis)"),
+    }
     let loaded = store.load(&config).map_err(|e| e.to_string())?;
-    let mut sequencer = match loaded {
+    let sequencer = match loaded {
         Some((state, chain, batches)) => {
-            println!("resuming from {} blocks of saved state", batches.len());
-            let chain = sena_fraudproof::AssertionChain::restore(chain);
-            Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
+            println!("resuming: replaying {} saved blocks", batches.len());
+            let genesis = config.build_state().map_err(|e| e.to_string())?;
+            Sequencer::resume(
+                genesis,
+                sena_fraudproof::AssertionChain::restore(chain),
+                PartyId(1),
+                config.minimum_bond,
+                keyless.clone(),
+                &batches,
+                state.root(),
+            )?
         }
         None => {
             let state = config.build_state().map_err(|e| e.to_string())?;
@@ -312,11 +390,27 @@ fn serve(
             Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
         }
     };
+    let mut sequencer = sequencer.with_keyless(keyless).with_fee_assets(
+        config
+            .gas_assets
+            .iter()
+            .map(|a| sena_primitives::AssetId(a.asset))
+            .collect(),
+    );
+    if let Some(account) = fee_recipient {
+        let account =
+            L2Address::from_hex(account.trim()).map_err(|e| format!("bad --fee-recipient: {e}"))?;
+        println!("tips go to {account}");
+        sequencer = sequencer.with_fee_recipient(account);
+    }
 
     // Warn rather than refuse: binding a public interface without a token is a
     // choice an operator can legitimately make behind their own proxy, but it
     // should never be made by accident.
-    if auth_token.is_none() && !listen.starts_with("127.0.0.1") && !listen.starts_with("localhost")
+    let listen = &server_config.listen;
+    if server_config.auth_token.is_none()
+        && !listen.starts_with("127.0.0.1")
+        && !listen.starts_with("localhost")
     {
         eprintln!(
             "warning: listening on {listen} with no --auth-token; anyone who can reach this \
@@ -325,13 +419,12 @@ fn serve(
     }
 
     let server_config = ServerConfig {
-        listen: listen.to_owned(),
         chain_id: config.chain_id.clone(),
-        block_interval_secs: block_interval,
-        auth_token,
-        rate_limit_per_minute: rate_limit,
-        ..ServerConfig::default()
+        ..server_config
     };
+    for origin in &server_config.cors_origins {
+        println!("browsers at {origin} may call this node");
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if run_for > 0 {
@@ -363,6 +456,91 @@ fn verify(data_dir: &str, rpc: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs `step` every `poll_interval` seconds until interrupted. A failed round
+/// is reported and retried; L1 and the L2 node are expected to come and go.
+fn rounds<R: std::fmt::Debug, E: std::fmt::Display>(
+    poll_interval: u64,
+    mut step: impl FnMut() -> Result<R, E>,
+    quiet: impl Fn(&R) -> bool,
+) -> Result<(), String> {
+    loop {
+        match step() {
+            Ok(report) if quiet(&report) => {}
+            Ok(report) => println!("{report:?}"),
+            Err(e) => eprintln!("round failed: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(poll_interval));
+    }
+}
+
+fn relay(
+    rpc: String,
+    rpc_token: Option<String>,
+    aptos: &AptosArgs,
+    bond: u128,
+    state: String,
+) -> Result<(), String> {
+    let source = sena_node::RpcSource {
+        url: rpc,
+        auth_token: rpc_token,
+    };
+    let config = sena_node::RelayerConfig {
+        bond,
+        state_path: state.into(),
+    };
+    let mut relayer =
+        sena_node::Relayer::new(aptos.client(), source, config).map_err(|e| e.to_string())?;
+    println!("relaying to {} as {}", aptos.contract, aptos.account);
+    rounds(
+        aptos.poll_interval,
+        || match relayer.step() {
+            // A rejected assertion means this sequencer asserted something
+            // false; carrying on would only post more on top of it.
+            Err(sena_node::relayer::RelayError::Rejected(h)) => {
+                eprintln!("assertion for block {h} was rejected on L1; halting");
+                std::process::exit(2);
+            }
+            other => other,
+        },
+        |r| *r == sena_node::relayer::StepReport::default(),
+    )
+}
+
+fn watch(
+    data_dir: &str,
+    aptos: &AptosArgs,
+    bond: u128,
+    state: String,
+    keyless_steps_per_tx: u64,
+) -> Result<(), String> {
+    let store = Store::open(data_dir).map_err(|e| e.to_string())?;
+    let config = store
+        .load_genesis()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no genesis.json in {data_dir}"))?;
+    let keyless = config.keyless_config().map_err(|e| e.to_string())?;
+    let genesis = config.build_state().map_err(|e| e.to_string())?;
+    let watcher_config = sena_node::WatcherConfig {
+        bond,
+        state_path: state.into(),
+        keyless_setup: sena_stf::KeylessConfig::l1_setup_id(keyless.as_deref()),
+        keyless,
+        keyless_steps_per_tx: keyless_steps_per_tx.max(1),
+    };
+    let mut watcher = sena_node::Watcher::new(aptos.client(), watcher_config, genesis)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "watching {} from assertion {}",
+        aptos.contract,
+        watcher.state().cursor
+    );
+    rounds(
+        aptos.poll_interval,
+        || watcher.step(),
+        |r| *r == sena_node::WatchReport::default(),
+    )
+}
+
 fn keygen() {
     let key = SigningKey::generate(&mut OsRng);
     let address = L2Address::from_bytes(key.verifying_key().to_bytes());
@@ -385,14 +563,53 @@ fn call(rpc: &str, body: &serde_json::Value) -> Result<serde_json::Value, String
         .map_err(|e| format!("response was not JSON: {e}"))
 }
 
-fn send(
-    rpc: &str,
-    secret: &str,
-    to: &str,
+/// What `sena_gasPrice` quotes for an asset.
+struct GasQuote {
+    rate: u128,
+    intrinsic_gas: u64,
+    base_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+}
+
+fn gas_quote(rpc: &str, asset: u32) -> Result<GasQuote, String> {
+    let response = call(
+        rpc,
+        &serde_json::json!({ "method": "sena_gasPrice", "params": { "asset": asset } }),
+    )?;
+    let num = |k: &str| -> Result<u128, String> {
+        response[k]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .or_else(|| response[k].as_u64().map(u128::from))
+            .ok_or_else(|| format!("no gas quote for asset {asset}: {response}"))
+    };
+    Ok(GasQuote {
+        rate: num("rate")?,
+        intrinsic_gas: u64::try_from(num("intrinsic_gas")?).map_err(|e| e.to_string())?,
+        base_fee_per_gas: num("base_fee_per_gas")?,
+        max_fee_per_gas: num("suggested_max_fee_per_gas")?,
+    })
+}
+
+/// What `send` signs.
+struct Transfer {
+    to: String,
     amount: u128,
     nonce: u64,
     asset: u32,
-) -> Result<(), String> {
+    fee_asset: u32,
+    tip: u128,
+}
+
+fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
+    let Transfer {
+        ref to,
+        amount,
+        nonce,
+        asset,
+        fee_asset,
+        tip,
+    } = *t;
     let raw = hex::decode(secret.trim()).map_err(|_| "secret is not hex".to_owned())?;
     let bytes: [u8; 32] = raw
         .try_into()
@@ -401,17 +618,20 @@ fn send(
 
     let recipient = L2Address::from_hex(to.trim()).map_err(|e| format!("bad recipient: {e}"))?;
 
-    // The rate the sender believes applies. Validated in-trace against the
-    // whitelist, so a wrong value is rejected rather than honoured.
-    let rate = sena_stf::RATE_SCALE;
-    let fee = sena_stf::gas::fee_for(rate).map_err(|e| e.to_string())?;
+    // The asset's rate and intrinsic gas, and the base fee, as the node quotes
+    // them. All three are checked in the trace, so a wrong quote is refused
+    // rather than honoured.
+    let quote = gas_quote(rpc, fee_asset)?;
 
     let mut tx = sena_stf::Transaction {
         sender: L2Address::from_bytes(key.verifying_key().to_bytes()),
         nonce,
-        fee_asset: sena_primitives::AssetId(asset),
-        max_fee: fee,
-        fee_rate: rate,
+        fee_asset: sena_primitives::AssetId(fee_asset),
+        fee_rate: quote.rate,
+        fee_intrinsic_gas: quote.intrinsic_gas,
+        gas_limit: 0,
+        max_fee_per_gas: quote.max_fee_per_gas,
+        max_priority_fee_per_gas: tip,
         payload: sena_stf::Payload::Transfer {
             to: recipient,
             asset: sena_primitives::AssetId(asset),
@@ -422,6 +642,12 @@ fn send(
             signature: [0; 64],
         },
     };
+    // Gas is known before execution: the limit is exactly what it uses.
+    tx.gas_limit = sena_stf::gas_required(&tx).map_err(|e| e.to_string())?;
+    println!(
+        "gas {} at up to {} per gas ({} base) in asset {fee_asset}",
+        tx.gas_limit, quote.max_fee_per_gas, quote.base_fee_per_gas
+    );
     let signature = ed25519_dalek::Signer::sign(&key, tx.signing_digest().as_bytes()).to_bytes();
     tx.authenticator = sena_stf::Authenticator::Ed25519 {
         public_key: key.verifying_key().to_bytes(),

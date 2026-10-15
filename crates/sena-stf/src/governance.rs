@@ -21,12 +21,12 @@
 //! that wanted to shorten the challenge window would have to persuade Aptos L1
 //! to run different code.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sena_primitives::serde_hex::{bytes_64, u128_string};
+use ed25519_dalek::{Signature, VerifyingKey};
+use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
 use sena_primitives::{CanonicalEncoder, DecodeError, Hash256, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
-use crate::gas::WhitelistedAsset;
+use crate::gas::{FeeSplit, WhitelistedAsset};
 
 /// Domain tag for the digest the council signs.
 const GOVERNANCE_UPDATE: &[u8] = b"SENA:v1:governance-update";
@@ -37,9 +37,9 @@ const GOVERNANCE_UPDATE: &[u8] = b"SENA:v1:governance-update";
 /// written however the payload is crafted, so adding governance reach is a
 /// deliberate, reviewable act rather than an oversight.
 pub const GOVERNABLE_PARAMETERS: &[&str] = &[
-    // Base cost of a transaction, in native units.
-    "gas.base_native",
-    // Maximum transactions a single batch may contain.
+    // Maximum transactions a single batch may contain. (Fee parameters are
+    // set through `SetFeeMarket`, which keeps them in the record the base fee
+    // step reads.)
     "batch.max_transactions",
 ];
 
@@ -50,9 +50,33 @@ pub struct Council {
     pub members: Vec<[u8; 32]>,
     /// How many distinct members must sign for a payload to be accepted.
     pub threshold: u32,
+    /// The epoch the next governance payload must be signed for.
+    ///
+    /// Consumed by every applied payload, like an account nonce. Without it a
+    /// signed payload could be replayed indefinitely — re-enabling a gas asset
+    /// the council had since disabled, or reinstating a retired JWK.
+    #[serde(default)]
+    pub epoch: u64,
+    /// How many members suffice to *disable* a fee asset — the fast path of
+    /// the circuit breaker, like Mento's watchdogs. Zero means guardians have
+    /// no fast path and disabling needs [`Council::threshold`] like any other
+    /// change. Re-enabling an asset always needs the full threshold.
+    #[serde(default)]
+    pub guardian_threshold: u32,
 }
 
 impl Council {
+    /// The signatures a payload needs: the guardian threshold for a
+    /// `guardian` payload if the council has one, otherwise the threshold.
+    #[must_use]
+    pub const fn required(&self, guardian: bool) -> u32 {
+        if guardian && self.guardian_threshold > 0 {
+            self.guardian_threshold
+        } else {
+            self.threshold
+        }
+    }
+
     /// Encodes the council for storage.
     ///
     /// Canonical binary, so `sena::osp` can decode the roster when adjudicating
@@ -70,6 +94,8 @@ impl Council {
             w.bytes32(member);
         }
         w.u32(self.threshold);
+        w.u64(self.epoch);
+        w.u32(self.guardian_threshold);
         w.finish()
     }
 
@@ -91,8 +117,15 @@ impl Council {
             members.push(r.bytes32()?);
         }
         let threshold = r.u32()?;
+        let epoch = r.u64()?;
+        let guardian_threshold = r.u32()?;
         r.finish()?;
-        Ok(Self { members, threshold })
+        Ok(Self {
+            members,
+            threshold,
+            epoch,
+            guardian_threshold,
+        })
     }
 }
 
@@ -123,13 +156,41 @@ pub enum GovernanceUpdate {
         #[serde(with = "u128_string")]
         value: u128,
     },
-}
-
-/// Discriminants for the canonical update encoding, fixed explicitly because
-/// the council's signature commits to them.
-mod update_tag {
-    pub const SET_GAS_ASSET: u8 = 0;
-    pub const SET_PARAMETER: u8 = 1;
+    /// Accept or retire an identity provider's JWK (REQ-AUTH-003).
+    ///
+    /// Providers rotate their signing keys every few weeks, so the set of
+    /// acceptable JWKs is state, not code. Retiring is a write of
+    /// `active: false` rather than a removal, keeping the trie append-only.
+    SetJwk {
+        /// Poseidon hash of the issuer (`sena_stf::keyless::iss_hash`).
+        #[serde(with = "bytes_32")]
+        iss_hash: [u8; 32],
+        /// Poseidon hash of the JWK (`sena_stf::keyless::rsa_jwk_hash`).
+        #[serde(with = "bytes_32")]
+        jwk_hash: [u8; 32],
+        /// Whether proofs against the JWK are accepted.
+        active: bool,
+    },
+    /// Set the base fee floor and gas target (Celo's base fee floor).
+    SetFeeMarket {
+        /// The lowest the base fee may go, in `PRICE_SCALE`ths of a native
+        /// unit per gas.
+        #[serde(with = "u128_string")]
+        floor: u128,
+        /// The gas a window aims to use.
+        target: u64,
+    },
+    /// Set how collected fees are shared out (Celo's `FeeHandler`).
+    SetFeeSplit {
+        /// The new split.
+        split: FeeSplit,
+    },
+    /// Disable a fee asset — the circuit breaker. The only update the
+    /// guardian threshold can authorise.
+    DisableGasAsset {
+        /// The asset to disable.
+        asset: sena_primitives::AssetId,
+    },
 }
 
 impl GovernanceUpdate {
@@ -141,35 +202,22 @@ impl GovernanceUpdate {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        match self {
-            Self::SetGasAsset { record } => {
-                w.u8(update_tag::SET_GAS_ASSET);
-                w.bytes(&record.encode());
-            }
-            Self::SetParameter { name, value } => {
-                w.u8(update_tag::SET_PARAMETER);
-                w.string(name);
-                w.u128(*value);
-            }
-        }
+        crate::wire::write_update(&mut w, self);
         w.finish()
     }
 
     /// Returns the digest the council signs.
     ///
-    /// `epoch` is included so that a signed payload cannot be replayed once it
-    /// has been applied, or applied twice by a relayer.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if serialisation fails, which cannot occur.
+    /// `epoch` must equal the council's current epoch when the payload is
+    /// applied, and applying it advances the epoch, so a signed payload can be
+    /// applied exactly once. The update is encoded canonically so the Aptos L1
+    /// verifier can recompute this digest.
     #[must_use]
     pub fn signing_digest(&self, epoch: u64) -> Hash256 {
-        let body = serde_json::to_vec(self).expect("update serialisation cannot fail");
         Hash256::commit(
             CanonicalEncoder::new(GOVERNANCE_UPDATE)
                 .u64(epoch)
-                .field(&body),
+                .field(&self.encode()),
         )
     }
 
@@ -199,7 +247,24 @@ impl GovernanceUpdate {
                     Ok(())
                 }
             }
+            Self::SetFeeMarket { floor, target } => {
+                if *floor == 0 || *target == 0 {
+                    Err(GovernanceError::InvalidFeeParameter)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SetFeeSplit { split } => split
+                .check()
+                .map_err(|_| GovernanceError::InvalidFeeParameter),
+            Self::SetJwk { .. } | Self::DisableGasAsset { .. } => Ok(()),
         }
+    }
+
+    /// Whether the guardian threshold may authorise this update.
+    #[must_use]
+    pub const fn guardian_may_apply(&self) -> bool {
+        matches!(self, Self::DisableGasAsset { .. })
     }
 }
 
@@ -219,8 +284,10 @@ pub fn verify_council_signatures(
     council: &Council,
     digest: &Hash256,
     signatures: &[CouncilSignature],
+    guardian: bool,
 ) -> Result<(), GovernanceError> {
-    if council.threshold == 0 {
+    let required = council.required(guardian);
+    if required == 0 {
         return Err(GovernanceError::ThresholdNotMet {
             supplied: 0,
             required: 0,
@@ -241,18 +308,20 @@ pub fn verify_council_signatures(
             .get(usize::try_from(*index).map_err(|_| GovernanceError::UnknownSigner)?)
             .ok_or(GovernanceError::UnknownSigner)?;
 
+        // Strict, as Aptos L1 verifies: a lenient check would accept
+        // signatures the one-step verifier refuses.
         let key =
             VerifyingKey::from_bytes(member).map_err(|_| GovernanceError::MalformedCouncil)?;
-        key.verify(digest.as_bytes(), &Signature::from_bytes(signature))
+        if key.is_weak() {
+            return Err(GovernanceError::MalformedCouncil);
+        }
+        key.verify_strict(digest.as_bytes(), &Signature::from_bytes(signature))
             .map_err(|_| GovernanceError::BadSignature { index: *index })?;
     }
 
     let supplied = u32::try_from(signatures.len()).unwrap_or(u32::MAX);
-    if supplied < council.threshold {
-        return Err(GovernanceError::ThresholdNotMet {
-            supplied,
-            required: council.threshold,
-        });
+    if supplied < required {
+        return Err(GovernanceError::ThresholdNotMet { supplied, required });
     }
     Ok(())
 }
@@ -292,6 +361,18 @@ pub enum GovernanceError {
     /// The asset rate would make execution free.
     #[error("gas asset rate must be non-zero")]
     InvalidAssetRate,
+    /// A fee market or fee split update is malformed.
+    #[error("fee floor and target must be non-zero, and fee split shares must sum to 1,000,000")]
+    InvalidFeeParameter,
+    /// The payload was signed for an epoch other than the council's current one:
+    /// a replay of an applied payload, or one signed out of order.
+    #[error("payload signed for epoch {signed}, but the council is at epoch {expected}")]
+    WrongEpoch {
+        /// The council's current epoch.
+        expected: u64,
+        /// The epoch the payload was signed for.
+        signed: u64,
+    },
 }
 
 #[cfg(test)]
@@ -309,6 +390,8 @@ mod tests {
         Council {
             members: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
             threshold,
+            epoch: 0,
+            guardian_threshold: 0,
         }
     }
 
@@ -321,7 +404,7 @@ mod tests {
 
     fn update() -> GovernanceUpdate {
         GovernanceUpdate::SetParameter {
-            name: "gas.base_native".to_owned(),
+            name: "batch.max_transactions".to_owned(),
             value: 2_000,
         }
     }
@@ -333,7 +416,7 @@ mod tests {
         let digest = update().signing_digest(1);
 
         let signatures = vec![sig(0, &keys[0], &digest), sig(2, &keys[2], &digest)];
-        assert!(verify_council_signatures(&council, &digest, &signatures).is_ok());
+        assert!(verify_council_signatures(&council, &digest, &signatures, false).is_ok());
     }
 
     #[test]
@@ -358,6 +441,7 @@ mod tests {
                     signature,
                 },
             ],
+            false,
         )
         .unwrap_err();
         assert_eq!(err, GovernanceError::UnorderedSigners);
@@ -371,7 +455,7 @@ mod tests {
         let signatures = vec![sig(0, &keys[0], &digest)];
 
         assert_eq!(
-            verify_council_signatures(&council, &digest, &signatures).unwrap_err(),
+            verify_council_signatures(&council, &digest, &signatures, false).unwrap_err(),
             GovernanceError::ThresholdNotMet {
                 supplied: 1,
                 required: 3
@@ -389,7 +473,7 @@ mod tests {
         // Claim to be member 0 while signing with an unrelated key.
         let signatures = vec![sig(0, &outsider, &digest)];
         assert!(matches!(
-            verify_council_signatures(&council, &digest, &signatures).unwrap_err(),
+            verify_council_signatures(&council, &digest, &signatures, false).unwrap_err(),
             GovernanceError::BadSignature { index: 0 }
         ));
     }
@@ -403,7 +487,7 @@ mod tests {
         let signatures = vec![sig(0, &keys[0], &signed_digest)];
 
         let later = update().signing_digest(2);
-        assert!(verify_council_signatures(&council, &later, &signatures).is_err());
+        assert!(verify_council_signatures(&council, &later, &signatures, false).is_err());
     }
 
     #[test]
@@ -414,12 +498,16 @@ mod tests {
         let signatures = vec![sig(0, &keys[0], &digest)];
 
         let different = GovernanceUpdate::SetParameter {
-            name: "gas.base_native".to_owned(),
+            name: "batch.max_transactions".to_owned(),
             value: 999_999,
         };
-        assert!(
-            verify_council_signatures(&council, &different.signing_digest(1), &signatures).is_err()
-        );
+        assert!(verify_council_signatures(
+            &council,
+            &different.signing_digest(1),
+            &signatures,
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -464,6 +552,7 @@ mod tests {
                 asset: sena_primitives::AssetId(1),
                 symbol: "FREE".to_owned(),
                 rate: 0,
+                intrinsic_gas: 0,
                 enabled: true,
             },
         };
@@ -471,5 +560,57 @@ mod tests {
             update.check_permitted().unwrap_err(),
             GovernanceError::InvalidAssetRate
         );
+    }
+
+    #[test]
+    fn guardians_can_only_take_the_fast_path_to_disable() {
+        let keys: Vec<_> = (0..3).map(member).collect();
+        let mut council = council_of(&keys, 3);
+        council.guardian_threshold = 1;
+        let disable = GovernanceUpdate::DisableGasAsset {
+            asset: sena_primitives::AssetId(1),
+        };
+        let digest = disable.signing_digest(0);
+        let one = [sig(0, &keys[0], &digest)];
+        assert!(disable.guardian_may_apply());
+        verify_council_signatures(&council, &digest, &one, true).unwrap();
+        // The same single signature is not enough for anything else.
+        assert!(matches!(
+            verify_council_signatures(&council, &digest, &one, false),
+            Err(GovernanceError::ThresholdNotMet { required: 3, .. })
+        ));
+        assert!(!GovernanceUpdate::SetJwk {
+            iss_hash: [0; 32],
+            jwk_hash: [0; 32],
+            active: true
+        }
+        .guardian_may_apply());
+        // Without a guardian threshold, disabling needs the full council.
+        council.guardian_threshold = 0;
+        assert!(verify_council_signatures(&council, &digest, &one, true).is_err());
+        assert_eq!(Council::decode(&council.encode()).unwrap(), council);
+    }
+
+    #[test]
+    fn fee_updates_are_checked() {
+        let bad = [
+            GovernanceUpdate::SetFeeMarket {
+                floor: 0,
+                target: 1,
+            },
+            GovernanceUpdate::SetFeeMarket {
+                floor: 1,
+                target: 0,
+            },
+            GovernanceUpdate::SetFeeSplit {
+                split: crate::gas::FeeSplit::default(),
+            },
+        ];
+        for u in bad {
+            assert_eq!(
+                u.check_permitted(),
+                Err(GovernanceError::InvalidFeeParameter)
+            );
+        }
     }
 }
