@@ -1,6 +1,6 @@
 # Status
 
-**Unreleased (after 0.2.0-beta)** · 306 Rust tests + 76 Move tests passing · **verified on a local Aptos node; not deployed to any public network** · not audited
+**Unreleased (after 0.2.0-beta)** · 306 Rust tests + 76 Move tests passing · **deployed to Aptos testnet** · not audited
 
 > **Fraud proofs work on a real Aptos node.** On a localnet, a batch whose
 > keyless transfer was forged a thousandfold was posted with its batch data,
@@ -10,7 +10,11 @@
 > honest block from L1 data alone. CI repeats both on every change
 > (`.github/workflows/move.yml`, job *localnet dispute and agents*).
 >
-> Nothing is on devnet, testnet or mainnet, and nothing is audited.
+> The current package is **published on Aptos testnet**: the assertion lifecycle
+> passed 11/11 there and real Circle USDC was deposited into the bridge
+> ([evidence with transaction hashes](docs/beta/evidence/04-testnet-deployment.md)).
+> No dispute has been played on testnet yet, nothing is on mainnet, and nothing
+> is audited.
 
 **Beta planning:** [`docs/beta/BETA_SCOPE.md`](docs/beta/BETA_SCOPE.md) ·
 [`DECISION_LOG.md`](docs/beta/DECISION_LOG.md) ·
@@ -88,14 +92,20 @@ conformance vectors make divergence on known cases a test failure; they are not
 a substitute for review. `SRS NFR-SEC-012` requires an independent audit before
 mainnet.
 
-### 2. Not deployed to a public network
+### 2. On testnet, but only the lifecycle and a deposit
 
-The current package has run only on a local Aptos node. An earlier contract
-version was published to devnet
-([evidence](docs/beta/evidence/03-devnet-deployment.md)); that deployment
-predates bonds, published batch data and keyless adjudication, and devnet has
-since reset. Testnet needs a funded account (no programmatic faucet) and one
-run of `scripts/chain-lifecycle.sh testnet` and `scripts/bridge-test.sh`.
+The current package is published on Aptos testnet
+([evidence](docs/beta/evidence/04-testnet-deployment.md)): the assertion
+lifecycle passed 11/11 with real APT bonds, and 1 USDC of Circle's testnet
+USDC was deposited into bridge custody. Not yet done on testnet:
+
+- **a dispute played to the end** -- that has run only on a localnet;
+- **a withdrawal** -- it needs an assertion past its 24-hour window and a
+  sequencer-produced balance proof;
+- **the relayer and watcher** against testnet.
+
+Publishing costs about 2.25 APT on testnet (mostly storage fees), so a
+publishing account should hold at least 4 APT.
 
 The package is larger than one transaction and is published with
 `--chunked-publish`.
@@ -200,12 +210,16 @@ not publish anyone's contact details, but a guess can be confirmed.
 Against the release gates in [`BETA_BUILD_PLAN.md`](docs/beta/BETA_BUILD_PLAN.md):
 **Gate B — local end-to-end integration against an Aptos node — is met.** The
 honest lifecycle and an adversarial one (a forged keyless credit disputed to
-rejection) both run against a local node, in CI. Gate C (public testnet) is
-next and needs only funding and a deployment run.
+rejection) both run against a local node, in CI. **Gate C — reproducible
+deployment — is largely met:** fresh accounts were funded, and the scripts
+built, published and initialised the package on testnet with no manual state
+edits. What it still lacks is recording the package and STF hashes for the
+deployment.
 
 ## Roadmap
 
-1. **Testnet deployment** of the current package, bridge with Circle USDC.
+1. **Finish testnet**: play a dispute there, run the relayer and watcher
+   against it, and complete a withdrawal after the window.
 2. **Independent audit** of the dispute contracts, the L1 compiler and keyless
    verification.
 3. **Live keyless sign-in** against the Aptos prover and pepper services, and

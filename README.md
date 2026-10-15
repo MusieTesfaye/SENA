@@ -7,7 +7,7 @@ proofs**.
 
 <p>
 <img alt="status" src="https://img.shields.io/badge/status-beta-orange">
-<img alt="aptos" src="https://img.shields.io/badge/aptos-localnet%20verified-blue">
+<img alt="aptos" src="https://img.shields.io/badge/aptos-testnet%20deployed-blue">
 <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
@@ -18,8 +18,8 @@ proofs**.
 > fraud, and on a real Aptos node a forged keyless transfer has been disputed
 > down to one step and rejected by Aptos itself, Groth16 proof and all.
 >
-> **It has not been audited, and the current contracts are not deployed to any
-> public network.** Do not put real funds anywhere near it.
+> **It has not been audited.** The contracts are on Aptos testnet, not mainnet.
+> Do not put real funds anywhere near it.
 >
 > [`STATUS.md`](STATUS.md) is the honest, line-by-line account of what works
 > today and what does not. Read it before forming a view.

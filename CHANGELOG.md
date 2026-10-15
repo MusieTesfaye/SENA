@@ -5,6 +5,20 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### On Aptos testnet
+
+- The current package is published on Aptos testnet. `chain-lifecycle.sh
+  testnet` passed 11/11 with real APT bonds, and 1 USDC was deposited into
+  bridge custody (`docs/beta/evidence/04-testnet-deployment.md`).
+- Chunked publishing passes `--large-packages-module-address 0x7`: CLI 7.9.0
+  defaults to the module's old testnet address, where staging fails with
+  `LINKER_ERROR`.
+- `bridge-test.sh` reads APT balances through `coin::balance`; new accounts
+  hold APT as a fungible asset and have no `CoinStore`.
+- `chain-lifecycle.sh` checks both accounts can pay before spending anything,
+  and says what to fund and how to rerun with the same accounts.
+- The Move tests also pass under Aptos CLI 9.0.0 and 9.6.0.
+
 ### Disputes settle on Aptos, keyless included
 
 - **Every instruction is adjudicable on L1.** `sena::compiler` decodes,

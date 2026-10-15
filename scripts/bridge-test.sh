@@ -21,7 +21,6 @@ set -uo pipefail
 CMD="${1:-status}"
 PROFILE="${SENA_PROFILE:-sena-testnet}"
 NETWORK=testnet
-API="https://fullnode.${NETWORK}.aptoslabs.com/v1"
 
 # Circle USDC on Aptos testnet: 6 decimals, a dispatchable fungible asset.
 USDC_METADATA=0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832
@@ -34,7 +33,7 @@ MAX_BATCH_AGE=3600
 KEYLESS_SETUP=1     # aptos-keyless-mainnet-2025-01
 
 GAS=(--max-gas 100000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
-PUBLISH_GAS=(--max-gas 500000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
+PUBLISH_GAS=(--max-gas 2000000 --gas-unit-price 100 --assume-yes --profile "$PROFILE")
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
@@ -63,10 +62,14 @@ try: print(json.load(sys.stdin)["Result"][0])
 except Exception: print("")'
 }
 
+# Read through the coin::balance view rather than the CoinStore resource:
+# APT has moved to the fungible-asset standard, and new accounts have no
+# CoinStore at all.
 apt_balance() {
-  timeout 25 curl -sS "$API/accounts/$ADDR/resource/0x1::coin::CoinStore%3C0x1::aptos_coin::AptosCoin%3E" 2>/dev/null \
+  aptos move view --function-id 0x1::coin::balance --type-args 0x1::aptos_coin::AptosCoin \
+    --args "address:$ADDR" --profile "$PROFILE" 2>/dev/null \
     | python3 -c 'import json,sys
-try: print(json.load(sys.stdin)["data"]["coin"]["value"])
+try: print(json.load(sys.stdin)["Result"][0])
 except Exception: print(0)'
 }
 
@@ -95,7 +98,7 @@ case "$CMD" in
   setup)
     step "Publish"
     # Over the 64 KiB transaction limit, so published in chunks.
-    out=$(aptos move publish --package-dir move/sena --named-addresses "sena=$ADDR" --chunked-publish "${PUBLISH_GAS[@]}" 2>&1)
+    out=$(aptos move publish --package-dir move/sena --named-addresses "sena=$ADDR" --chunked-publish --large-packages-module-address 0x7 "${PUBLISH_GAS[@]}" 2>&1)
     echo "$out" | grep -q '"success": true' && ok "published" || { bad "publish failed"; echo "$out" | grep Error | head -2; exit 1; }
 
     step "Initialise"

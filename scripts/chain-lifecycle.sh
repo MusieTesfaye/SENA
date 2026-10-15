@@ -26,11 +26,12 @@ NETWORK="${1:-devnet}"
 # behaving correctly and the script asking the wrong question.
 PROFILE="${SENA_PROFILE:-sena-${NETWORK}-$(date +%Y%m%d-%H%M%S)}"
 # Gas is specified rather than estimated: the devnet simulate endpoint times out
-# from some connections, and passing these skips that call. Publishing needs
-# substantially more than an entry-function call -- the first successful publish
-# used 184,594 -- so the two budgets are separate.
+# from some connections, and passing these skips that call. Publishing needs far
+# more than an entry-function call -- on testnet each staged chunk uses about
+# 200,000-250,000 units and the final publish more than 500,000 -- so the two
+# budgets are separate.
 GAS_ARGS=(--max-gas 100000 --gas-unit-price 100 --assume-yes)
-PUBLISH_GAS_ARGS=(--max-gas 500000 --gas-unit-price 100 --assume-yes)
+PUBLISH_GAS_ARGS=(--max-gas 2000000 --gas-unit-price 100 --assume-yes)
 
 # Distinct roots so a mistake shows up as a mismatch rather than a coincidence.
 GENESIS_ROOT="0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -111,9 +112,10 @@ if [ "$NETWORK" = "local" ] || [ "$NETWORK" = "devnet" ]; then
   done
 fi
 
-# Stop before spending anything if either account cannot pay its way. The
-# publisher needs its 0.5 APT gas ceiling to be covered plus what publishing
-# spends; the challenger, the bond plus gas.
+# Stop before spending anything if either account cannot pay its way. On
+# testnet the chunked publish costs about 2 APT (mostly storage fees), and each
+# transaction's 2,000,000-unit ceiling must be covered by the balance on top;
+# the challenger needs the bond plus gas.
 apt_of() {
   aptos move view --function-id 0x1::coin::balance --type-args 0x1::aptos_coin::AptosCoin \
     --args "address:$1" --profile "$PROFILE" 2>/dev/null \
@@ -123,7 +125,7 @@ except Exception: print(0)'
 }
 CHALLENGER_ADDR="0x$(profile_account "$CHALLENGER")"
 short=0
-for pair in "$ADDR:100000000" "$CHALLENGER_ADDR:30000000"; do
+for pair in "$ADDR:400000000" "$CHALLENGER_ADDR:30000000"; do
   a="${pair%%:*}"; need="${pair##*:}"; have=$(apt_of "$a")
   if [ "$have" -lt "$need" ]; then
     echo "  $a holds $have octas; needs at least $need ($((need / 100000000)).$(printf '%08d' $((need % 100000000))) APT)"
@@ -137,9 +139,12 @@ if [ "$short" -eq 1 ]; then
 fi
 
 step "2. Publish the package"
-# The package is over the 64 KiB transaction limit, so it goes up in chunks.
+# The package is over the 64 KiB transaction limit, so it goes up in chunks,
+# through the framework's `large_packages` module. That now lives at 0x7 on
+# every network; CLI 7.9.0 still defaults to its old testnet address, where
+# staging fails with LINKER_ERROR.
 publish_out=$(aptos move publish --package-dir move/sena --named-addresses "sena=$ADDR" \
-  --chunked-publish --profile "$PROFILE" "${PUBLISH_GAS_ARGS[@]}" 2>&1)
+  --chunked-publish --large-packages-module-address 0x7 --profile "$PROFILE" "${PUBLISH_GAS_ARGS[@]}" 2>&1)
 if echo "$publish_out" | grep -q '"success": true'; then
   ok "package published"
 else

@@ -262,8 +262,9 @@ encode `u128`, and a JSON number above 2^53 would be silently rounded. Try
 
 ## What no test here covers
 
-- **Nothing has run on a public network** with the current contracts; the
-  on-chain layers above use a local node.
+- **On testnet, only the lifecycle and a deposit have run**
+  ([evidence](beta/evidence/04-testnet-deployment.md)); disputes and the
+  agents have run on a local node only.
 - **The withdrawal path has not been driven end to end on chain.** The node
   produces a proof and the contract verifies it and pays out in Move tests, but
   nobody has yet spent a proof from `sena_getWithdrawalProof` against a
