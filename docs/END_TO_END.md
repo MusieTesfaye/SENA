@@ -284,15 +284,15 @@ at twice the base fee) keeps working while it rises.
 ### Several stablecoins
 
 Any number of assets can be whitelisted in genesis, each with its own rate
-and intrinsic gas. The fee asset is the sender's choice, independent of the
-asset moved:
+and intrinsic gas. By default a transfer pays its fee in the coin it moves
+(USDT in USDT, DAI in DAI); `--fee-asset` picks another:
 
 ```json
 "gas_assets": [
   { "asset": 1, "symbol": "USDC", "rate": "1000000", "intrinsic_gas": 10000, "enabled": true },
   { "asset": 2, "symbol": "USDT", "rate": "1000000", "intrinsic_gas": 10000, "enabled": true },
   { "asset": 3, "symbol": "EURC", "rate": "925000",  "intrinsic_gas": 15000, "enabled": true },
-  { "asset": 4, "symbol": "DAI",  "rate": "1000000", "intrinsic_gas": 10000, "enabled": false }
+  { "asset": 4, "symbol": "DAI",  "rate": "1000000", "intrinsic_gas": 10000, "enabled": true }
 ]
 ```
 
@@ -307,8 +307,10 @@ gas 46000 at up to 46250000000 per gas (23125000000 base) in asset 3
 
 EURC's base fee is the native base fee × 0.925, and its own 15,000 intrinsic
 gas makes the transfer 46,000 gas: 46 EURC units of tip and 1,063 of base fee.
-A disabled asset (DAI above) gets no quote and its fees are refused, but it
-can still be transferred. `scripts/stablecoins-test.py` runs all of this and
+Setting `"enabled": false` (or a council or guardian `DisableGasAsset`)
+switches an asset off for fees: it gets no quote and fees in it are refused,
+but it can still be transferred. `scripts/stablecoins-test.py` sends a
+transfer in each of the four coins, each paying in its own coin, and
 checks every balance; results are in
 [evidence 05](beta/evidence/05-stablecoins.md).
 
@@ -595,7 +597,7 @@ live in the Aptos contracts, which the L2 cannot change.
 | Script | Needs | Does |
 |---|---|---|
 | `scripts/localnet-dispute.sh [fee]` | a localnet | Parts 5–6 in one go: fresh accounts, publish, and the keyless fraud dispute to rejection; with `fee`, a sequencer's forged EURC tip instead |
-| `scripts/stablecoins-test.py` | `cargo build --release -p sena-node` | Part 4 with four stablecoins: fees in each, a fee in one for a transfer of another, a disabled and an unlisted asset refused, every balance checked |
+| `scripts/stablecoins-test.py` | `cargo build --release -p sena-node` | Part 4 with four stablecoins: a transfer in each, paying its fee in its own coin; an unlisted asset refused; every balance checked |
 | `scripts/localnet-agents.sh` | a localnet, `cargo build -p sena-node` | Part 5: a sequencer, the relayer posting, the watcher verifying; fails if the watcher challenges |
 | `scripts/chain-lifecycle.sh local\|devnet\|testnet` | a network | Publish and initialise; then the safety checks — an underbonded post, finalizing early, a self-challenge and finalizing a challenged assertion must all be refused |
 | `scripts/bridge-test.sh setup\|deposit\|status` | testnet, USDC | The bridge with Circle's testnet USDC |

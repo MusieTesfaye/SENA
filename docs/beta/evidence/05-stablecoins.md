@@ -4,12 +4,12 @@
 **What:** fees paid in four whitelisted stablecoins on a live node, and a
 forged fee in a non-par stablecoin disputed to rejection on an Aptos localnet.
 
-| Asset | Id | Rate (per native unit) | Intrinsic gas | Fees |
-|---|---|---|---|---|
-| USDC | 1 | 1.000 | 10,000 | enabled |
-| USDT | 2 | 1.000 | 10,000 | enabled |
-| EURC | 3 | 0.925 | 15,000 | enabled |
-| DAI | 4 | 1.000 | 10,000 | **disabled** |
+| Asset | Id | Rate (per native unit) | Intrinsic gas |
+|---|---|---|---|
+| USDC | 1 | 1.000 | 10,000 |
+| USDT | 2 | 1.000 | 10,000 |
+| EURC | 3 | 0.925 | 15,000 |
+| DAI | 4 | 1.000 | 10,000 |
 
 The names are labels in a test genesis. On Aptos testnet only Circle USDC is
 the issuer's own; the "USDT" and "USD1" listed there are third-party demo
@@ -19,18 +19,17 @@ a second asset. It takes any fungible asset, one bridge per asset.
 ## 1. A live node, every balance checked: `scripts/stablecoins-test.py`
 
 A sequencer with the four assets above, Alice holding 100.000000 of each, and
-seven transfers sent through `sena-node send`. The expected amounts are
-computed by the script, independently of the node, from [`FEES.md`](../../FEES.md).
-**32 passed, 0 failed.**
+a transfer in each stablecoin sent through `sena-node send`, **each paying its
+fee in its own stablecoin**. The script computes the expected amounts itself
+from [`FEES.md`](../../FEES.md), without asking the node.
+**30 passed, 0 failed.**
 
 | Transfer | Fee paid in | Gas | Tip | Base fee | Outcome |
 |---|---|---|---|---|---|
 | 5 USDC | USDC | 41,000 | 41 | 1,025 | confirmed |
 | 7 USDT | USDT | 41,000 | 41 | 1,025 | confirmed |
 | 3 EURC | EURC | 46,000 | 46 | 1,063 | confirmed |
-| 1 USDT | **EURC** | 46,000 | 46 | 1,063 | confirmed |
-| 2 DAI | DAI | | | | **refused**: disabled for fees |
-| 2 DAI | USDC | 41,000 | 41 | 1,025 | confirmed: disabling only stops fee payment; DAI can still be sent |
+| 2 DAI | DAI | 41,000 | 41 | 1,025 | confirmed |
 | 1 USDC | asset 9 | | | | **refused**: not whitelisted |
 
 EURC's base fee is 0.025 × 0.925 = 0.023125 per gas, and its own intrinsic gas
@@ -39,25 +38,28 @@ smallest unit:
 
 | | USDC | USDT | EURC | DAI |
 |---|---|---|---|---|
-| Alice | 94,997,868 | 91,998,934 | 96,997,782 | 98,000,000 |
-| Bob | 5,000,000 | 8,000,000 | 3,000,000 | 2,000,000 |
-| Sequencer (tips) | 82 | 41 | 92 | 0 |
-| Fee vault (base fees) | 2,050 | 1,025 | 2,126 | 0 |
+| Alice | 94,998,934 | 92,998,934 | 96,998,891 | 97,998,934 |
+| Bob | 5,000,000 | 7,000,000 | 3,000,000 | 2,000,000 |
+| Sequencer (tips) | 41 | 41 | 46 | 41 |
+| Fee vault (base fees) | 1,025 | 1,025 | 1,063 | 1,025 |
 | **Total** | 100,000,000 | 100,000,000 | 100,000,000 | 100,000,000 |
 
 No asset was created or destroyed, and each fee went to the asset it was paid
 in.
 
-The two refusals in this run come from the node's quote: `sena_gasPrice`
-returns no quote for a disabled or unlisted asset. The node also refuses at
-admission when a wallet skips the quote. The test
+The council can also switch an asset off for fees; the guardian alone can do
+it quickly. A switched-off asset gets no quote, but it can still be
+transferred. A wallet can also pay in one stablecoin for a transfer of
+another (`--fee-asset`). Both are checked in
 `only_an_enabled_fee_asset_declared_as_whitelisted_is_admitted`
-(`crates/sena-node/tests/node.rs`) submits over RPC four fees that must be
-turned away:
+(`crates/sena-node/tests/node.rs`). Submitting over RPC, it shows that the
+node refuses four bad fees:
 - one in a disabled asset;
 - one in an unlisted asset;
 - one in EURC declared at par;
 - one in EURC declared with the wrong intrinsic gas.
+
+It also shows the node accepts a USDT transfer whose fee is paid in EURC.
 
 ## 2. Aptos rules on a non-par fee: `scripts/localnet-dispute.sh fee`
 

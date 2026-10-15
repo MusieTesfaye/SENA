@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """Pay fees in several stablecoins on a live node and check every balance.
 
-Starts a sequencer whose genesis whitelists four stablecoins -- USDC and USDT
-at par, EURC at a non-par rate with its own intrinsic gas, and DAI disabled --
-then sends real transfers through `sena-node send` and checks, to the unit,
-what each account holds in each asset afterwards:
+Starts a sequencer whose genesis whitelists four stablecoins -- USDC, USDT
+and DAI at par, and EURC at a non-par rate with its own intrinsic gas -- then
+sends real transfers through `sena-node send` and checks, to the unit, what
+each account holds in each asset afterwards:
 
-  * a transfer in each enabled stablecoin, paying its fee in the same one;
-  * a USDT transfer paying its fee in EURC (the fee asset is the payer's
-    choice, independent of what moves);
-  * a DAI transfer paying in DAI, which must be refused: DAI is whitelisted
-    but disabled for fees;
-  * a DAI transfer paying in USDC, which must go through: disabling an asset
-    for fees does not freeze it;
+  * a transfer in each stablecoin, paying its fee in that same stablecoin;
   * a fee in an asset that is not whitelisted at all, which the node will not
     quote.
+
+Disabled fee assets, and fees paid in one asset for a transfer of another,
+are covered by `crates/sena-node/tests/node.rs`.
 
 The expected amounts are computed here, independently of the node, from the
 rules in docs/FEES.md.
@@ -48,7 +45,7 @@ ASSETS = [
     (1, "USDC", 1_000_000, 10_000, True),
     (2, "USDT", 1_000_000, 10_000, True),
     (3, "EURC", 925_000, 15_000, True),
-    (4, "DAI", 1_000_000, 10_000, False),
+    (4, "DAI", 1_000_000, 10_000, True),
 ]
 RATES = {a: (rate, gas) for a, _, rate, gas, _ in ASSETS}
 SYMBOL = {a: s for a, s, *_ in ASSETS}
@@ -176,9 +173,7 @@ def main():
             ("USDC transfer, fee in USDC", 1, 1, 5_000_000, True),
             ("USDT transfer, fee in USDT", 2, 2, 7_000_000, True),
             ("EURC transfer, fee in EURC", 3, 3, 3_000_000, True),
-            ("USDT transfer, fee in EURC", 2, 3, 1_000_000, True),
-            ("DAI transfer, fee in DAI (disabled for fees)", 4, 4, 2_000_000, False),
-            ("DAI transfer, fee in USDC", 4, 1, 2_000_000, True),
+            ("DAI transfer, fee in DAI", 4, 4, 2_000_000, True),
             ("USDC transfer, fee in asset 9 (not whitelisted)", 1, 9, 1_000_000, False),
         ]
         expect = {who: {a: 0 for a in RATES} for who in (alice, bob, seq, FEE_VAULT)}

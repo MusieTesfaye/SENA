@@ -49,7 +49,7 @@ assumed not to work.
 | **Batch data published on L1**; L1 computes the batch root | `move/sena` | A post whose data does not match its claim cannot be made |
 | Batch-structure fraud proofs (uncompilable tx, start gaps, trace length) | `move/sena` | Move tests; watcher mock-L1 tests |
 | **A full keyless fraud dispute on a real Aptos node** | `scripts/localnet-dispute.sh` | Assertion ends rejected; 4,833 gas units from post to rejection |
-| **Fees in several stablecoins** | `scripts/stablecoins-test.py`; `scripts/localnet-dispute.sh fee` | USDC, USDT and EURC at a non-par rate on a live node, every balance exact; a forged EURC tip rejected on an Aptos localnet ([evidence 05](docs/beta/evidence/05-stablecoins.md)) |
+| **Fees in several stablecoins** | `scripts/stablecoins-test.py`; `scripts/localnet-dispute.sh fee` | USDC, USDT, DAI and EURC (non-par) on a live node, each paying fees in itself, every balance exact; a forged EURC tip rejected on an Aptos localnet ([evidence 05](docs/beta/evidence/05-stablecoins.md)) |
 | Bonds and bridge custody move real fungible assets | `move/sena` | Balances checked on reject, refund, groundless challenge, withdrawal |
 | Assertion lifecycle enforced by Aptos | `scripts/chain-lifecycle.sh` | 11/11 on a localnet: window, self-challenge and challenge all block as they must |
 | **Relayer**: post with batch data, defend, finalize | `sena-node relay` | Mock-L1 tests; posted a real block on a localnet |

@@ -129,9 +129,9 @@ prefix of the queue, since later transactions may depend on earlier ones.
 ## Tested
 
 [Evidence 05](beta/evidence/05-stablecoins.md) records two runs. A live node
-took fees in USDC, USDT and EURC at a non-par rate, including a fee in one
-asset for a transfer of another, and refused a disabled and an unlisted asset;
-every balance was checked to the unit. On an Aptos localnet, a sequencer's
+took fees in USDC, USDT, DAI and EURC (at a non-par rate), each transfer
+paying in its own coin, and refused an unlisted asset; every balance was
+checked to the unit. On an Aptos localnet, a sequencer's
 forged tip in EURC was disputed to rejection.
 
 ## What is not copied from Celo
