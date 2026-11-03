@@ -7,6 +7,9 @@
 /// pure function of the transaction and the batch header (timestamp, base fee,
 /// tip recipient) plus the keyless setup, which is what makes this possible.
 ///
+/// `chain_id` is the chain the contracts were initialised for: a transaction
+/// signed for another SENA network does not compile here, as in the node.
+///
 /// The fee follows Celo's fee abstraction (see `sena::gas`): the gas the
 /// transaction uses is metered from its program, the base fee is converted
 /// into the fee asset at the declared rate, `gas_limit ×` the effective price
@@ -53,8 +56,9 @@ module sena::compiler {
         base_fee: u128,
         fee_recipient: vector<u8>,
         keyless_setup: u8,
+        chain_id: u64,
     ): (bool, vector<Instruction>) {
-        compile_inner(tx_bytes, timestamp, base_fee, fee_recipient, keyless_setup, option::none())
+        compile_inner(tx_bytes, timestamp, base_fee, fee_recipient, keyless_setup, chain_id, option::none())
     }
 
     /// `compile`, with a keyless transaction's authorisation verdict supplied
@@ -66,9 +70,10 @@ module sena::compiler {
         base_fee: u128,
         fee_recipient: vector<u8>,
         keyless_setup: u8,
+        chain_id: u64,
         verdict: bool,
     ): (bool, vector<Instruction>) {
-        compile_inner(tx_bytes, timestamp, base_fee, fee_recipient, keyless_setup, option::some(verdict))
+        compile_inner(tx_bytes, timestamp, base_fee, fee_recipient, keyless_setup, chain_id, option::some(verdict))
     }
 
     /// Whether the bytes decode to a keyless transaction.
@@ -79,7 +84,7 @@ module sena::compiler {
 
     /// The payload's instructions (`compile_payload`), or `(false, _)` for a
     /// payload the node refuses to compile.
-    fun compile_payload(p: &Payload, sender: vector<u8>): (bool, vector<Instruction>) {
+    fun compile_payload(p: &Payload, sender: vector<u8>, chain_id: u64): (bool, vector<Instruction>) {
         let none = vector::empty<Instruction>();
         let out = vector::empty<Instruction>();
         if (txcodec::is_transfer(p)) {
@@ -87,10 +92,22 @@ module sena::compiler {
             if (to == sender) { return (false, none) };
             vector::push_back(&mut out, osp::debit(sender, txcodec::asset(p), txcodec::amount(p)));
             vector::push_back(&mut out, osp::credit(to, txcodec::asset(p), txcodec::amount(p)));
-        } else if (txcodec::is_bind(p)) {
-            vector::push_back(&mut out, osp::bind_identifier(txcodec::identifier(p), sender));
-        } else if (txcodec::is_unbind(p)) {
-            vector::push_back(&mut out, osp::unbind_identifier(txcodec::identifier(p), sender));
+        } else if (txcodec::is_register_attestation(p)) {
+            // Stateless, so checked here, as the sender's own signature is: the
+            // issuer's Ed25519 key is its address.
+            let issuer = txcodec::issuer(p);
+            if (!keyless::verify_ed25519_strict(
+                &issuer,
+                &txcodec::attestation_signature(p),
+                &txcodec::attestation_digest(p, chain_id),
+            )) { return (false, none) };
+            vector::push_back(&mut out, osp::set_attestation(
+                txcodec::identifier(p), issuer, txcodec::account(p), txcodec::issued_on(p)
+            ));
+        } else if (txcodec::is_revoke_attestation(p)) {
+            vector::push_back(&mut out, osp::revoke_attestation(
+                txcodec::identifier(p), txcodec::issuer(p), sender
+            ));
         } else if (txcodec::is_distribute_fees(p)) {
             // `compile_distribution`: check the split, take the amount from
             // the vault, pay each beneficiary its share; the rest is burned.
@@ -124,7 +141,7 @@ module sena::compiler {
             };
             vector::push_back(&mut out, osp::verify_council(
                 txcodec::epoch(p),
-                txcodec::governance_digest(p),
+                txcodec::governance_digest(p, chain_id),
                 txcodec::signer_indices(p),
                 txcodec::signatures(p),
                 txcodec::is_disable_gas_asset(p),
@@ -176,17 +193,19 @@ module sena::compiler {
         base_fee: u128,
         fee_recipient: vector<u8>,
         keyless_setup: u8,
+        chain_id: u64,
         keyless_verdict: option::Option<bool>,
     ): (bool, vector<Instruction>) {
         let none = vector::empty<Instruction>();
         let decoded = txcodec::decode(tx_bytes);
         if (option::is_none(&decoded)) { return (false, none) };
         let tx = option::extract(&mut decoded);
+        if (txcodec::chain_id(&tx) != chain_id) { return (false, none) };
 
         if (!authenticate(&tx, timestamp, keyless_setup, keyless_verdict)) { return (false, none) };
 
         let sender = txcodec::sender(&tx);
-        let (payload_ok, payload) = compile_payload(txcodec::payload(&tx), sender);
+        let (payload_ok, payload) = compile_payload(txcodec::payload(&tx), sender, chain_id);
         if (!payload_ok) { return (false, none) };
         let (gas_ok, used) = gas_used(&tx, &payload);
         if (!gas_ok) { return (false, none) };

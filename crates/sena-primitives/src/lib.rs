@@ -45,6 +45,6 @@ pub mod serde_hex;
 
 pub use address::{AssetId, L2Address};
 pub use codec::{DecodeError, Reader, Writer};
-pub use encoding::{domain, CanonicalEncoder};
+pub use encoding::{chain_id, domain, CanonicalEncoder};
 pub use hash::{Hash256, HashParseError};
 pub use identity::{Channel, HashedIdentifier, NetworkSalt};

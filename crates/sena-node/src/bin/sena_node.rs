@@ -338,6 +338,7 @@ fn genesis(data_dir: &str, dev: bool, fund: &[String]) -> Result<(), String> {
 
     println!("genesis written to {}/genesis.json", data_dir);
     println!("  chain            {}", config.chain_id);
+    println!("  chain id         {}", config.transaction_chain_id());
     println!("  challenge window {}s", config.challenge_window_secs);
     println!("  allocations      {}", config.allocations.len());
     println!("  state root       {root}");
@@ -375,6 +376,7 @@ fn serve(
                 PartyId(1),
                 config.minimum_bond,
                 keyless.clone(),
+                config.transaction_chain_id(),
                 &batches,
                 state.root(),
             )?
@@ -390,13 +392,17 @@ fn serve(
             Sequencer::new(state, chain, PartyId(1), config.minimum_bond)
         }
     };
-    let mut sequencer = sequencer.with_keyless(keyless).with_fee_assets(
-        config
-            .gas_assets
-            .iter()
-            .map(|a| sena_primitives::AssetId(a.asset))
-            .collect(),
-    );
+    let mut sequencer = sequencer
+        .with_keyless(keyless)
+        .with_chain_id(config.transaction_chain_id())
+        .with_network_salt(config.network_salt.as_bytes().to_vec())
+        .with_fee_assets(
+            config
+                .gas_assets
+                .iter()
+                .map(|a| sena_primitives::AssetId(a.asset))
+                .collect(),
+        );
     if let Some(account) = fee_recipient {
         let account =
             L2Address::from_hex(account.trim()).map_err(|e| format!("bad --fee-recipient: {e}"))?;
@@ -526,6 +532,7 @@ fn watch(
         keyless_setup: sena_stf::KeylessConfig::l1_setup_id(keyless.as_deref()),
         keyless,
         keyless_steps_per_tx: keyless_steps_per_tx.max(1),
+        chain_id: config.transaction_chain_id(),
     };
     let mut watcher = sena_node::Watcher::new(aptos.client(), watcher_config, genesis)
         .map_err(|e| e.to_string())?;
@@ -622,8 +629,15 @@ fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
     // them. All three are checked in the trace, so a wrong quote is refused
     // rather than honoured.
     let quote = gas_quote(rpc, fee_asset)?;
+    // The chain the node serves: the transaction signs it, so it cannot be
+    // replayed on another SENA network.
+    let info = call(rpc, &serde_json::json!({ "method": "sena_getChainInfo" }))?;
+    let chain_id = info["transaction_chain_id"]
+        .as_u64()
+        .ok_or_else(|| format!("the node did not report its chain id: {info}"))?;
 
     let mut tx = sena_stf::Transaction {
+        chain_id,
         sender: L2Address::from_bytes(key.verifying_key().to_bytes()),
         nonce,
         fee_asset: sena_primitives::AssetId(fee_asset),

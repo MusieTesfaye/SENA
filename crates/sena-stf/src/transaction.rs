@@ -3,9 +3,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use sena_primitives::serde_hex::{bytes_32, bytes_64, u128_string};
 use sena_primitives::Writer;
-use sena_primitives::{
-    domain, AssetId, CanonicalEncoder, Channel, Hash256, HashedIdentifier, L2Address,
-};
+use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address};
 use serde::{Deserialize, Serialize};
 
 use crate::gas::FeeSplit;
@@ -26,18 +24,32 @@ pub enum Payload {
         #[serde(with = "u128_string")]
         amount: u128,
     },
-    /// Bind a human-readable identifier to the sender's address (REQ-SOCIAL-001).
-    BindIdentifier {
-        /// Which kind of channel the identifier belongs to.
-        channel: Channel,
-        /// The identifier, already hashed client-side so the plain text never
-        /// reaches the node (REQ-SOCIAL-003).
+    /// Record an issuer's signed attestation that `identifier` belongs to
+    /// `account` (REQ-SOCIAL-001, Celo's `registerAttestation`). Anyone may
+    /// submit it; the issuer's signature over
+    /// [`attestation_digest`](crate::social::attestation_digest) is what
+    /// counts, and a transaction carrying a bad one does not compile.
+    RegisterAttestation {
+        /// The identifier, hashed client-side so the plain text never reaches
+        /// the node (REQ-SOCIAL-003).
         identifier: HashedIdentifier,
+        /// The issuer: an Ed25519 public key, which is its address.
+        issuer: L2Address,
+        /// The account the identifier belongs to.
+        account: L2Address,
+        /// When the issuer attested it; later than any attestation it replaces.
+        issued_on: u64,
+        /// The issuer's signature.
+        #[serde(with = "bytes_64")]
+        signature: [u8; 64],
     },
-    /// Release an identifier the sender currently holds.
-    UnbindIdentifier {
-        /// The identifier to release.
+    /// Revoke an issuer's attestation for `identifier`. The sender must be the
+    /// issuer or the attested account (Celo's `revokeAttestation`).
+    RevokeAttestation {
+        /// The hashed identifier.
         identifier: HashedIdentifier,
+        /// The issuer whose attestation it is.
+        issuer: L2Address,
     },
     /// Apply a council-authorised governance change (REQ-GOV-003).
     ///
@@ -89,6 +101,10 @@ pub enum Authenticator {
 /// A transaction as submitted to the sequencer.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Transaction {
+    /// The chain the transaction is for ([`sena_primitives::chain_id`] of the
+    /// chain's name). Signed over, so a transaction signed for one SENA network
+    /// is refused on every other (EIP-155, Aptos's `chain_id`).
+    pub chain_id: u64,
     /// The account the transaction acts on behalf of.
     pub sender: L2Address,
     /// The sender's expected nonce. Must equal the account's current nonce.
@@ -158,6 +174,7 @@ impl Transaction {
         let payload = self.payload.encode();
         Hash256::commit(
             CanonicalEncoder::new(domain::TRANSACTION)
+                .u64(self.chain_id)
                 .field(self.sender.as_bytes())
                 .u64(self.nonce)
                 .u64(u64::from(self.fee_asset.get()))

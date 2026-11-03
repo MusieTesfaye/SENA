@@ -66,24 +66,33 @@ pub enum Instruction {
         /// Amount to add.
         amount: u128,
     },
-    /// Bind a hashed identifier to an address (REQ-SOCIAL-001).
-    BindIdentifier {
-        /// The identifier being bound.
+    /// Record an issuer's attestation that `identifier` belongs to `account`
+    /// (REQ-SOCIAL-001, REQ-SOCIAL-005). The issuer's signature was checked when
+    /// the transaction compiled; the step checks that `issued_on` is later than
+    /// whatever the slot holds, so an older attestation cannot be replayed.
+    SetAttestation {
+        /// The hashed identifier.
         identifier: HashedIdentifier,
-        /// The address it will resolve to.
-        address: L2Address,
+        /// The issuer that attested it.
+        issuer: L2Address,
+        /// The account it belongs to.
+        account: L2Address,
+        /// When the issuer attested it.
+        issued_on: u64,
     },
-    /// Release a binding, leaving a vacant marker.
+    /// Revoke a standing attestation, keeping it marked revoked.
     ///
     /// The entry is overwritten rather than removed. Removal can require
     /// collapsing a trie branch, whose shape a Merkle proof does not describe,
     /// which would put it out of reach of the L1 one-step verifier. Keeping the
     /// trie structurally append-only means every step is a replace or an insert.
-    UnbindIdentifier {
-        /// The identifier being released.
+    RevokeAttestation {
+        /// The hashed identifier.
         identifier: HashedIdentifier,
-        /// The address that must currently hold it.
-        expected_owner: L2Address,
+        /// The issuer whose attestation it is.
+        issuer: L2Address,
+        /// Who revokes it: the issuer or the attested account.
+        by: L2Address,
     },
     /// Check that `asset` is enabled for fees at exactly `rate` and
     /// `intrinsic_gas` (REQ-GAS-005).
@@ -243,6 +252,9 @@ impl Instruction {
     /// Panics on more than `u32::MAX` council signatures, which the wire limits
     /// rule out.
     #[must_use]
+    // One arm per instruction, each a few writes; splitting it would only hide
+    // the layout Move mirrors.
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = sena_primitives::Writer::new();
         match self {
@@ -269,21 +281,27 @@ impl Instruction {
                     .u32(asset.get())
                     .u128(*amount);
             }
-            Self::BindIdentifier {
+            Self::SetAttestation {
                 identifier,
-                address,
+                issuer,
+                account,
+                issued_on,
             } => {
                 w.u8(3)
                     .bytes32(identifier.as_hash().as_bytes())
-                    .bytes32(address.as_bytes());
+                    .bytes32(issuer.as_bytes())
+                    .bytes32(account.as_bytes())
+                    .u64(*issued_on);
             }
-            Self::UnbindIdentifier {
+            Self::RevokeAttestation {
                 identifier,
-                expected_owner,
+                issuer,
+                by,
             } => {
                 w.u8(4)
                     .bytes32(identifier.as_hash().as_bytes())
-                    .bytes32(expected_owner.as_bytes());
+                    .bytes32(issuer.as_bytes())
+                    .bytes32(by.as_bytes());
             }
             Self::VerifyGasAsset {
                 asset,
@@ -367,9 +385,12 @@ impl Instruction {
             Self::ConsumeNonce { account, .. }
             | Self::Debit { account, .. }
             | Self::Credit { account, .. } => keys::account(account),
-            Self::BindIdentifier { identifier, .. } | Self::UnbindIdentifier { identifier, .. } => {
-                keys::social_by_identifier(identifier)
+            Self::SetAttestation {
+                identifier, issuer, ..
             }
+            | Self::RevokeAttestation {
+                identifier, issuer, ..
+            } => keys::attestation(identifier, issuer),
             Self::VerifyGasAsset { asset, .. } | Self::DisableGasAsset { asset } => {
                 keys::asset(asset.get())
             }

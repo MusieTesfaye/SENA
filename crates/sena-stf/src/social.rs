@@ -1,86 +1,112 @@
-//! The Social Connect identity index (REQ-SOCIAL-001).
+//! Federated attestations: who an identifier belongs to, according to whom
+//! (REQ-SOCIAL-001, REQ-SOCIAL-005).
+//!
+//! SENA follows Celo's `SocialConnect`. An *issuer* — any account that verifies
+//! ownership of a phone number, email address or handle, for instance by
+//! sending a code to it — signs an attestation that an identifier belongs to an
+//! account. Anyone may submit the signed attestation; the chain checks the
+//! issuer's signature and records it under the identifier and the issuer.
+//! Nothing is first come, first served: an identifier has no owner on chain
+//! except as some issuer attests, and a lookup names the issuers it trusts
+//! (Celo's `lookupAttestations(identifier, trustedIssuers)`).
+//!
+//! Identifiers are hashed client-side ([`HashedIdentifier`]); the chain never
+//! sees the plain text (REQ-SOCIAL-003). An account may hold attestations for
+//! any number of identifiers, from any number of issuers.
+//!
+//! Replay: a registration must carry a later `issued_on` than the record it
+//! replaces, so a signed attestation — including one since revoked — cannot be
+//! resubmitted to undo a later change. Revocation keeps the record, marked
+//! revoked, for the same reason.
 
-use sena_primitives::{DecodeError, L2Address, Reader, Writer};
+use sena_primitives::{
+    domain, CanonicalEncoder, DecodeError, Hash256, HashedIdentifier, L2Address, Reader, Writer,
+};
 use serde::{Deserialize, Serialize};
 
-/// Discriminant for a bound identifier.
-const TAG_BOUND: u8 = 0;
-/// Discriminant for a released identifier.
-const TAG_VACANT: u8 = 1;
+/// Discriminant for a standing attestation.
+const TAG_ACTIVE: u8 = 0;
+/// Discriminant for a revoked attestation.
+const TAG_REVOKED: u8 = 1;
 
-/// What a hashed identifier currently resolves to.
-///
-/// [`Self::Vacant`] is stored rather than the entry being removed. See
-/// [`crate::Instruction::UnbindIdentifier`] for why the trie is kept
-/// structurally append-only.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub enum SocialBinding {
-    /// The identifier resolves to this address.
-    Bound {
-        /// The address that holds the identifier.
-        address: L2Address,
-    },
-    /// The identifier was previously bound and has been released.
-    Vacant,
+/// An issuer's attestation, as state holds it under (identifier, issuer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Attestation {
+    /// The account the identifier belongs to.
+    pub account: L2Address,
+    /// When the issuer attested it (Unix seconds, as the issuer signed it).
+    pub issued_on: u64,
+    /// Whether the issuer or the account has since revoked it.
+    pub revoked: bool,
 }
 
-impl SocialBinding {
-    /// Returns the bound address, if any.
-    #[must_use]
-    pub const fn address(&self) -> Option<L2Address> {
-        match self {
-            Self::Bound { address } => Some(*address),
-            Self::Vacant => None,
-        }
-    }
-
-    /// Encodes the binding for storage.
-    ///
-    /// A one-byte discriminant followed by the address, if any. Canonical
-    /// binary rather than JSON so that `sena::osp` can decode it in Move.
+impl Attestation {
+    /// Encodes the record for storage: a one-byte discriminant, the account
+    /// and `issued_on`. Canonical binary so that `sena::osp` decodes it in Move.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        match self {
-            Self::Bound { address } => {
-                w.u8(TAG_BOUND);
-                w.bytes32(address.as_bytes());
-            }
-            Self::Vacant => {
-                w.u8(TAG_VACANT);
-            }
-        }
+        w.u8(if self.revoked {
+            TAG_REVOKED
+        } else {
+            TAG_ACTIVE
+        })
+        .bytes32(self.account.as_bytes())
+        .u64(self.issued_on);
         w.finish()
     }
 
-    /// Decodes a stored binding.
+    /// Decodes a stored record.
     ///
     /// # Errors
     ///
-    /// Returns [`MalformedBinding`] if the bytes are not a canonical binding.
-    pub fn decode(bytes: &[u8]) -> Result<Self, MalformedBinding> {
-        Self::decode_inner(bytes).map_err(|_| MalformedBinding)
+    /// Returns [`MalformedAttestation`] unless the bytes are canonical.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MalformedAttestation> {
+        Self::decode_inner(bytes).map_err(|_| MalformedAttestation)
     }
 
     fn decode_inner(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(bytes);
-        let binding = match r.u8()? {
-            TAG_BOUND => Self::Bound {
-                address: L2Address::from_bytes(r.bytes32()?),
-            },
-            TAG_VACANT => Self::Vacant,
+        let revoked = match r.u8()? {
+            TAG_ACTIVE => false,
+            TAG_REVOKED => true,
             other => return Err(DecodeError::UnknownVariant(other)),
         };
+        let account = L2Address::from_bytes(r.bytes32()?);
+        let issued_on = r.u64()?;
         r.finish()?;
-        Ok(binding)
+        Ok(Self {
+            account,
+            issued_on,
+            revoked,
+        })
     }
 }
 
-/// The stored bytes were not a valid [`SocialBinding`].
+/// What an issuer signs to attest that `identifier` belongs to `account` on
+/// the chain `chain_id`. The issuer's address is its Ed25519 public key.
+#[must_use]
+pub fn attestation_digest(
+    chain_id: u64,
+    identifier: &HashedIdentifier,
+    issuer: &L2Address,
+    account: &L2Address,
+    issued_on: u64,
+) -> Hash256 {
+    Hash256::commit(
+        CanonicalEncoder::new(domain::ATTESTATION)
+            .u64(chain_id)
+            .field(identifier.as_hash().as_bytes())
+            .field(issuer.as_bytes())
+            .field(account.as_bytes())
+            .u64(issued_on),
+    )
+}
+
+/// The stored bytes were not a valid [`Attestation`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
-#[error("stored social binding is malformed")]
-pub struct MalformedBinding;
+#[error("stored attestation is malformed")]
+pub struct MalformedAttestation;
 
 #[cfg(test)]
 mod tests {
@@ -88,18 +114,29 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let bound = SocialBinding::Bound {
-            address: L2Address::from_bytes([1; 32]),
-        };
-        assert_eq!(SocialBinding::decode(&bound.encode()).unwrap(), bound);
-        assert_eq!(
-            SocialBinding::decode(&SocialBinding::Vacant.encode()).unwrap(),
-            SocialBinding::Vacant
-        );
+        for revoked in [false, true] {
+            let a = Attestation {
+                account: L2Address::from_bytes([1; 32]),
+                issued_on: 1_700_000_000,
+                revoked,
+            };
+            assert_eq!(Attestation::decode(&a.encode()).unwrap(), a);
+        }
+        assert!(Attestation::decode(&[2; 41]).is_err());
     }
 
     #[test]
-    fn vacant_resolves_to_nothing() {
-        assert_eq!(SocialBinding::Vacant.address(), None);
+    fn the_digest_binds_every_field() {
+        let id = HashedIdentifier(Hash256([3; 32]));
+        let a = L2Address::from_bytes([4; 32]);
+        let b = L2Address::from_bytes([5; 32]);
+        let base = attestation_digest(1, &id, &a, &b, 9);
+        assert_ne!(base, attestation_digest(2, &id, &a, &b, 9), "chain");
+        assert_ne!(
+            base,
+            attestation_digest(1, &id, &b, &a, 9),
+            "issuer and account"
+        );
+        assert_ne!(base, attestation_digest(1, &id, &a, &b, 10), "issued_on");
     }
 }

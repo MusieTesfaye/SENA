@@ -248,6 +248,13 @@ impl GenesisConfig {
         }
     }
 
+    /// The chain id every transaction, council signature and attestation on
+    /// this network signs: [`sena_primitives::chain_id`] of [`Self::chain_id`].
+    #[must_use]
+    pub fn transaction_chain_id(&self) -> u64 {
+        sena_primitives::chain_id(&self.chain_id)
+    }
+
     /// The chain's keyless parameters, or `None` if keyless is disabled.
     ///
     /// # Errors

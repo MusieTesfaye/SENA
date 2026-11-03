@@ -105,6 +105,7 @@ fn transfer(sig: KeylessSignature, signer: &SigningKey) -> Transaction {
 
 fn transfer_from(from: L2Address, sig: KeylessSignature, signer: &SigningKey) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: from,
         nonce: 0,
         fee_asset: USDC,

@@ -16,9 +16,9 @@ use sena_state::MerkleTrie;
 use sena_stf::execute::{genesis_credit, StepWitness};
 use sena_stf::gas::{native_to_asset, DEFAULT_ASSET_INTRINSIC_GAS, DEFAULT_BASE_FEE_FLOOR};
 use sena_stf::{
-    apply, compile, execute_batch, keys, verify_step, Account, Authenticator, BatchContext,
-    BatchError, CompileError, Council, CouncilSignature, GovernanceUpdate, Instruction,
-    MachineState, Payload, SocialBinding, StepError, Transaction, WhitelistedAsset, FEE_VAULT,
+    apply, compile, execute_batch, keys, verify_step, Account, Attestation, Authenticator,
+    BatchContext, BatchError, CompileError, Council, CouncilSignature, GovernanceUpdate,
+    Instruction, MachineState, Payload, StepError, Transaction, WhitelistedAsset, FEE_VAULT,
     RATE_SCALE,
 };
 use sena_stf::{fee_charge, gas_required, GasError};
@@ -61,6 +61,7 @@ fn address_of(key: &SigningKey) -> L2Address {
 /// Builds a signed transaction.
 fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
     let mut tx = with_fees(Transaction {
+        chain_id: 0,
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
@@ -132,7 +133,7 @@ fn council_sign(
     update: &GovernanceUpdate,
     epoch: u64,
 ) -> Vec<CouncilSignature> {
-    let digest = update.signing_digest(epoch);
+    let digest = update.signing_digest(0, epoch);
     keys.iter()
         .map(|(index, key)| CouncilSignature {
             index: *index,
@@ -367,6 +368,7 @@ fn a_key_cannot_spend_from_an_account_it_does_not_own() {
     let theft = resign(
         &thief,
         Transaction {
+            chain_id: 0,
             sender: address_of(&victim),
             ..signed(
                 &thief,
@@ -403,6 +405,7 @@ fn a_small_order_key_is_refused() {
     let mut signature = [0u8; 64];
     signature[0] = 1; // R = identity, S = 0
     let tx = Transaction {
+        chain_id: 0,
         sender: L2Address::from_bytes(identity),
         nonce: 0,
         fee_asset: USDC,
@@ -433,66 +436,123 @@ fn handle(name: &str) -> HashedIdentifier {
     HashedIdentifier::new(Channel::Handle, name, &NetworkSalt::new(*b"test-salt"))
 }
 
+/// An issuer's signed attestation that `id` belongs to `account`, for the test
+/// chain.
+fn attest(
+    issuer: &SigningKey,
+    id: HashedIdentifier,
+    account: L2Address,
+    issued_on: u64,
+) -> Payload {
+    let digest = sena_stf::attestation_digest(
+        sena_stf::TEST_CHAIN_ID,
+        &id,
+        &address_of(issuer),
+        &account,
+        issued_on,
+    );
+    Payload::RegisterAttestation {
+        identifier: id,
+        issuer: address_of(issuer),
+        account,
+        issued_on,
+        signature: issuer.sign(digest.as_bytes()).to_bytes(),
+    }
+}
+
+fn stored_attestation(
+    trie: &MerkleTrie,
+    id: &HashedIdentifier,
+    issuer: &SigningKey,
+) -> Option<Attestation> {
+    trie.get(&keys::attestation(id, &address_of(issuer)))
+        .map(|b| Attestation::decode(b).unwrap())
+}
+
 #[test]
-fn an_identifier_resolves_to_its_owner() {
+fn an_issuers_attestation_is_recorded_whoever_submits_it() {
     let alice = signer(1);
-    let mut trie = funded_trie(&[(address_of(&alice), 50_000)]);
+    let relayer = signer(3);
+    let issuer = signer(7);
+    let mut trie = funded_trie(&[(address_of(&relayer), 90_000)]);
     let id = handle("@alice");
 
-    let tx = signed(
-        &alice,
-        0,
-        Payload::BindIdentifier {
-            channel: Channel::Handle,
-            identifier: id,
-        },
-    );
+    let tx = signed(&relayer, 0, attest(&issuer, id, address_of(&alice), 100));
     execute_batch(&mut trie, &CTX, &[tx]).unwrap();
 
-    let stored = trie
-        .get(&keys::social_by_identifier(&id))
-        .expect("binding should exist");
     assert_eq!(
-        SocialBinding::decode(stored).unwrap().address(),
-        Some(address_of(&alice))
+        stored_attestation(&trie, &id, &issuer),
+        Some(Attestation {
+            account: address_of(&alice),
+            issued_on: 100,
+            revoked: false,
+        })
     );
 }
 
 #[test]
-fn an_identifier_cannot_be_taken_from_its_owner() {
-    let alice = signer(1);
+fn an_attestation_the_issuer_did_not_sign_does_not_compile() {
     let mallory = signer(2);
-    let mut trie = funded_trie(&[(address_of(&alice), 50_000), (address_of(&mallory), 50_000)]);
+    let issuer = signer(7);
     let id = handle("@alice");
+    // Mallory signs it herself but names the issuer.
+    let mut forged = attest(&mallory, id, address_of(&mallory), 100);
+    if let Payload::RegisterAttestation { issuer: named, .. } = &mut forged {
+        *named = address_of(&issuer);
+    }
+    let tx = signed(&mallory, 0, forged);
+    assert!(matches!(
+        compile(&tx, &CTX),
+        Err(CompileError::BadAttestation)
+    ));
 
+    // Signed by the issuer, but for another chain.
+    let digest =
+        sena_stf::attestation_digest(5, &id, &address_of(&issuer), &address_of(&mallory), 100);
+    let other_chain = Payload::RegisterAttestation {
+        identifier: id,
+        issuer: address_of(&issuer),
+        account: address_of(&mallory),
+        issued_on: 100,
+        signature: issuer.sign(digest.as_bytes()).to_bytes(),
+    };
+    assert!(matches!(
+        compile(&signed(&mallory, 0, other_chain), &CTX),
+        Err(CompileError::BadAttestation)
+    ));
+}
+
+#[test]
+fn an_older_attestation_cannot_be_replayed_over_a_newer_one() {
+    let alice = signer(1);
+    let bob = signer(2);
+    let issuer = signer(7);
+    let mut trie = funded_trie(&[(address_of(&alice), 90_000)]);
+    let id = handle("@shared");
+
+    // The issuer moves the identifier from Alice to Bob.
     execute_batch(
         &mut trie,
         &CTX,
-        &[signed(
-            &alice,
-            0,
-            Payload::BindIdentifier {
-                channel: Channel::Handle,
-                identifier: id,
-            },
-        )],
+        &[
+            signed(&alice, 0, attest(&issuer, id, address_of(&alice), 100)),
+            signed(&alice, 1, attest(&issuer, id, address_of(&bob), 200)),
+        ],
     )
     .unwrap();
-
-    let theft = signed(
-        &mallory,
-        0,
-        Payload::BindIdentifier {
-            channel: Channel::Handle,
-            identifier: id,
-        },
+    assert_eq!(
+        stored_attestation(&trie, &id, &issuer).unwrap().account,
+        address_of(&bob)
     );
-    let err = execute_batch(&mut trie, &CTX, &[theft]).unwrap_err();
+
+    // Alice resubmits the first attestation to take it back.
+    let replay = signed(&alice, 2, attest(&issuer, id, address_of(&alice), 100));
+    let err = execute_batch(&mut trie, &CTX, &[replay]).unwrap_err();
     assert!(
         matches!(
             err,
             BatchError::Step {
-                source: StepError::IdentifierTaken,
+                source: StepError::StaleAttestation { .. },
                 ..
             }
         ),
@@ -501,85 +561,102 @@ fn an_identifier_cannot_be_taken_from_its_owner() {
 }
 
 #[test]
-fn releasing_an_identifier_frees_it_for_someone_else() {
-    let alice = signer(1);
-    let bob = signer(2);
-    let mut trie = funded_trie(&[(address_of(&alice), 50_000), (address_of(&bob), 50_000)]);
-    let id = handle("@shared");
-
-    execute_batch(
-        &mut trie,
-        &CTX,
-        &[
-            signed(
-                &alice,
-                0,
-                Payload::BindIdentifier {
-                    channel: Channel::Handle,
-                    identifier: id,
-                },
-            ),
-            signed(&alice, 1, Payload::UnbindIdentifier { identifier: id }),
-            signed(
-                &bob,
-                0,
-                Payload::BindIdentifier {
-                    channel: Channel::Handle,
-                    identifier: id,
-                },
-            ),
-        ],
-    )
-    .unwrap();
-
-    let stored = trie.get(&keys::social_by_identifier(&id)).unwrap();
-    assert_eq!(
-        SocialBinding::decode(stored).unwrap().address(),
-        Some(address_of(&bob))
-    );
-}
-
-#[test]
-fn releasing_an_identifier_you_do_not_hold_fails() {
+fn the_issuer_or_the_account_may_revoke_and_nobody_else() {
     let alice = signer(1);
     let mallory = signer(2);
-    let mut trie = funded_trie(&[(address_of(&alice), 50_000), (address_of(&mallory), 50_000)]);
+    let issuer = signer(7);
+    let mut trie = funded_trie(&[
+        (address_of(&alice), 90_000),
+        (address_of(&mallory), 90_000),
+        (address_of(&issuer), 90_000),
+    ]);
     let id = handle("@alice");
-
+    let revoke = Payload::RevokeAttestation {
+        identifier: id,
+        issuer: address_of(&issuer),
+    };
     execute_batch(
         &mut trie,
         &CTX,
         &[signed(
             &alice,
             0,
-            Payload::BindIdentifier {
-                channel: Channel::Handle,
-                identifier: id,
-            },
+            attest(&issuer, id, address_of(&alice), 100),
         )],
     )
     .unwrap();
 
+    // A failed batch is discarded whole, so each refusal runs on a copy.
     let err = execute_batch(
-        &mut trie,
+        &mut trie.clone(),
         &CTX,
-        &[signed(
-            &mallory,
-            0,
-            Payload::UnbindIdentifier { identifier: id },
-        )],
+        &[signed(&mallory, 0, revoke.clone())],
     )
     .unwrap_err();
     assert!(
         matches!(
             err,
             BatchError::Step {
-                source: StepError::IdentifierNotHeld,
+                source: StepError::NotAttestationParty,
                 ..
             }
         ),
         "got {err:?}"
     );
+
+    // The account revokes; revoking again finds nothing standing.
+    execute_batch(&mut trie, &CTX, &[signed(&alice, 1, revoke.clone())]).unwrap();
+    assert!(stored_attestation(&trie, &id, &issuer).unwrap().revoked);
+    let err = execute_batch(&mut trie.clone(), &CTX, &[signed(&issuer, 0, revoke)]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BatchError::Step {
+                source: StepError::NoAttestation,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+
+    // A revoked attestation is not replayable; a newer one restores it.
+    let replay = signed(&alice, 2, attest(&issuer, id, address_of(&alice), 100));
+    assert!(execute_batch(&mut trie.clone(), &CTX, &[replay]).is_err());
+    execute_batch(
+        &mut trie,
+        &CTX,
+        &[signed(
+            &alice,
+            2,
+            attest(&issuer, id, address_of(&alice), 300),
+        )],
+    )
+    .unwrap();
+    assert!(!stored_attestation(&trie, &id, &issuer).unwrap().revoked);
+}
+
+#[test]
+fn a_transaction_for_another_chain_does_not_compile() {
+    let alice = signer(1);
+    let mut tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    // Re-signed for chain 5: valid there, refused here.
+    tx.chain_id = 5;
+    let tx = resign(&alice, tx);
+    assert!(matches!(
+        compile(&tx, &CTX),
+        Err(CompileError::WrongChain {
+            transaction: 5,
+            chain: 0
+        })
+    ));
 }
 
 // --- The trace ---------------------------------------------------------------
@@ -626,10 +703,7 @@ fn determinism_the_same_batch_yields_the_same_root() {
         signed(
             &alice,
             1,
-            Payload::BindIdentifier {
-                channel: Channel::Handle,
-                identifier: handle("@a"),
-            },
+            attest(&signer(7), handle("@a"), address_of(&alice), 1),
         ),
     ];
 
@@ -674,10 +748,7 @@ fn l1_verification_agrees_with_node_execution() {
         signed(
             &bob,
             0,
-            Payload::BindIdentifier {
-                channel: Channel::Handle,
-                identifier: handle("@bob"),
-            },
+            attest(&signer(7), handle("@bob"), address_of(&bob), 1),
         ),
         signed(
             &bob,

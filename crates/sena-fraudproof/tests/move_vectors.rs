@@ -124,6 +124,7 @@ fn sign_ed25519(k: &SigningKey, mut tx: Transaction) -> Transaction {
 
 fn base(sender: L2Address, nonce: u64, payload: Payload) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender,
         nonce,
         fee_asset: USDC,
@@ -184,7 +185,7 @@ fn council_members() -> [SigningKey; 2] {
 }
 
 fn governance(epoch: u64, update: GovernanceUpdate) -> Transaction {
-    let digest = update.signing_digest(epoch);
+    let digest = update.signing_digest(0, epoch);
     let signatures = council_members()
         .iter()
         .enumerate()
@@ -282,6 +283,7 @@ fn devnet_ctx(config: &KeylessConfig) -> BatchContext<'_> {
         keyless: Some(config),
         base_fee: BASE_FEE,
         fee_recipient: sequencer(),
+        chain_id: sena_stf::TEST_CHAIN_ID,
     }
 }
 
@@ -435,6 +437,7 @@ fn generate() -> String {
             },
             base_fee,
             fee_recipient: sequencer(),
+            chain_id: sena_stf::TEST_CHAIN_ID,
         }
     };
 
@@ -778,7 +781,7 @@ fn generate() -> String {
     ));
     let disable = GovernanceUpdate::DisableGasAsset { asset: USDC };
     let one = council_members()[1]
-        .sign(disable.signing_digest(0).as_bytes())
+        .sign(disable.signing_digest(0, 0).as_bytes())
         .to_bytes();
     cases.push(CompileCase::at(
         "guardian_disable",
@@ -791,37 +794,84 @@ fn generate() -> String {
             }],
         ),
     ));
-    let identifier =
-        HashedIdentifier::new(Channel::Handle, "@alice", &NetworkSalt::new(*b"vectors"));
-    cases.push(CompileCase {
-        name: "bind_identifier",
-        bytes: sign_ed25519(
+    let identifier = HashedIdentifier::new(
+        Channel::Email,
+        "alice@example.com",
+        &NetworkSalt::new(*b"vectors"),
+    );
+    // An issuer attests Alice's email; anyone (here Bob's key) submits it.
+    let issuer = key(7);
+    let attest = |chain_id: u64, signer: &SigningKey| {
+        let digest = sena_stf::attestation_digest(
+            chain_id,
+            &identifier,
+            &addr(&issuer),
+            &addr(&alice),
+            1_000,
+        );
+        Payload::RegisterAttestation {
+            identifier,
+            issuer: addr(&issuer),
+            account: addr(&alice),
+            issued_on: 1_000,
+            signature: signer.sign(digest.as_bytes()).to_bytes(),
+        }
+    };
+    let submitter = key(2);
+    cases.push(CompileCase::at(
+        "register_attestation",
+        &sign_ed25519(
+            &submitter,
+            base(
+                addr(&submitter),
+                0,
+                attest(sena_stf::TEST_CHAIN_ID, &issuer),
+            ),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "register_attestation_forged",
+        &sign_ed25519(
+            &submitter,
+            base(
+                addr(&submitter),
+                0,
+                attest(sena_stf::TEST_CHAIN_ID, &key(8)),
+            ),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "register_attestation_other_chain",
+        &sign_ed25519(&submitter, base(addr(&submitter), 0, attest(5, &issuer))),
+    ));
+    cases.push(CompileCase::at(
+        "revoke_attestation",
+        &sign_ed25519(
             &alice,
             base(
                 addr(&alice),
-                0,
-                Payload::BindIdentifier {
-                    channel: Channel::Handle,
+                1,
+                Payload::RevokeAttestation {
                     identifier,
+                    issuer: addr(&issuer),
                 },
             ),
-        )
-        .encode(),
-        timestamp: TIMESTAMP,
-        setup: SETUP_DEVNET,
-        base_fee: BASE_FEE,
-    });
-    cases.push(CompileCase {
-        name: "unbind_identifier",
-        bytes: sign_ed25519(
-            &alice,
-            base(addr(&alice), 1, Payload::UnbindIdentifier { identifier }),
-        )
-        .encode(),
-        timestamp: TIMESTAMP,
-        setup: SETUP_DEVNET,
-        base_fee: BASE_FEE,
-    });
+        ),
+    ));
+    let mut other_chain = base(
+        addr(&alice),
+        0,
+        Payload::Transfer {
+            to: bob,
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    other_chain.chain_id = 5;
+    cases.push(CompileCase::at(
+        "transfer_for_another_chain",
+        &sign_ed25519(&alice, other_chain),
+    ));
     let sample = aptos_sample::signature();
     cases.push(CompileCase {
         name: "governance_set_jwk",
@@ -1042,7 +1092,7 @@ fn emit_transitions(m: &mut Module, split: &FeeSplit) {
         .encode()
     };
     let disable = GovernanceUpdate::DisableGasAsset { asset: USDC };
-    let digest = disable.signing_digest(4);
+    let digest = disable.signing_digest(0, 4);
     let one = vec![CouncilSignature {
         index: 0,
         signature: council_members()[0].sign(digest.as_bytes()).to_bytes(),
@@ -1052,6 +1102,28 @@ fn emit_transitions(m: &mut Module, split: &FeeSplit) {
         digest,
         signatures: one.clone(),
         guardian,
+    };
+    let attested = HashedIdentifier(sena_primitives::Hash256([0x5a; 32]));
+    let issuer = L2Address::from_bytes([0x11; 32]);
+    let account = L2Address::from_bytes([0x22; 32]);
+    let set_attestation = |issued_on| Instruction::SetAttestation {
+        identifier: attested,
+        issuer,
+        account,
+        issued_on,
+    };
+    let revoke_attestation = |by| Instruction::RevokeAttestation {
+        identifier: attested,
+        issuer,
+        by,
+    };
+    let attestation = |issued_on, revoked| {
+        sena_stf::Attestation {
+            account,
+            issued_on,
+            revoked,
+        }
+        .encode()
     };
     let cases = vec![
         TransitionCase {
@@ -1217,6 +1289,51 @@ fn emit_transitions(m: &mut Module, split: &FeeSplit) {
             name: "one_signature_for_council",
             instruction: guardian(false),
             current: Some(council(1)),
+        },
+        TransitionCase {
+            name: "set_attestation_fresh",
+            instruction: set_attestation(100),
+            current: None,
+        },
+        TransitionCase {
+            name: "set_attestation_later",
+            instruction: set_attestation(101),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "set_attestation_replayed",
+            instruction: set_attestation(100),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "set_attestation_over_revoked",
+            instruction: set_attestation(100),
+            current: Some(attestation(101, true)),
+        },
+        TransitionCase {
+            name: "revoke_by_issuer",
+            instruction: revoke_attestation(issuer),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "revoke_by_account",
+            instruction: revoke_attestation(account),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "revoke_by_stranger",
+            instruction: revoke_attestation(L2Address::from_bytes([0x77; 32])),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "revoke_nothing",
+            instruction: revoke_attestation(issuer),
+            current: None,
+        },
+        TransitionCase {
+            name: "revoke_revoked",
+            instruction: revoke_attestation(issuer),
+            current: Some(attestation(100, true)),
         },
     ];
     m.u64("transition_case_count", cases.len() as u64);

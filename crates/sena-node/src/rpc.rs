@@ -15,7 +15,7 @@
 
 use sena_primitives::serde_hex::{balances, u128_string};
 use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address};
-use sena_stf::{gas, keys, Account, SocialBinding, Transaction, WhitelistedAsset};
+use sena_stf::{gas, keys, Account, Attestation, Transaction, WhitelistedAsset};
 use serde::{Deserialize, Serialize};
 
 use sena_fraudproof::{AssertionId, Status};
@@ -35,11 +35,16 @@ pub enum Request {
         /// The account to read.
         address: L2Address,
     },
-    /// Resolve a hashed social identifier to an address (REQ-SOCIAL-004).
-    #[serde(rename = "sena_resolveIdentifier")]
-    ResolveIdentifier {
-        /// The hashed identifier to resolve.
+    /// What the issuers the caller trusts attest about a hashed identifier
+    /// (REQ-SOCIAL-004; Celo's `lookupAttestations`). Revoked attestations
+    /// are left out. Trust is the caller's choice: the chain records what any
+    /// issuer signs, and an issuer the caller does not name does not count.
+    #[serde(rename = "sena_lookupAttestations")]
+    LookupAttestations {
+        /// The hashed identifier.
         identifier: HashedIdentifier,
+        /// The issuers whose attestations to return, at most 16.
+        trusted_issuers: Vec<L2Address>,
     },
     /// Report a transaction's confirmation status.
     #[serde(rename = "sena_getConfirmation")]
@@ -130,6 +135,20 @@ pub enum Request {
     },
 }
 
+/// The most issuers one `sena_lookupAttestations` call may name.
+pub const MAX_TRUSTED_ISSUERS: usize = 16;
+
+/// An issuer's standing attestation, as `sena_lookupAttestations` reports it.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct IssuedAttestation {
+    /// The issuer.
+    pub issuer: L2Address,
+    /// The account the identifier belongs to, according to the issuer.
+    pub account: L2Address,
+    /// When the issuer attested it.
+    pub issued_on: u64,
+}
+
 /// A whitelisted fee asset, as state holds it.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct FeeAsset {
@@ -184,10 +203,11 @@ pub enum Response {
         #[serde(with = "balances")]
         balances: Vec<(u32, u128)>,
     },
-    /// An identifier resolution.
-    Resolved {
-        /// The address, or `None` if the identifier is unbound or released.
-        address: Option<L2Address>,
+    /// The standing attestations for an identifier, one per trusted issuer
+    /// that has one, in the order the issuers were named.
+    Attestations {
+        /// The attestations.
+        attestations: Vec<IssuedAttestation>,
     },
     /// A transaction's confirmation status.
     Confirmation(Confirmation),
@@ -284,6 +304,10 @@ pub enum Response {
         state_root: Hash256,
         /// How many transactions are waiting.
         mempool_size: usize,
+        /// The chain id transactions must carry (`chain_id` above, hashed).
+        transaction_chain_id: u64,
+        /// The salt identifiers are hashed under, hex.
+        network_salt: String,
     },
     /// Everything the L1 bridge needs to release custody.
     ///
@@ -538,6 +562,34 @@ fn gas_price(sequencer: &Sequencer, asset: AssetId) -> Response {
     }
 }
 
+/// The standing attestations `trusted_issuers` have made for `identifier`.
+fn lookup_attestations(
+    sequencer: &Sequencer,
+    identifier: &HashedIdentifier,
+    trusted_issuers: &[L2Address],
+) -> Response {
+    if trusted_issuers.len() > MAX_TRUSTED_ISSUERS {
+        return Response::Error {
+            message: format!("name at most {MAX_TRUSTED_ISSUERS} trusted issuers"),
+        };
+    }
+    let attestations = trusted_issuers
+        .iter()
+        .filter_map(|issuer| {
+            let bytes = sequencer
+                .state
+                .get(&keys::attestation(identifier, issuer))?;
+            let a = Attestation::decode(bytes).ok().filter(|a| !a.revoked)?;
+            Some(IssuedAttestation {
+                issuer: *issuer,
+                account: a.account,
+                issued_on: a.issued_on,
+            })
+        })
+        .collect();
+    Response::Attestations { attestations }
+}
+
 /// Whether `tx` concerns `address`: sent by it, or a transfer to it.
 fn concerns(tx: &Transaction, address: &L2Address) -> bool {
     tx.sender == *address
@@ -570,7 +622,7 @@ fn account_transactions(
         if out.len() >= limit {
             break;
         }
-        let ctx = block.context(sequencer.keyless().map(AsRef::as_ref));
+        let ctx = block.context(sequencer.keyless().map(AsRef::as_ref), sequencer.chain_id());
         for tx in block.transactions.iter().rev() {
             if out.len() >= limit {
                 break;
@@ -673,14 +725,10 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
             }
         }
 
-        Request::ResolveIdentifier { identifier } => {
-            let address = sequencer
-                .state
-                .get(&keys::social_by_identifier(&identifier))
-                .and_then(|bytes| SocialBinding::decode(bytes).ok())
-                .and_then(|binding| binding.address());
-            Response::Resolved { address }
-        }
+        Request::LookupAttestations {
+            identifier,
+            trusted_issuers,
+        } => lookup_attestations(sequencer, &identifier, &trusted_issuers),
 
         Request::GetConfirmation { hash } => Response::Confirmation(sequencer.confirmation(&hash)),
 
@@ -751,6 +799,8 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
             challenge_window_secs: sequencer.chain.challenge_window(),
             state_root: sequencer.state.root(),
             mempool_size: sequencer.mempool.len(),
+            transaction_chain_id: sequencer.chain_id(),
+            network_salt: hex::encode(sequencer.network_salt()),
         },
     }
 }

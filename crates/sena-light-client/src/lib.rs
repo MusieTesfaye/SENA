@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address};
 use sena_state::{MerkleProof, ProofError, Terminal};
-use sena_stf::{keys, Account, BalanceError, SocialBinding};
+use sena_stf::{keys, Account, Attestation, BalanceError};
 use serde::{Deserialize, Serialize};
 
 /// The trust level of a verified state root.
@@ -203,15 +203,18 @@ impl LightClient {
         })
     }
 
-    /// Verifies a human-readable social identifier binding against a trusted root.
+    /// Verifies what an issuer attests about a hashed identifier, against a
+    /// trusted root: `expected` is the attestation the slot must hold, or
+    /// `None` if the issuer must have attested nothing for it.
     ///
     /// # Errors
     ///
     /// Returns [`LightClientError`] if the root is untrusted or the proof does not match.
-    pub fn verify_social_binding(
+    pub fn verify_attestation(
         &self,
         identifier: &HashedIdentifier,
-        expected_address: Option<&L2Address>,
+        issuer: &L2Address,
+        expected: Option<&Attestation>,
         proof: &MerkleProof,
         state_root: &Hash256,
     ) -> Result<TrustLevel, LightClientError> {
@@ -219,22 +222,12 @@ impl LightClient {
             .trust_level_of(state_root)
             .ok_or(LightClientError::UntrustedRoot(*state_root))?;
 
-        let slot = keys::social_by_identifier(identifier);
-
-        match expected_address {
-            Some(address) => {
-                let binding = SocialBinding::Bound { address: *address };
-                let encoded = binding.encode();
-                proof.verify_inclusion(state_root, &slot, &encoded)?;
+        let slot = keys::attestation(identifier, issuer);
+        match expected {
+            Some(attestation) => {
+                proof.verify_inclusion(state_root, &slot, &attestation.encode())?;
             }
-            None => {
-                // If expected to be unassigned, it either does not exist (non-inclusion)
-                // or holds a Vacant tombstone.
-                if proof.verify_non_inclusion(state_root, &slot).is_err() {
-                    let vacant = SocialBinding::Vacant;
-                    proof.verify_inclusion(state_root, &slot, &vacant.encode())?;
-                }
-            }
+            None => proof.verify_non_inclusion(state_root, &slot)?,
         }
 
         Ok(trust_level)

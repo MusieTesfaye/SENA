@@ -108,14 +108,19 @@ module sena::disputes {
         /// Fixed here, once: a verification key that could be changed under a
         /// live chain would let whoever changed it decide keyless disputes.
         keyless_setup: u8,
+        /// The chain id L2 transactions carry (`sena_primitives::chain_id` of
+        /// the genesis chain name). Fixed here, once, as the keyless setup is:
+        /// a transaction signed for another SENA network does not compile.
+        chain_id: u64,
     }
 
     /// Creates the dispute registry.
     ///
     /// `keyless_setup` must name the same parameter set as the L2 genesis
-    /// (`keyless.setup`), or L1 would judge honest keyless transactions
+    /// (`keyless.setup`), and `chain_id` the same chain (the node reports it
+    /// as `transaction_chain_id`), or L1 would judge honest transactions
     /// invalid.
-    public entry fun initialize(admin: &signer, chain: address, keyless_setup: u8) {
+    public entry fun initialize(admin: &signer, chain: address, keyless_setup: u8, chain_id: u64) {
         assert!(!exists<Registry>(signer::address_of(admin)), E_ALREADY_INITIALIZED);
         keyless::assert_known_setup(keyless_setup);
         keyless_jobs::create(admin);
@@ -123,6 +128,7 @@ module sena::disputes {
             disputes: table::new<vector<u8>, Dispute>(),
             chain,
             keyless_setup,
+            chain_id,
         });
     }
 
@@ -420,18 +426,19 @@ module sena::disputes {
         tx_bytes: vector<u8>,
         batch_time: u64,
         keyless_setup: u8,
-    ): (bool, vector<osp::Instruction>) {
+    ): (bool, vector<osp::Instruction>) acquires Registry {
         // The rest of the batch header the transaction compiles against.
         let (base_fee, fee_recipient) = assertions::fee_header(chain_addr, assertion);
+        let chain_id = borrow_global<Registry>(registry_addr).chain_id;
         if (!compiler::is_keyless(tx_bytes)) {
-            return compiler::compile(tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup)
+            return compiler::compile(tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id)
         };
         let (done, verdict) = keyless_jobs::verdict(
             registry_addr, keyless_jobs::job_id(tx_bytes, batch_time, keyless_setup)
         );
         assert!(done, E_KEYLESS_NOT_VERIFIED);
         compiler::compile_with_keyless_verdict(
-            tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, verdict
+            tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id, verdict
         )
     }
 
@@ -456,7 +463,7 @@ module sena::disputes {
         start_pc: u64,
         tx_bytes: vector<u8>,
         siblings: &vector<vector<u8>>,
-    ): (bool, u64) {
+    ): (bool, u64) acquires Registry {
         assert!(batch::proves(tx_root, tx_count, index, start_pc, tx_bytes, siblings), E_BAD_LEAF);
         let (ok, program) = compile_leaf(
             registry_addr, chain_addr, assertion, tx_bytes, batch_time, keyless_setup
@@ -622,6 +629,11 @@ module sena::disputes {
         };
         let d = table::borrow(&registry.disputes, id);
         (true, d.stage, d.turn, d.lo, d.hi, d.has_offer, d.offered, d.deadline)
+    }
+
+    #[view]
+    public fun chain_id(registry_addr: address): u64 acquires Registry {
+        borrow_global<Registry>(registry_addr).chain_id
     }
 
     #[view]

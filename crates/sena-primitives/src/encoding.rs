@@ -34,6 +34,35 @@ pub mod domain {
     pub const MACHINE_STATE: &[u8] = b"SENA:v1:machine-state";
     /// The signing preimage of a transaction.
     pub const TRANSACTION: &[u8] = b"SENA:v1:transaction";
+    /// Derivation of a chain id from a chain's name.
+    pub const CHAIN: &[u8] = b"SENA:v1:chain";
+    /// What an issuer signs to attest an identifier's owner (REQ-SOCIAL-005).
+    pub const ATTESTATION: &[u8] = b"SENA:v1:attestation";
+}
+
+/// The chain id a network with this name uses: the first six bytes of a
+/// domain-separated hash of the name, big endian.
+///
+/// Every transaction, council signature and attestation signs it, so a
+/// signature made for one network is refused on any other, including a later
+/// network reusing the same accounts (Ethereum's EIP-155, Aptos's `chain_id`).
+///
+/// Six bytes, not eight, so the id stays below 2^53 and travels exactly as a
+/// JSON number: a JavaScript wallet that read it rounded would sign for a
+/// chain that does not exist.
+///
+/// ```
+/// use sena_primitives::chain_id;
+/// assert_ne!(chain_id("sena-devnet-1"), chain_id("sena-devnet-2"));
+/// assert!(chain_id("sena-devnet-1") < 1 << 53);
+/// ```
+#[must_use]
+pub fn chain_id(name: &str) -> u64 {
+    let digest =
+        crate::Hash256::commit(CanonicalEncoder::new(domain::CHAIN).field(name.as_bytes()));
+    let mut id = [0u8; 8];
+    id[2..].copy_from_slice(&digest.as_bytes()[..6]);
+    u64::from_be_bytes(id)
 }
 
 /// Accumulates length-prefixed fields into an unambiguous byte string.

@@ -479,6 +479,7 @@ mod tests {
         );
 
         let tx = Transaction {
+            chain_id: 0,
             sender: L2Address::from_bytes([0; 32]),
             nonce: 0,
             fee_asset: sena_primitives::AssetId(1),

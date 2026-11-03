@@ -62,6 +62,8 @@ pub struct VerifierNode {
     /// verifier without them would judge honest keyless blocks unexecutable
     /// and challenge them, and lose.
     keyless: Option<Arc<KeylessConfig>>,
+    /// The chain id transactions must carry; the verifier's own, from genesis.
+    chain_id: u64,
 }
 
 impl VerifierNode {
@@ -78,7 +80,15 @@ impl VerifierNode {
             identity,
             last_trace: None,
             keyless,
+            chain_id: sena_stf::TEST_CHAIN_ID,
         }
+    }
+
+    /// Verifies the chain `chain_id`, refusing transactions signed for others.
+    #[must_use]
+    pub const fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
     }
 
     /// Re-executes a published block and compares it against the assertion.
@@ -90,7 +100,7 @@ impl VerifierNode {
         let pre_state = self.state.clone();
         let mut next = self.state.clone();
 
-        let ctx = block.context(self.keyless.as_deref());
+        let ctx = block.context(self.keyless.as_deref(), self.chain_id);
         let trace = match execute_batch(&mut next, &ctx, &block.transactions) {
             Ok(trace) => trace,
             Err(BatchError::Compile { index, source }) => {

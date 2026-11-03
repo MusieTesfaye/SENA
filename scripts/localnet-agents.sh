@@ -43,8 +43,11 @@ echo "package published"
 # An L2 account to transact with, funded at genesis.
 read -r SECRET ALICE < <("$NODE" keygen | awk '/^secret/{s=$2} /^address/{a=$2} END{print s, a}')
 BOB=$("$NODE" keygen | awk '/^address/{print $2}')
-GENESIS_ROOT=$("$NODE" genesis --data-dir data --fund "$ALICE:1000000000" | awk '/^  state root/{print $3; exit}')
-echo "genesis root $GENESIS_ROOT"
+GENESIS_OUT=$("$NODE" genesis --data-dir data --fund "$ALICE:1000000000")
+GENESIS_ROOT=$(awk '/^  state root/{print $3; exit}' <<<"$GENESIS_OUT")
+# Transactions sign the chain id; L1 refuses any for another chain.
+CHAIN_ID=$(awk '/^  chain id/{print $3; exit}' <<<"$GENESIS_OUT")
+echo "genesis root $GENESIS_ROOT, chain id $CHAIN_ID"
 
 run() {
   local fn="$1"; shift
@@ -53,7 +56,7 @@ run() {
 }
 run assertions::initialize "hex:0x${GENESIS_ROOT#0x}" u64:86400 "u128:$BOND" address:0xa \
   "address:$PROPOSER" u64:3600
-run disputes::initialize "address:$PROPOSER" u8:0
+run disputes::initialize "address:$PROPOSER" u8:0 "u64:$CHAIN_ID"
 echo "contracts initialised"
 
 "$NODE" run --data-dir data --listen "127.0.0.1:$PORT" --block-interval 1 --run-for 120 >node.log 2>&1 &

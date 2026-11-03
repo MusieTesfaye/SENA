@@ -16,7 +16,7 @@ use sena_primitives::{
     Writer,
 };
 use sena_state::{MerkleTrie, Node};
-use sena_stf::{keys, Account, MachineState, SocialBinding, WhitelistedAsset};
+use sena_stf::{keys, Account, Attestation, MachineState, WhitelistedAsset};
 
 /// Prints a vector so it can be copied into the Move tests.
 fn vector(name: &str, bytes: &[u8]) -> String {
@@ -95,7 +95,13 @@ fn state_key_vectors() {
     );
 
     // Regions must stay disjoint across languages too.
-    assert_ne!(keys::account(&address), keys::social_by_address(&address));
+    assert_ne!(
+        keys::account(&address),
+        keys::attestation(
+            &sena_primitives::HashedIdentifier(Hash256(*address.as_bytes())),
+            &address
+        )
+    );
 }
 
 #[test]
@@ -123,18 +129,24 @@ fn account_encoding_vectors() {
 }
 
 #[test]
-fn social_binding_vectors() {
-    println!("\n-- social bindings --");
-    let bound = SocialBinding::Bound {
-        address: L2Address::from_bytes([0x01; 32]),
+fn attestation_vectors() {
+    println!("\n-- attestations --");
+    let active = Attestation {
+        account: L2Address::from_bytes([0x01; 32]),
+        issued_on: 7,
+        revoked: false,
     };
     assert_eq!(
-        vector("binding{bound 0x01..}", &bound.encode()),
-        format!("00{}", "01".repeat(32))
+        vector("attestation{active 0x01.. at 7}", &active.encode()),
+        format!("00{}0000000000000007", "01".repeat(32))
     );
+    let revoked = Attestation {
+        revoked: true,
+        ..active
+    };
     assert_eq!(
-        vector("binding{vacant}", &SocialBinding::Vacant.encode()),
-        "01"
+        vector("attestation{revoked}", &revoked.encode()),
+        format!("01{}0000000000000007", "01".repeat(32))
     );
 }
 

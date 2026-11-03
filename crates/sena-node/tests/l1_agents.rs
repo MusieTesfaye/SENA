@@ -492,6 +492,7 @@ fn address_of(key: &SigningKey) -> L2Address {
 
 fn transfer(from: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: address_of(from),
         nonce,
         fee_asset: USDC,
@@ -595,6 +596,7 @@ impl World {
             keyless: None,
             keyless_setup: 0,
             keyless_steps_per_tx: 12,
+            chain_id: sena_stf::TEST_CHAIN_ID,
         };
         Watcher::new(self.l1(CHALLENGER), config, self.genesis.clone()).unwrap()
     }
@@ -806,6 +808,7 @@ fn a_watcher_refuses_a_chain_with_another_genesis() {
         keyless: None,
         keyless_setup: 0,
         keyless_steps_per_tx: 12,
+        chain_id: sena_stf::TEST_CHAIN_ID,
     };
     let other = MerkleTrie::new();
     assert!(matches!(

@@ -21,7 +21,7 @@ use crate::gas::{self, FeeMarket, FeeSplit, GasError, WhitelistedAsset};
 use crate::governance::{self, Council, GovernanceError, GovernanceUpdate};
 use crate::instruction::{Instruction, MachineState};
 use crate::keyless::{KeylessConfig, KeylessContext};
-use crate::social::SocialBinding;
+use crate::social::{attestation_digest, Attestation};
 use crate::transaction::{AuthError, Authenticator, Payload, Transaction};
 
 /// The system-controlled vault that collects fees (REQ-GAS-007).
@@ -30,6 +30,10 @@ use crate::transaction::{AuthError, Authenticator, Payload, Transaction};
 /// and no signing key maps to it, so the fees it accumulates can only be moved
 /// by a protocol rule, never by whoever holds a private key.
 pub const FEE_VAULT: L2Address = L2Address::from_bytes([0xFE; 32]);
+
+/// The chain id of [`BatchContext::without_keyless`], for tests and tools that
+/// run without a configured network.
+pub const TEST_CHAIN_ID: u64 = 0;
 
 /// Why a single step failed.
 ///
@@ -52,12 +56,21 @@ pub enum StepError {
     /// Stored bytes could not be decoded as the expected type.
     #[error("state slot holds malformed data")]
     MalformedSlot,
-    /// The identifier is already bound to a different address.
-    #[error("identifier is already bound to another address")]
-    IdentifierTaken,
-    /// The identifier is not bound to the address trying to release it.
-    #[error("identifier is not held by the address attempting to release it")]
-    IdentifierNotHeld,
+    /// An attestation is no later than the one the slot already holds: it is
+    /// an old attestation being replayed, or a duplicate.
+    #[error("attestation issued at {issued_on} is not later than the standing one, issued at {standing}")]
+    StaleAttestation {
+        /// When the submitted attestation was issued.
+        issued_on: u64,
+        /// When the one in the slot was issued.
+        standing: u64,
+    },
+    /// There is no standing attestation to revoke.
+    #[error("no standing attestation to revoke")]
+    NoAttestation,
+    /// Only the issuer or the attested account may revoke an attestation.
+    #[error("only the issuer or the attested account may revoke an attestation")]
+    NotAttestationParty,
     /// The witness did not describe the slot the instruction touches.
     #[error("witness is for slot {provided}, but the instruction touches {expected}")]
     WitnessSlotMismatch {
@@ -173,30 +186,41 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             account.credit(*asset, *amount)?;
             Ok(account.encode())
         }
-        Instruction::BindIdentifier { address, .. } => {
-            match current {
-                None => {}
-                Some(bytes) => match SocialBinding::decode(bytes) {
-                    Err(_) => return Err(StepError::MalformedSlot),
-                    Ok(SocialBinding::Vacant) => {}
-                    Ok(SocialBinding::Bound { address: holder }) => {
-                        // Re-binding to the same address is idempotent; binding
-                        // over someone else's identifier is not permitted.
-                        if holder != *address {
-                            return Err(StepError::IdentifierTaken);
-                        }
-                    }
-                },
+        Instruction::SetAttestation {
+            account, issued_on, ..
+        } => {
+            if let Some(bytes) = current {
+                let standing = Attestation::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+                // Revoked or not: only a later attestation replaces it, so a
+                // signed attestation cannot be replayed to undo a change.
+                if *issued_on <= standing.issued_on {
+                    return Err(StepError::StaleAttestation {
+                        issued_on: *issued_on,
+                        standing: standing.issued_on,
+                    });
+                }
             }
-            Ok(SocialBinding::Bound { address: *address }.encode())
+            Ok(Attestation {
+                account: *account,
+                issued_on: *issued_on,
+                revoked: false,
+            }
+            .encode())
         }
-        Instruction::UnbindIdentifier { expected_owner, .. } => {
-            let bytes = current.ok_or(StepError::IdentifierNotHeld)?;
-            let binding = SocialBinding::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
-            match binding.address() {
-                Some(holder) if holder == *expected_owner => Ok(SocialBinding::Vacant.encode()),
-                _ => Err(StepError::IdentifierNotHeld),
+        Instruction::RevokeAttestation { issuer, by, .. } => {
+            let bytes = current.ok_or(StepError::NoAttestation)?;
+            let standing = Attestation::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+            if standing.revoked {
+                return Err(StepError::NoAttestation);
             }
+            if by != issuer && *by != standing.account {
+                return Err(StepError::NotAttestationParty);
+            }
+            Ok(Attestation {
+                revoked: true,
+                ..standing
+            }
+            .encode())
         }
         Instruction::VerifyGasAsset { .. }
         | Instruction::ChargeBaseFee { .. }
@@ -484,6 +508,17 @@ pub enum CompileError {
     /// The transaction exceeds the wire-format limits L1 can adjudicate.
     #[error("transaction exceeds wire limits: {0}")]
     Wire(#[from] crate::wire::WireError),
+    /// The transaction was signed for another chain.
+    #[error("transaction is for chain {transaction}, this is chain {chain}")]
+    WrongChain {
+        /// The chain the transaction names.
+        transaction: u64,
+        /// This chain.
+        chain: u64,
+    },
+    /// An attestation's issuer signature does not verify.
+    #[error("the issuer's signature on the attestation does not verify")]
+    BadAttestation,
 }
 
 /// What a batch is executed against, besides state.
@@ -505,11 +540,14 @@ pub struct BatchContext<'a> {
     pub base_fee: u128,
     /// Where tips go: the sequencer's account (Ethereum's coinbase).
     pub fee_recipient: L2Address,
+    /// This chain's id ([`sena_primitives::chain_id`] of its name). Fixed at
+    /// genesis, and on L1 when the contracts are initialised.
+    pub chain_id: u64,
 }
 
 impl BatchContext<'_> {
-    /// A context with keyless accounts disabled, the genesis base fee, and
-    /// tips paid to the fee vault.
+    /// A context with keyless accounts disabled, the genesis base fee, tips
+    /// paid to the fee vault, and chain id [`TEST_CHAIN_ID`].
     #[must_use]
     pub const fn without_keyless(timestamp: u64) -> Self {
         BatchContext {
@@ -517,6 +555,7 @@ impl BatchContext<'_> {
             keyless: None,
             base_fee: gas::DEFAULT_BASE_FEE_FLOOR,
             fee_recipient: FEE_VAULT,
+            chain_id: TEST_CHAIN_ID,
         }
     }
 
@@ -568,6 +607,12 @@ pub fn compile(
         if signatures.len() > crate::wire::MAX_COUNCIL_SIGNATURES {
             return Err(crate::wire::WireError::TooManySignatures.into());
         }
+    }
+    if transaction.chain_id != ctx.chain_id {
+        return Err(CompileError::WrongChain {
+            transaction: transaction.chain_id,
+            chain: ctx.chain_id,
+        });
     }
     transaction.authenticate(&ctx.keyless_context())?;
 
@@ -632,7 +677,12 @@ pub fn compile(
 /// Returns [`CompileError`] if the payload does not compile.
 pub fn gas_required(transaction: &Transaction) -> Result<u64, CompileError> {
     let mut payload = Vec::new();
-    compile_payload(&transaction.payload, transaction.sender, &mut payload)?;
+    compile_payload(
+        &transaction.payload,
+        transaction.sender,
+        transaction.chain_id,
+        &mut payload,
+    )?;
     Ok(gas::gas_used(transaction, &payload)?)
 }
 
@@ -655,7 +705,12 @@ fn charge_and_payload(
     ctx: &BatchContext<'_>,
 ) -> Result<(gas::FeeCharge, Vec<Instruction>), CompileError> {
     let mut payload = Vec::new();
-    compile_payload(&transaction.payload, transaction.sender, &mut payload)?;
+    compile_payload(
+        &transaction.payload,
+        transaction.sender,
+        transaction.chain_id,
+        &mut payload,
+    )?;
     let charge = gas::settle(
         transaction.gas_limit,
         gas::gas_used(transaction, &payload)?,
@@ -672,6 +727,7 @@ fn charge_and_payload(
 fn compile_payload(
     payload: &Payload,
     sender: L2Address,
+    chain_id: u64,
     instructions: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     match payload {
@@ -690,16 +746,29 @@ fn compile_payload(
                 amount: *amount,
             });
         }
-        Payload::BindIdentifier { identifier, .. } => {
-            instructions.push(Instruction::BindIdentifier {
+        Payload::RegisterAttestation {
+            identifier,
+            issuer,
+            account,
+            issued_on,
+            signature,
+        } => {
+            // Stateless, so checked here, as the sender's own signature is.
+            let digest = attestation_digest(chain_id, identifier, issuer, account, *issued_on);
+            crate::transaction::verify_ed25519_strict(issuer.as_bytes(), signature, &digest)
+                .map_err(|_| CompileError::BadAttestation)?;
+            instructions.push(Instruction::SetAttestation {
                 identifier: *identifier,
-                address: sender,
+                issuer: *issuer,
+                account: *account,
+                issued_on: *issued_on,
             });
         }
-        Payload::UnbindIdentifier { identifier } => {
-            instructions.push(Instruction::UnbindIdentifier {
+        Payload::RevokeAttestation { identifier, issuer } => {
+            instructions.push(Instruction::RevokeAttestation {
                 identifier: *identifier,
-                expected_owner: sender,
+                issuer: *issuer,
+                by: sender,
             });
         }
         Payload::Governance {
@@ -710,7 +779,7 @@ fn compile_payload(
             update.check_permitted()?;
             instructions.push(Instruction::VerifyCouncil {
                 epoch: *epoch,
-                digest: update.signing_digest(*epoch),
+                digest: update.signing_digest(chain_id, *epoch),
                 signatures: signatures.clone(),
                 guardian: update.guardian_may_apply(),
             });

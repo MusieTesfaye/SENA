@@ -40,6 +40,7 @@ fn address_of(key: &SigningKey) -> L2Address {
 
 fn signed(key: &SigningKey, nonce: u64, to: L2Address, amount: u128) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
@@ -422,6 +423,7 @@ fn a_node_resumes_from_disk_with_the_same_state() {
         PartyId(1),
         config.minimum_bond,
         None,
+        sena_stf::TEST_CHAIN_ID,
         &batches,
         state.root(),
     )

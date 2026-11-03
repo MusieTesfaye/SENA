@@ -5,7 +5,7 @@ use sena_light_client::{
 };
 use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
-use sena_stf::{keys, Account, SocialBinding};
+use sena_stf::{keys, Account, Attestation};
 
 const USDC: AssetId = AssetId(1);
 const USDT: AssetId = AssetId(2);
@@ -163,34 +163,55 @@ fn verifies_unfunded_account_non_inclusion() {
 }
 
 #[test]
-fn verifies_social_identifier_resolution() {
+fn verifies_an_issuers_attestation() {
     let mut trie = MerkleTrie::new();
     let alice = test_address(0x11);
+    let issuer = test_address(0x22);
+    let other_issuer = test_address(0x33);
     let salt = NetworkSalt::new(b"test_salt".to_vec());
     let handle = HashedIdentifier::new(Channel::Handle, "alice_web3", &salt);
 
-    let slot = keys::social_by_identifier(&handle);
-    let binding = SocialBinding::Bound { address: alice };
-    trie.insert(slot, binding.encode());
+    let slot = keys::attestation(&handle, &issuer);
+    let attestation = Attestation {
+        account: alice,
+        issued_on: 1_700_000_000,
+        revoked: false,
+    };
+    trie.insert(slot, attestation.encode());
 
     let state_root = trie.root();
     let proof = trie.prove(&slot);
-
     let client = LightClient::new("sena-testnet", state_root);
 
-    // Legitimate resolution verifies
+    // The issuer's attestation verifies.
     assert_eq!(
         client
-            .verify_social_binding(&handle, Some(&alice), &proof, &state_root)
+            .verify_attestation(&handle, &issuer, Some(&attestation), &proof, &state_root)
             .unwrap(),
         TrustLevel::Finalized
     );
 
-    // Tampered address fails
-    let eve = test_address(0xee);
+    // Claiming it names someone else, or is revoked, fails.
+    let eve = Attestation {
+        account: test_address(0xee),
+        ..attestation
+    };
     assert!(client
-        .verify_social_binding(&handle, Some(&eve), &proof, &state_root)
+        .verify_attestation(&handle, &issuer, Some(&eve), &proof, &state_root)
         .is_err());
+    let revoked = Attestation {
+        revoked: true,
+        ..attestation
+    };
+    assert!(client
+        .verify_attestation(&handle, &issuer, Some(&revoked), &proof, &state_root)
+        .is_err());
+
+    // Another issuer has attested nothing, and that is provable too.
+    let none = trie.prove(&keys::attestation(&handle, &other_issuer));
+    assert!(client
+        .verify_attestation(&handle, &other_issuer, None, &none, &state_root)
+        .is_ok());
 }
 
 #[test]

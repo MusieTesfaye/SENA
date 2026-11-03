@@ -24,8 +24,8 @@ module sena::txcodec {
     const AUTH_KEYLESS: u8 = 1;
 
     const PAYLOAD_TRANSFER: u8 = 0;
-    const PAYLOAD_BIND_IDENTIFIER: u8 = 1;
-    const PAYLOAD_UNBIND_IDENTIFIER: u8 = 2;
+    const PAYLOAD_REGISTER_ATTESTATION: u8 = 1;
+    const PAYLOAD_REVOKE_ATTESTATION: u8 = 2;
     const PAYLOAD_GOVERNANCE: u8 = 3;
     const PAYLOAD_DISTRIBUTE_FEES: u8 = 4;
 
@@ -41,9 +41,12 @@ module sena::txcodec {
 
     const DOMAIN_TRANSACTION: vector<u8> = b"SENA:v1:transaction";
     const DOMAIN_GOVERNANCE_UPDATE: vector<u8> = b"SENA:v1:governance-update";
+    const DOMAIN_ATTESTATION: vector<u8> = b"SENA:v1:attestation";
 
     /// A decoded transaction.
     struct Tx has copy, drop {
+        /// The chain the transaction is for (`Transaction::chain_id`).
+        chain_id: u64,
         sender: vector<u8>,
         nonce: u64,
         fee_asset: u32,
@@ -69,8 +72,14 @@ module sena::txcodec {
         to: vector<u8>,
         asset: u32,
         amount: u128,
-        channel: u8,
         identifier: vector<u8>,
+        /// RegisterAttestation/RevokeAttestation: the issuer.
+        issuer: vector<u8>,
+        /// RegisterAttestation: the attested account, when, and the issuer's
+        /// signature.
+        account: vector<u8>,
+        issued_on: u64,
+        attestation_signature: vector<u8>,
         epoch: u64,
         /// The governance update's canonical bytes, which the council signs.
         update_bytes: vector<u8>,
@@ -172,8 +181,11 @@ module sena::txcodec {
             to: vector::empty(),
             asset: 0,
             amount: 0,
-            channel: 0,
             identifier: vector::empty(),
+            issuer: vector::empty(),
+            account: vector::empty(),
+            issued_on: 0,
+            attestation_signature: vector::empty(),
             epoch: 0,
             update_bytes: vector::empty(),
             update_kind: 0,
@@ -250,12 +262,15 @@ module sena::txcodec {
             p.to = take_bytes(&mut c, 32);
             p.asset = take_u32(&mut c);
             p.amount = take_u128(&mut c);
-        } else if (kind == PAYLOAD_BIND_IDENTIFIER) {
-            p.channel = take_u8(&mut c);
-            if (p.channel > 2) { return option::none() };
+        } else if (kind == PAYLOAD_REGISTER_ATTESTATION) {
             p.identifier = take_bytes(&mut c, 32);
-        } else if (kind == PAYLOAD_UNBIND_IDENTIFIER) {
+            p.issuer = take_bytes(&mut c, 32);
+            p.account = take_bytes(&mut c, 32);
+            p.issued_on = take_u64(&mut c);
+            p.attestation_signature = take_bytes(&mut c, 64);
+        } else if (kind == PAYLOAD_REVOKE_ATTESTATION) {
             p.identifier = take_bytes(&mut c, 32);
+            p.issuer = take_bytes(&mut c, 32);
         } else if (kind == PAYLOAD_GOVERNANCE) {
             p.epoch = take_u64(&mut c);
             p.update_bytes = take_field(&mut c);
@@ -287,6 +302,7 @@ module sena::txcodec {
         let encoded_len = vector::length(&bytes);
         if (encoded_len > MAX_TRANSACTION_BYTES) { return option::none() };
         let c = cursor(bytes);
+        let chain_id = take_u64(&mut c);
         let sender = take_bytes(&mut c, 32);
         let nonce = take_u64(&mut c);
         let fee_asset = take_u32(&mut c);
@@ -328,6 +344,7 @@ module sena::txcodec {
         if (!done(&c)) { return option::none() };
 
         option::some(Tx {
+            chain_id,
             sender,
             nonce,
             fee_asset,
@@ -349,6 +366,7 @@ module sena::txcodec {
     /// The digest every authenticator signs (`Transaction::signing_digest`).
     public fun signing_digest(tx: &Tx): vector<u8> {
         let buf = codec::begin(DOMAIN_TRANSACTION);
+        codec::put_field_u64(&mut buf, tx.chain_id);
         codec::put_field(&mut buf, tx.sender);
         codec::put_field_u64(&mut buf, tx.nonce);
         codec::put_field_u64(&mut buf, (tx.fee_asset as u64));
@@ -361,17 +379,31 @@ module sena::txcodec {
         codec::commit(buf)
     }
 
-    /// The digest the council signs for a governance payload
-    /// (`GovernanceUpdate::signing_digest`).
-    public fun governance_digest(p: &Payload): vector<u8> {
+    /// The digest the council signs for a governance payload on the chain
+    /// `chain_id` (`GovernanceUpdate::signing_digest`).
+    public fun governance_digest(p: &Payload, chain_id: u64): vector<u8> {
         let buf = codec::begin(DOMAIN_GOVERNANCE_UPDATE);
+        codec::put_field_u64(&mut buf, chain_id);
         codec::put_field_u64(&mut buf, p.epoch);
         codec::put_field(&mut buf, p.update_bytes);
         codec::commit(buf)
     }
 
+    /// The digest an issuer signs for a registered attestation on the chain
+    /// `chain_id` (`social::attestation_digest`).
+    public fun attestation_digest(p: &Payload, chain_id: u64): vector<u8> {
+        let buf = codec::begin(DOMAIN_ATTESTATION);
+        codec::put_field_u64(&mut buf, chain_id);
+        codec::put_field(&mut buf, p.identifier);
+        codec::put_field(&mut buf, p.issuer);
+        codec::put_field(&mut buf, p.account);
+        codec::put_field_u64(&mut buf, p.issued_on);
+        codec::commit(buf)
+    }
+
     // --- Accessors -----------------------------------------------------------
 
+    public fun chain_id(tx: &Tx): u64 { tx.chain_id }
     public fun sender(tx: &Tx): vector<u8> { tx.sender }
     public fun nonce(tx: &Tx): u64 { tx.nonce }
     public fun fee_asset(tx: &Tx): u32 { tx.fee_asset }
@@ -389,14 +421,18 @@ module sena::txcodec {
 
     public fun kind(p: &Payload): u8 { p.kind }
     public fun is_transfer(p: &Payload): bool { p.kind == PAYLOAD_TRANSFER }
-    public fun is_bind(p: &Payload): bool { p.kind == PAYLOAD_BIND_IDENTIFIER }
-    public fun is_unbind(p: &Payload): bool { p.kind == PAYLOAD_UNBIND_IDENTIFIER }
+    public fun is_register_attestation(p: &Payload): bool { p.kind == PAYLOAD_REGISTER_ATTESTATION }
+    public fun is_revoke_attestation(p: &Payload): bool { p.kind == PAYLOAD_REVOKE_ATTESTATION }
     public fun is_governance(p: &Payload): bool { p.kind == PAYLOAD_GOVERNANCE }
     public fun is_distribute_fees(p: &Payload): bool { p.kind == PAYLOAD_DISTRIBUTE_FEES }
     public fun to(p: &Payload): vector<u8> { p.to }
     public fun asset(p: &Payload): u32 { p.asset }
     public fun amount(p: &Payload): u128 { p.amount }
     public fun identifier(p: &Payload): vector<u8> { p.identifier }
+    public fun issuer(p: &Payload): vector<u8> { p.issuer }
+    public fun account(p: &Payload): vector<u8> { p.account }
+    public fun issued_on(p: &Payload): u64 { p.issued_on }
+    public fun attestation_signature(p: &Payload): vector<u8> { p.attestation_signature }
     public fun epoch(p: &Payload): u64 { p.epoch }
     public fun update_kind(p: &Payload): u8 { p.update_kind }
     public fun is_set_gas_asset(p: &Payload): bool { p.update_kind == UPDATE_SET_GAS_ASSET }

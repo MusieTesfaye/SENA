@@ -29,6 +29,7 @@ fn address_of(key: &SigningKey) -> L2Address {
 
 fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: address_of(key),
         nonce,
         fee_asset: USDC,
@@ -563,45 +564,124 @@ fn rpc_reports_an_unknown_account_as_empty_rather_than_failing() {
     assert!(matches!(response, Response::Account { nonce: 0, .. }));
 }
 
-#[test]
-fn rpc_resolves_a_social_identifier() {
-    let alice = signer(1);
-    let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
-    let id = HashedIdentifier::new(Channel::Handle, "@alice", &NetworkSalt::new(*b"test-salt"));
+/// Alice's email, hashed under the test salt.
+fn alices_email() -> HashedIdentifier {
+    HashedIdentifier::new(
+        Channel::Email,
+        "alice@example.com",
+        &NetworkSalt::new(*b"test-salt"),
+    )
+}
 
-    seq.submit(signed(
-        &alice,
-        0,
-        Payload::BindIdentifier {
-            channel: Channel::Handle,
-            identifier: id,
-        },
-    ))
-    .unwrap();
-    seq.produce(100).unwrap().unwrap();
+/// An issuer's signed attestation that `id` belongs to `account`.
+fn attestation_by(
+    issuer: &SigningKey,
+    id: HashedIdentifier,
+    account: L2Address,
+    issued_on: u64,
+) -> Payload {
+    let digest = sena_stf::attestation_digest(
+        sena_stf::TEST_CHAIN_ID,
+        &id,
+        &address_of(issuer),
+        &account,
+        issued_on,
+    );
+    Payload::RegisterAttestation {
+        identifier: id,
+        issuer: address_of(issuer),
+        account,
+        issued_on,
+        signature: issuer.sign(digest.as_bytes()).to_bytes(),
+    }
+}
 
+fn lookup(seq: &mut Sequencer, id: HashedIdentifier, issuers: &[L2Address]) -> Vec<L2Address> {
     match handle(
-        &mut seq,
+        seq,
         "sena-test-1",
-        Request::ResolveIdentifier { identifier: id },
+        Request::LookupAttestations {
+            identifier: id,
+            trusted_issuers: issuers.to_vec(),
+        },
     ) {
-        Response::Resolved { address } => assert_eq!(address, Some(address_of(&alice))),
+        Response::Attestations { attestations } => attestations.iter().map(|a| a.account).collect(),
         other => panic!("unexpected response: {other:?}"),
     }
 }
 
 #[test]
-fn rpc_resolves_an_unknown_identifier_to_nothing() {
-    let mut seq = node(genesis(&[]));
-    let id = HashedIdentifier::new(Channel::Handle, "@nobody", &NetworkSalt::new(*b"test-salt"));
+fn an_identifier_resolves_only_through_an_issuer_the_caller_trusts() {
+    let alice = signer(1);
+    let issuer = signer(7);
+    let other_issuer = address_of(&signer(8));
+    let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)]));
+    let id = alices_email();
+
+    // The issuer signed; Alice submits and pays.
+    seq.submit(signed(
+        &alice,
+        0,
+        attestation_by(&issuer, id, address_of(&alice), 100),
+    ))
+    .unwrap();
+    seq.produce(100).unwrap().unwrap();
+
     assert_eq!(
-        handle(
-            &mut seq,
-            "sena-test-1",
-            Request::ResolveIdentifier { identifier: id }
-        ),
-        Response::Resolved { address: None }
+        lookup(&mut seq, id, &[address_of(&issuer)]),
+        vec![address_of(&alice)]
     );
+    assert!(
+        lookup(&mut seq, id, &[other_issuer]).is_empty(),
+        "an untrusted issuer says nothing"
+    );
+
+    // Alice revokes it; it no longer resolves.
+    seq.submit(signed(
+        &alice,
+        1,
+        Payload::RevokeAttestation {
+            identifier: id,
+            issuer: address_of(&issuer),
+        },
+    ))
+    .unwrap();
+    seq.produce(100).unwrap().unwrap();
+    assert!(lookup(&mut seq, id, &[address_of(&issuer)]).is_empty());
+}
+
+#[test]
+fn nobody_can_claim_an_identifier_without_the_issuers_signature() {
+    // The hole first-come binding had: anyone could hash alice@example.com
+    // and point it at themselves.
+    let eve = signer(9);
+    let issuer = signer(7);
+    let mut seq = node(genesis(&[(address_of(&eve), 1_000_000)]));
+    let id = alices_email();
+    // Eve signs the attestation herself, naming the real issuer.
+    let mut forged = attestation_by(&eve, id, address_of(&eve), 100);
+    if let Payload::RegisterAttestation { issuer: named, .. } = &mut forged {
+        *named = address_of(&issuer);
+    }
+    assert!(seq.submit(signed(&eve, 0, forged)).is_err());
+    assert!(lookup(&mut seq, id, &[address_of(&issuer)]).is_empty());
+}
+
+#[test]
+fn a_transaction_for_another_chain_is_refused() {
+    let alice = signer(1);
+    let mut seq = node(genesis(&[(address_of(&alice), 1_000_000)])).with_chain_id(42);
+    // `signed` builds transactions for the test chain, not chain 42.
+    let tx = signed(
+        &alice,
+        0,
+        Payload::Transfer {
+            to: address_of(&signer(2)),
+            asset: USDC,
+            amount: 1,
+        },
+    );
+    assert!(seq.submit(tx).is_err());
 }
 
 #[test]

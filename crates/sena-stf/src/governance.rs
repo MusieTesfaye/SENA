@@ -210,12 +210,14 @@ impl GovernanceUpdate {
     ///
     /// `epoch` must equal the council's current epoch when the payload is
     /// applied, and applying it advances the epoch, so a signed payload can be
-    /// applied exactly once. The update is encoded canonically so the Aptos L1
+    /// applied exactly once. `chain_id` keeps it from being applied on another
+    /// network with the same council. The update is encoded canonically so the Aptos L1
     /// verifier can recompute this digest.
     #[must_use]
-    pub fn signing_digest(&self, epoch: u64) -> Hash256 {
+    pub fn signing_digest(&self, chain_id: u64, epoch: u64) -> Hash256 {
         Hash256::commit(
             CanonicalEncoder::new(GOVERNANCE_UPDATE)
+                .u64(chain_id)
                 .u64(epoch)
                 .field(&self.encode()),
         )
@@ -413,7 +415,7 @@ mod tests {
     fn a_quorum_of_distinct_members_is_accepted() {
         let keys = [member(1), member(2), member(3)];
         let council = council_of(&keys, 2);
-        let digest = update().signing_digest(1);
+        let digest = update().signing_digest(0, 1);
 
         let signatures = vec![sig(0, &keys[0], &digest), sig(2, &keys[2], &digest)];
         assert!(verify_council_signatures(&council, &digest, &signatures, false).is_ok());
@@ -425,7 +427,7 @@ mod tests {
         // the threshold.
         let keys = [member(1), member(2), member(3)];
         let council = council_of(&keys, 2);
-        let digest = update().signing_digest(1);
+        let digest = update().signing_digest(0, 1);
         let signature = keys[0].sign(digest.as_bytes()).to_bytes();
 
         let err = verify_council_signatures(
@@ -451,7 +453,7 @@ mod tests {
     fn too_few_signatures_are_refused() {
         let keys = [member(1), member(2), member(3)];
         let council = council_of(&keys, 3);
-        let digest = update().signing_digest(1);
+        let digest = update().signing_digest(0, 1);
         let signatures = vec![sig(0, &keys[0], &digest)];
 
         assert_eq!(
@@ -467,7 +469,7 @@ mod tests {
     fn a_non_member_signature_is_refused() {
         let keys = [member(1), member(2)];
         let council = council_of(&keys, 1);
-        let digest = update().signing_digest(1);
+        let digest = update().signing_digest(0, 1);
         let outsider = member(99);
 
         // Claim to be member 0 while signing with an unrelated key.
@@ -483,10 +485,10 @@ mod tests {
         // Replay protection: an approved change must not be re-applied later.
         let keys = [member(1)];
         let council = council_of(&keys, 1);
-        let signed_digest = update().signing_digest(1);
+        let signed_digest = update().signing_digest(0, 1);
         let signatures = vec![sig(0, &keys[0], &signed_digest)];
 
-        let later = update().signing_digest(2);
+        let later = update().signing_digest(0, 2);
         assert!(verify_council_signatures(&council, &later, &signatures, false).is_err());
     }
 
@@ -494,7 +496,7 @@ mod tests {
     fn a_signature_for_another_update_is_refused() {
         let keys = [member(1)];
         let council = council_of(&keys, 1);
-        let digest = update().signing_digest(1);
+        let digest = update().signing_digest(0, 1);
         let signatures = vec![sig(0, &keys[0], &digest)];
 
         let different = GovernanceUpdate::SetParameter {
@@ -503,7 +505,7 @@ mod tests {
         };
         assert!(verify_council_signatures(
             &council,
-            &different.signing_digest(1),
+            &different.signing_digest(0, 1),
             &signatures,
             false
         )
@@ -570,7 +572,7 @@ mod tests {
         let disable = GovernanceUpdate::DisableGasAsset {
             asset: sena_primitives::AssetId(1),
         };
-        let digest = disable.signing_digest(0);
+        let digest = disable.signing_digest(0, 0);
         let one = [sig(0, &keys[0], &digest)];
         assert!(disable.guardian_may_apply());
         verify_council_signatures(&council, &digest, &one, true).unwrap();

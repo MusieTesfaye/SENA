@@ -8,8 +8,8 @@
 pub mod keyless;
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use sena_primitives::{AssetId, L2Address};
-use sena_stf::{Authenticator, Payload, Transaction};
+use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address, NetworkSalt};
+use sena_stf::{attestation_digest, Authenticator, Payload, Transaction};
 
 /// What a transfer pays for gas, as a node's `sena_gasPrice` quotes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,8 +26,8 @@ pub struct FeeQuote {
     pub max_priority_fee_per_gas: u128,
 }
 
-/// An unsigned transfer of `amount` of `asset` from `sender` to `to`, paying
-/// its fee as `fee` says, with the gas limit set to exactly what it uses.
+/// An unsigned transaction on the chain `chain_id`, paying its fee as `fee`
+/// says, with the gas limit set to exactly what it uses.
 ///
 /// The authenticator is a placeholder; sign with [`sign_ed25519`] or
 /// [`keyless::sign`], which also sets the gas a keyless signature adds.
@@ -35,15 +35,15 @@ pub struct FeeQuote {
 /// # Errors
 ///
 /// Returns the compile error if the transaction cannot be metered.
-pub fn transfer(
+pub fn unsigned(
+    chain_id: u64,
     sender: L2Address,
     nonce: u64,
-    to: L2Address,
-    asset: AssetId,
-    amount: u128,
+    payload: Payload,
     fee: &FeeQuote,
 ) -> Result<Transaction, sena_stf::CompileError> {
     let mut tx = Transaction {
+        chain_id,
         sender,
         nonce,
         fee_asset: fee.asset,
@@ -52,7 +52,7 @@ pub fn transfer(
         gas_limit: 0,
         max_fee_per_gas: fee.max_fee_per_gas,
         max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
-        payload: Payload::Transfer { to, asset, amount },
+        payload,
         authenticator: Authenticator::Ed25519 {
             public_key: [0; 32],
             signature: [0; 64],
@@ -60,6 +60,54 @@ pub fn transfer(
     };
     tx.gas_limit = sena_stf::gas_required(&tx)?;
     Ok(tx)
+}
+
+/// An unsigned transfer of `amount` of `asset` from `sender` to `to`; see
+/// [`unsigned`].
+///
+/// # Errors
+///
+/// Returns the compile error if the transaction cannot be metered.
+pub fn transfer(
+    chain_id: u64,
+    sender: L2Address,
+    nonce: u64,
+    to: L2Address,
+    asset: AssetId,
+    amount: u128,
+    fee: &FeeQuote,
+) -> Result<Transaction, sena_stf::CompileError> {
+    unsigned(
+        chain_id,
+        sender,
+        nonce,
+        Payload::Transfer { to, asset, amount },
+        fee,
+    )
+}
+
+/// The hashed form of an identifier, as attestations and lookups name it:
+/// normalised, then hashed under the network's salt (REQ-SOCIAL-002).
+#[must_use]
+pub fn hash_identifier(channel: Channel, raw: &str, salt: &[u8]) -> HashedIdentifier {
+    HashedIdentifier::new(channel, raw, &NetworkSalt::new(salt.to_vec()))
+}
+
+/// An issuer's signature attesting that `identifier` belongs to `account` on
+/// the chain `chain_id`, made with the issuer's Ed25519 key.
+#[must_use]
+pub fn sign_attestation(
+    issuer_secret: &[u8; 32],
+    chain_id: u64,
+    identifier: &HashedIdentifier,
+    account: &L2Address,
+    issued_on: u64,
+) -> [u8; 64] {
+    let issuer = ed25519_address(issuer_secret);
+    let digest = attestation_digest(chain_id, identifier, &issuer, account, issued_on);
+    SigningKey::from_bytes(issuer_secret)
+        .sign(digest.as_bytes())
+        .to_bytes()
 }
 
 /// The address an Ed25519 key controls: its public key.
@@ -105,7 +153,7 @@ mod tests {
     fn a_signed_transfer_authenticates_and_is_metered_exactly() {
         let secret = [5; 32];
         let to = L2Address::from_bytes([9; 32]);
-        let tx = transfer(ed25519_address(&secret), 0, to, AssetId(1), 10, &usdc()).unwrap();
+        let tx = transfer(0, ed25519_address(&secret), 0, to, AssetId(1), 10, &usdc()).unwrap();
         assert_eq!(tx.gas_limit, 41_000);
         let tx = sign_ed25519(tx, &secret);
         assert_eq!(tx.sender, ed25519_address(&secret));
@@ -114,5 +162,30 @@ mod tests {
             now: 0,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn an_issuers_attestation_compiles_and_a_forged_one_does_not() {
+        let issuer_secret = [6; 32];
+        let issuer = ed25519_address(&issuer_secret);
+        let alice = ed25519_address(&[5; 32]);
+        let id = hash_identifier(Channel::Email, "Alice@Example.com", b"salt");
+        assert_eq!(
+            id,
+            hash_identifier(Channel::Email, "alice@example.com", b"salt")
+        );
+        let register = |signature| Payload::RegisterAttestation {
+            identifier: id,
+            issuer,
+            account: alice,
+            issued_on: 100,
+            signature,
+        };
+        let signature = sign_attestation(&issuer_secret, 7, &id, &alice, 100);
+        assert!(unsigned(7, alice, 0, register(signature), &usdc()).is_ok());
+        // Signed for another chain, or by someone else, it does not compile.
+        assert!(unsigned(8, alice, 0, register(signature), &usdc()).is_err());
+        let forged = sign_attestation(&[9; 32], 7, &id, &alice, 100);
+        assert!(unsigned(7, alice, 0, register(forged), &usdc()).is_err());
     }
 }

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use sena_primitives::{domain, AssetId, CanonicalEncoder, Hash256, L2Address, Writer};
 use sena_state::Node;
-use sena_stf::{Account, MachineState, SocialBinding};
+use sena_stf::{Account, Attestation, MachineState};
 
 fn move_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -150,27 +150,33 @@ fn machine_commitment_constant_matches() {
 }
 
 #[test]
-fn social_binding_discriminants_match() {
-    // The Move module hardcodes these; if the Rust encoding ever reorders the
-    // variants, the two would disagree about what a slot means.
-    let bound = SocialBinding::Bound {
-        address: L2Address::from_bytes([0x01; 32]),
+fn attestation_discriminants_match() {
+    // The Move module hardcodes these; if the Rust encoding ever reorders them,
+    // the two would disagree about what a slot means.
+    let a = Attestation {
+        account: L2Address::from_bytes([0x01; 32]),
+        issued_on: 0,
+        revoked: false,
     };
-    assert_eq!(bound.encode()[0], 0, "Bound must stay discriminant 0");
     assert_eq!(
-        SocialBinding::Vacant.encode()[0],
+        a.encode()[0],
+        0,
+        "a standing attestation must stay discriminant 0"
+    );
+    assert_eq!(
+        Attestation { revoked: true, ..a }.encode()[0],
         1,
-        "Vacant must stay discriminant 1"
+        "a revoked one must stay discriminant 1"
     );
 
     let src = source("osp.move");
     assert!(
-        src.contains("const TAG_BOUND: u8 = 0;"),
-        "Move TAG_BOUND drifted"
+        src.contains("const TAG_ATTESTED: u8 = 0;"),
+        "Move TAG_ATTESTED drifted"
     );
     assert!(
-        src.contains("const TAG_VACANT: u8 = 1;"),
-        "Move TAG_VACANT drifted"
+        src.contains("const TAG_REVOKED: u8 = 1;"),
+        "Move TAG_REVOKED drifted"
     );
 }
 
@@ -210,13 +216,14 @@ fn the_dispute_arity_and_timeouts_match() {
 #[test]
 fn every_new_domain_tag_matches() {
     // Each Move module declares its own tags; check each against Rust.
-    let pairs: [(&str, &[u8]); 6] = [
+    let pairs: [(&str, &[u8]); 7] = [
         ("batch.move", domain::BATCH),
         ("batch.move", b"SENA:v1:batch-leaf"),
         ("batch.move", b"SENA:v1:batch-node"),
         ("keyless.move", domain::KEYLESS_ADDRESS),
         ("txcodec.move", domain::TRANSACTION),
         ("txcodec.move", b"SENA:v1:governance-update"),
+        ("txcodec.move", b"SENA:v1:attestation"),
     ];
     for (file, tag) in pairs {
         let literal = format!("b\"{}\"", std::str::from_utf8(tag).unwrap());
@@ -230,7 +237,7 @@ fn state_regions_match() {
     let src = source("osp.move");
     for region in [
         "SENA:v1:state:account",
-        "SENA:v1:state:social-by-identifier",
+        "SENA:v1:state:attestation",
         "SENA:v1:state:asset",
         "SENA:v1:state:parameter",
         "SENA:v1:state:council",

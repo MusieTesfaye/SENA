@@ -107,7 +107,7 @@ case "$CMD" in
     echo "$(run "${ADDR}::assertions::initialize" "hex:$GENESIS_ROOT" "u64:$WINDOW" "u128:$BOND" \
         "address:0xa" "address:$ADDR" "u64:$MAX_BATCH_AGE")" \
       | grep -q '"success": true' && ok "assertion chain (window ${WINDOW}s)" || bad "assertions::initialize"
-    echo "$(run "${ADDR}::disputes::initialize" "address:$ADDR" "u8:$KEYLESS_SETUP")" \
+    echo "$(run "${ADDR}::disputes::initialize" "address:$ADDR" "u8:$KEYLESS_SETUP" "u64:${SENA_CHAIN_ID:-0}")" \
       | grep -q '"success": true' && ok "dispute registry" || bad "disputes::initialize"
     echo "$(run "${ADDR}::bridge::initialize" "address:$ADDR" "address:$USDC_METADATA" "u32:$L2_ASSET_ID")" \
       | grep -q '"success": true' && ok "bridge, custodying USDC" || bad "bridge::initialize"

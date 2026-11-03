@@ -418,11 +418,12 @@ pub fn instruction_gas(instruction: &Instruction) -> u64 {
     match instruction {
         Instruction::Debit { .. }
         | Instruction::Credit { .. }
-        | Instruction::UnbindIdentifier { .. } => 5_000,
+        | Instruction::RevokeAttestation { .. } => 5_000,
         // Bounded by the wire format's signature limit, so no overflow.
         Instruction::VerifyCouncil { signatures, .. } => 10_000 + 3_000 * signatures.len() as u64,
-        Instruction::BindIdentifier { .. }
-        | Instruction::SetGasAsset { .. }
+        // A write plus the issuer's signature, checked when compiling.
+        Instruction::SetAttestation { .. } => 23_000,
+        Instruction::SetGasAsset { .. }
         | Instruction::SetParameter { .. }
         | Instruction::SetJwk { .. }
         | Instruction::SetFeeMarket { .. }

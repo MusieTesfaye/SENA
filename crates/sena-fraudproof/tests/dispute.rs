@@ -45,6 +45,7 @@ fn address_of(key: &SigningKey) -> L2Address {
 
 fn signed(key: &SigningKey, nonce: u64, payload: Payload) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: address_of(key),
         nonce,
         fee_asset: USDC,

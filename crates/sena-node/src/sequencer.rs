@@ -90,14 +90,21 @@ impl Block {
         )
     }
 
-    /// The context the block was executed in.
+    /// The context the block executes in on the chain `chain_id`. The chain
+    /// id is the caller's own, never the block's: a verifier must not let a
+    /// block say which chain's signatures it accepts.
     #[must_use]
-    pub fn context<'a>(&self, keyless: Option<&'a KeylessConfig>) -> BatchContext<'a> {
+    pub fn context<'a>(
+        &self,
+        keyless: Option<&'a KeylessConfig>,
+        chain_id: u64,
+    ) -> BatchContext<'a> {
         BatchContext {
             timestamp: self.timestamp,
             keyless,
             base_fee: self.base_fee,
             fee_recipient: self.fee_recipient,
+            chain_id,
         }
     }
 }
@@ -173,6 +180,10 @@ pub struct Sequencer {
     /// The fee assets wallets are told about (`sena_getFeeAssets`): those
     /// whitelisted at genesis. Their current records are read from state.
     fee_assets: Vec<AssetId>,
+    /// The chain id transactions must carry ([`sena_primitives::chain_id`]).
+    chain_id: u64,
+    /// The salt identifiers are hashed under, reported to wallets.
+    network_salt: Vec<u8>,
 }
 
 impl Sequencer {
@@ -203,7 +214,35 @@ impl Sequencer {
             fee_recipient: FEE_VAULT,
             fee_asset_limits: BTreeMap::new(),
             fee_assets: Vec::new(),
+            chain_id: sena_stf::TEST_CHAIN_ID,
+            network_salt: Vec::new(),
         }
+    }
+
+    /// Reports `salt` as the salt identifiers are hashed under.
+    #[must_use]
+    pub fn with_network_salt(mut self, salt: Vec<u8>) -> Self {
+        self.network_salt = salt;
+        self
+    }
+
+    /// The salt identifiers are hashed under.
+    #[must_use]
+    pub fn network_salt(&self) -> &[u8] {
+        &self.network_salt
+    }
+
+    /// Accepts transactions for the chain `chain_id` only.
+    #[must_use]
+    pub const fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
+    /// The chain id transactions must carry.
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// The fee assets to list to wallets.
@@ -254,6 +293,7 @@ impl Sequencer {
             // Batch timestamps never fall behind the market's window.
             base_fee: market.base_fee_at(timestamp).unwrap_or(market.base_fee),
             fee_recipient: self.fee_recipient,
+            chain_id: self.chain_id,
         }
     }
 
@@ -273,12 +313,15 @@ impl Sequencer {
     /// # Panics
     ///
     /// Panics if a trace exceeds `u64::MAX` steps, which no batch can reach.
+    // Every argument is a distinct part of what the node was started with.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume(
         genesis: MerkleTrie,
         chain: AssertionChain,
         identity: PartyId,
         bond: u128,
         keyless: Option<Arc<KeylessConfig>>,
+        chain_id: u64,
         batches: &[crate::store::StoredBatch],
         saved_state_root: Hash256,
     ) -> Result<Self, String> {
@@ -292,7 +335,9 @@ impl Sequencer {
             bond: 0,
         }
         .id();
-        let mut seq = Self::new(genesis, chain, identity, bond).with_keyless(keyless);
+        let mut seq = Self::new(genesis, chain, identity, bond)
+            .with_keyless(keyless)
+            .with_chain_id(chain_id);
         seq.head = genesis_id;
         for (i, batch) in batches.iter().enumerate() {
             let height = i as u64 + 1;
@@ -302,6 +347,7 @@ impl Sequencer {
                 keyless: seq.keyless.as_deref(),
                 base_fee: batch.base_fee,
                 fee_recipient: batch.fee_recipient,
+                chain_id,
             };
             let mut next = seq.state.clone();
             let trace = execute_batch(&mut next, &ctx, &batch.transactions)

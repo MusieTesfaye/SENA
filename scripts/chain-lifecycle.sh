@@ -49,6 +49,9 @@ BOND=1000000
 TRACE_LEN=10
 MAX_BATCH_AGE=3600
 KEYLESS_SETUP=1  # aptos-keyless-mainnet-2025-01
+# The chain id L2 transactions sign (`sena-node genesis` prints it). The
+# lifecycle posts a batch without disputing it, so any value works here.
+CHAIN_ID=${SENA_CHAIN_ID:-0}
 APT_METADATA=0xa
 BATCH_TIME=$(date +%s)
 
@@ -212,7 +215,7 @@ expect_ok "assertion chain initialised" \
   "${ADDR}::assertions::initialize" "hex:$GENESIS_ROOT" "u64:$WINDOW" "u128:$BOND" \
   "address:$APT_METADATA" "address:$ADDR" "u64:$MAX_BATCH_AGE"
 expect_ok "dispute registry initialised (keyless setup $KEYLESS_SETUP)" \
-  "${ADDR}::disputes::initialize" "address:$ADDR" "u8:$KEYLESS_SETUP"
+  "${ADDR}::disputes::initialize" "address:$ADDR" "u8:$KEYLESS_SETUP" "u64:$CHAIN_ID"
 
 step "4. Derive assertion ids independently"
 # Computed from the canonical encoding rather than read back from the chain, so

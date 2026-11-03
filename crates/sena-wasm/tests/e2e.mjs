@@ -67,11 +67,13 @@ async function balances(address) {
   return Object.fromEntries((a.balances ?? []).map((b) => [b.asset, BigInt(b.amount)]));
 }
 
+let CHAIN_ID = 0n;
+
 // What a wallet does to send: quote, build, sign, submit.
 async function transfer(from, sign, to, asset, amount) {
   const q = await rpc("sena_gasPrice", { asset });
   const account = await rpc("sena_getAccount", { address: from });
-  const tx = wasm.buildTransfer(from, BigInt(account.nonce), to, asset, amount.toString(), asset,
+  const tx = wasm.buildTransfer(CHAIN_ID, from, BigInt(account.nonce), to, asset, amount.toString(), asset,
     q.rate, BigInt(q.intrinsic_gas), q.suggested_max_fee_per_gas, TIP.toString());
   const signed = sign(tx);
   const response = await submit(signed);
@@ -104,7 +106,11 @@ try {
     }
   }
 
-  console.log("Browser access");
+  const info = await rpc("sena_getChainInfo");
+  CHAIN_ID = BigInt(info.transaction_chain_id);
+  console.log(`Chain ${info.chain_id}, transaction chain id ${CHAIN_ID}`);
+
+  console.log("\nBrowser access");
   const pre = await fetch(RPC, { method: "OPTIONS", headers: { Origin: ORIGIN, "Access-Control-Request-Method": "POST" } });
   check(`preflight from ${ORIGIN} allowed`, pre.headers.get("access-control-allow-origin") === ORIGIN);
   const other = await fetch(RPC, { method: "OPTIONS", headers: { Origin: "http://evil.example" } });
@@ -191,6 +197,51 @@ try {
     return JSON.stringify(t);
   }, bob, 1, 1n);
   check("a transfer altered after signing is refused", tampered.response.result === "error", JSON.stringify(tampered.response));
+  const otherChain = await transfer(address, (tx) => {
+    const t = JSON.parse(tx);
+    t.chain_id = 12345; // signed for another chain
+    return signKeyless(JSON.stringify(t));
+  }, bob, 1, 1n);
+  check("a transfer signed for another chain is refused", otherChain.response.result === "error", JSON.stringify(otherChain.response));
+
+  console.log("\nAttestations (Celo SocialConnect)");
+  const issuerSecret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
+  const issuer = wasm.ed25519Address(issuerSecret);
+  const identifier = wasm.hashIdentifier("email", "Alice@Example.com", info.network_salt);
+  check("identifiers normalise", identifier === wasm.hashIdentifier("email", "alice@example.com", info.network_salt));
+  const register = async (signer, account, issuedOn) => {
+    const signature = wasm.signAttestation(signer, CHAIN_ID, identifier, account, BigInt(issuedOn));
+    const payload = JSON.stringify({ kind: "register_attestation", identifier, issuer, account, issued_on: issuedOn, signature });
+    const q = await rpc("sena_gasPrice", { asset: 1 });
+    const nonce = (await rpc("sena_getAccount", { address })).nonce;
+    const tx = wasm.buildTransaction(CHAIN_ID, address, BigInt(nonce), payload, 1, q.rate, BigInt(q.intrinsic_gas), q.suggested_max_fee_per_gas, "0");
+    const signed = signKeyless(tx);
+    return { response: await submit(signed), hash: wasm.transactionHash(signed) };
+  };
+  const lookup = async (issuers) =>
+    (await rpc("sena_lookupAttestations", { identifier, trusted_issuers: issuers })).attestations ?? [];
+
+  let builderRefused = false;
+  try { await register(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex"), address, 100); }
+  catch (e) { builderRefused = /does not verify/.test(String(e)); }
+  check("an attestation the issuer did not sign does not even build", builderRefused);
+  // Built with the real signature, then the signature swapped: the node refuses it.
+  {
+    const signature = wasm.signAttestation(issuerSecret, CHAIN_ID, identifier, address, 100n);
+    const payload = JSON.stringify({ kind: "register_attestation", identifier, issuer, account: address, issued_on: 100, signature });
+    const q = await rpc("sena_gasPrice", { asset: 1 });
+    const nonce = (await rpc("sena_getAccount", { address })).nonce;
+    const t = JSON.parse(wasm.buildTransaction(CHAIN_ID, address, BigInt(nonce), payload, 1, q.rate, BigInt(q.intrinsic_gas), q.suggested_max_fee_per_gas, "0"));
+    t.payload.signature = "11".repeat(64);
+    const response = await submit(signKeyless(JSON.stringify(t)));
+    check("a tampered attestation is refused by the node", response.result === "error", JSON.stringify(response));
+  }
+  const real = await register(issuerSecret, address, 100);
+  const height = real.response.result === "submitted" ? await confirmed(real.hash) : null;
+  check(`the issuer's attestation is recorded, block ${height}`, height !== null, JSON.stringify(real.response));
+  const found = await lookup([issuer]);
+  check("lookup through the trusted issuer finds the keyless account", found.length === 1 && found[0].account === address, JSON.stringify(found));
+  check("lookup through an untrusted issuer finds nothing", (await lookup([bob])).length === 0);
 } finally {
   node.kill();
   rmSync(dir, { recursive: true, force: true });

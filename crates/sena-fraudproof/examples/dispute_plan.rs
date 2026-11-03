@@ -47,6 +47,7 @@ fn addr(k: &SigningKey) -> L2Address {
 
 fn base(sender: L2Address, nonce: u64, to: L2Address, amount: u128) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender,
         nonce,
         fee_asset: USDC,
@@ -279,6 +280,7 @@ fn main() {
         "timestamp": timestamp,
         "base_fee": ctx.base_fee.to_string(),
         "fee_recipient": hx(ctx.fee_recipient.as_bytes()),
+        "chain_id": ctx.chain_id,
         "scenario": if fee_scenario { "fee" } else { "keyless" },
         "forged": { "step": at, "honest": amount.to_string(), "forged": (amount * 1_000).to_string() },
         "txs": txs.iter().map(|t| hx(&t.encode())).collect::<Vec<_>>(),

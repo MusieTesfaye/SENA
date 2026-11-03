@@ -135,6 +135,7 @@ def main():
     run("admin", m + "disputes::initialize", [
         {"type": "address", "value": admin},
         {"type": "u8", "value": DEVNET_SETUP},
+        {"type": "u64", "value": str(plan.get("chain_id", 0))},
     ], gas)
 
     txs = [bytes.fromhex(t[2:]) for t in plan["txs"]]

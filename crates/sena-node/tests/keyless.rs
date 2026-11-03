@@ -59,6 +59,7 @@ fn sequencer(config: &GenesisConfig, clock: fn() -> u64) -> Sequencer {
 
 fn keyless_transfer(amount: u128) -> Transaction {
     let mut tx = Transaction {
+        chain_id: 0,
         sender: aptos_sample::signature().address(),
         nonce: 0,
         fee_asset: USDC,

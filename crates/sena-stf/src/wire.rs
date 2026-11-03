@@ -9,9 +9,7 @@
 //! of one transaction would let a sequencer publish data that verifiers and L1
 //! read differently.
 
-use sena_primitives::{
-    AssetId, Channel, DecodeError, Hash256, HashedIdentifier, L2Address, Reader, Writer,
-};
+use sena_primitives::{AssetId, DecodeError, Hash256, HashedIdentifier, L2Address, Reader, Writer};
 
 use crate::gas::{FeeSplit, WhitelistedAsset};
 use crate::governance::{CouncilSignature, GovernanceUpdate};
@@ -46,8 +44,8 @@ mod tag {
     pub const ED25519: u8 = 0;
     pub const KEYLESS: u8 = 1;
     pub const TRANSFER: u8 = 0;
-    pub const BIND_IDENTIFIER: u8 = 1;
-    pub const UNBIND_IDENTIFIER: u8 = 2;
+    pub const REGISTER_ATTESTATION: u8 = 1;
+    pub const REVOKE_ATTESTATION: u8 = 2;
     pub const GOVERNANCE: u8 = 3;
     pub const DISTRIBUTE_FEES: u8 = 4;
     pub const SET_GAS_ASSET: u8 = 0;
@@ -187,17 +185,24 @@ pub(crate) fn write_payload(w: &mut Writer, payload: &Payload) {
             w.u32(asset.get());
             w.u128(*amount);
         }
-        Payload::BindIdentifier {
-            channel,
+        Payload::RegisterAttestation {
             identifier,
+            issuer,
+            account,
+            issued_on,
+            signature,
         } => {
-            w.u8(tag::BIND_IDENTIFIER);
-            w.u8(channel.discriminant());
+            w.u8(tag::REGISTER_ATTESTATION);
             w.bytes32(identifier.as_hash().as_bytes());
+            w.bytes32(issuer.as_bytes());
+            w.bytes32(account.as_bytes());
+            w.u64(*issued_on);
+            w.raw(signature);
         }
-        Payload::UnbindIdentifier { identifier } => {
-            w.u8(tag::UNBIND_IDENTIFIER);
+        Payload::RevokeAttestation { identifier, issuer } => {
+            w.u8(tag::REVOKE_ATTESTATION);
             w.bytes32(identifier.as_hash().as_bytes());
+            w.bytes32(issuer.as_bytes());
         }
         Payload::Governance {
             epoch,
@@ -235,15 +240,16 @@ fn read_payload(r: &mut Reader<'_>) -> Result<Payload, WireError> {
             asset: AssetId(r.u32()?),
             amount: r.u128()?,
         },
-        tag::BIND_IDENTIFIER => {
-            let d = r.u8()?;
-            Payload::BindIdentifier {
-                channel: Channel::from_discriminant(d).ok_or(DecodeError::UnknownVariant(d))?,
-                identifier: HashedIdentifier(Hash256(r.bytes32()?)),
-            }
-        }
-        tag::UNBIND_IDENTIFIER => Payload::UnbindIdentifier {
+        tag::REGISTER_ATTESTATION => Payload::RegisterAttestation {
             identifier: HashedIdentifier(Hash256(r.bytes32()?)),
+            issuer: L2Address::from_bytes(r.bytes32()?),
+            account: L2Address::from_bytes(r.bytes32()?),
+            issued_on: r.u64()?,
+            signature: r.array::<64>()?,
+        },
+        tag::REVOKE_ATTESTATION => Payload::RevokeAttestation {
+            identifier: HashedIdentifier(Hash256(r.bytes32()?)),
+            issuer: L2Address::from_bytes(r.bytes32()?),
         },
         tag::GOVERNANCE => {
             let epoch = r.u64()?;
@@ -282,6 +288,7 @@ fn read_payload(r: &mut Reader<'_>) -> Result<Payload, WireError> {
 #[must_use]
 pub fn encode(tx: &Transaction) -> Vec<u8> {
     let mut w = Writer::new();
+    w.u64(tx.chain_id);
     w.bytes32(tx.sender.as_bytes());
     w.u64(tx.nonce);
     w.u32(tx.fee_asset.get());
@@ -321,6 +328,7 @@ pub fn decode(bytes: &[u8]) -> Result<Transaction, WireError> {
         return Err(WireError::TooLarge(bytes.len()));
     }
     let mut r = Reader::new(bytes);
+    let chain_id = r.u64()?;
     let sender = L2Address::from_bytes(r.bytes32()?);
     let nonce = r.u64()?;
     let fee_asset = AssetId(r.u32()?);
@@ -343,6 +351,7 @@ pub fn decode(bytes: &[u8]) -> Result<Transaction, WireError> {
     };
     r.finish()?;
     let tx = Transaction {
+        chain_id,
         sender,
         nonce,
         fee_asset,
@@ -368,6 +377,7 @@ mod tests {
 
     fn transfer() -> Transaction {
         Transaction {
+            chain_id: 0,
             sender: L2Address::from_bytes([1; 32]),
             nonce: 7,
             fee_asset: AssetId(1),

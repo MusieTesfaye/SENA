@@ -7,9 +7,9 @@
 //!
 //! Build: `scripts/build-wasm.sh`.
 
-use sena_primitives::{AssetId, L2Address};
+use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address};
 use sena_stf::keyless::limits;
-use sena_stf::{KeylessSignature, Transaction};
+use sena_stf::{KeylessSignature, Payload, Transaction};
 use sena_wallet::keyless::{self, Jwt, KeylessSession, SignIn};
 use sena_wallet::FeeQuote;
 use serde_json::{json, Value};
@@ -186,12 +186,30 @@ pub fn signature_address(signature: &str) -> Result<String, JsError> {
     Ok(sig.address().to_string())
 }
 
-/// An unsigned transfer, as JSON, metered to exactly the gas it uses.
+fn fee_quote(
+    fee_asset: u32,
+    fee_rate: &str,
+    fee_intrinsic_gas: u64,
+    max_fee_per_gas: &str,
+    tip: &str,
+) -> Result<FeeQuote, JsError> {
+    Ok(FeeQuote {
+        asset: AssetId(fee_asset),
+        rate: amount(fee_rate, "fee rate")?,
+        intrinsic_gas: fee_intrinsic_gas,
+        max_fee_per_gas: amount(max_fee_per_gas, "max fee per gas")?,
+        max_priority_fee_per_gas: amount(tip, "tip")?,
+    })
+}
+
+/// An unsigned transfer on the chain `chain_id` (the node's
+/// `transaction_chain_id`), as JSON, metered to exactly the gas it uses.
 /// Amounts and prices are decimal strings; `max_fee_per_gas` and `tip` are in
 /// `PRICE_SCALE`ths of the fee asset's smallest unit.
 #[allow(clippy::too_many_arguments)]
 #[wasm_bindgen(js_name = buildTransfer)]
 pub fn build_transfer(
+    chain_id: u64,
     sender: &str,
     nonce: u64,
     to: &str,
@@ -203,14 +221,9 @@ pub fn build_transfer(
     max_fee_per_gas: &str,
     tip: &str,
 ) -> Result<String, JsError> {
-    let fee = FeeQuote {
-        asset: AssetId(fee_asset),
-        rate: amount(fee_rate, "fee rate")?,
-        intrinsic_gas: fee_intrinsic_gas,
-        max_fee_per_gas: amount(max_fee_per_gas, "max fee per gas")?,
-        max_priority_fee_per_gas: amount(tip, "tip")?,
-    };
+    let fee = fee_quote(fee_asset, fee_rate, fee_intrinsic_gas, max_fee_per_gas, tip)?;
     let tx = sena_wallet::transfer(
+        chain_id,
         address(sender)?,
         nonce,
         address(to)?,
@@ -220,6 +233,78 @@ pub fn build_transfer(
     )
     .map_err(err)?;
     Ok(json_of(&tx))
+}
+
+/// An unsigned transaction carrying any payload, given as the node's JSON for
+/// it (`{"kind":"register_attestation",...}`); otherwise as
+/// [`build_transfer`].
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen(js_name = buildTransaction)]
+pub fn build_transaction(
+    chain_id: u64,
+    sender: &str,
+    nonce: u64,
+    payload: &str,
+    fee_asset: u32,
+    fee_rate: &str,
+    fee_intrinsic_gas: u64,
+    max_fee_per_gas: &str,
+    tip: &str,
+) -> Result<String, JsError> {
+    let payload: Payload =
+        serde_json::from_str(payload).map_err(|e| err(format!("bad payload: {e}")))?;
+    let fee = fee_quote(fee_asset, fee_rate, fee_intrinsic_gas, max_fee_per_gas, tip)?;
+    let tx =
+        sena_wallet::unsigned(chain_id, address(sender)?, nonce, payload, &fee).map_err(err)?;
+    Ok(json_of(&tx))
+}
+
+fn channel(name: &str) -> Result<Channel, JsError> {
+    match name {
+        "email" => Ok(Channel::Email),
+        "phone" => Ok(Channel::Phone),
+        "handle" => Ok(Channel::Handle),
+        other => Err(err(format!(
+            "unknown channel {other:?}; use email, phone or handle"
+        ))),
+    }
+}
+
+/// The hashed identifier for `raw` on `channel` ("email", "phone" or
+/// "handle"), under the network salt (the node's `network_salt`, hex). The
+/// plain text is normalised first and never leaves the caller.
+#[wasm_bindgen(js_name = hashIdentifier)]
+pub fn hash_identifier(channel_name: &str, raw: &str, salt_hex: &str) -> Result<String, JsError> {
+    let salt = hex::decode(salt_hex.trim().trim_start_matches("0x"))
+        .map_err(|_| err("network salt must be hex"))?;
+    let id = sena_wallet::hash_identifier(channel(channel_name)?, raw, &salt);
+    Ok(id.0.to_string())
+}
+
+fn identifier(hex_str: &str) -> Result<HashedIdentifier, JsError> {
+    Ok(HashedIdentifier(sena_primitives::Hash256(bytes(
+        hex_str,
+        "identifier",
+    )?)))
+}
+
+/// An issuer's signature, hex, attesting that `identifier` belongs to
+/// `account` on the chain `chain_id`.
+#[wasm_bindgen(js_name = signAttestation)]
+pub fn sign_attestation(
+    issuer_secret: &str,
+    chain_id: u64,
+    identifier_hex: &str,
+    account: &str,
+    issued_on: u64,
+) -> Result<String, JsError> {
+    Ok(hex::encode(sena_wallet::sign_attestation(
+        &bytes(issuer_secret, "issuer secret key")?,
+        chain_id,
+        &identifier(identifier_hex)?,
+        &address(account)?,
+        issued_on,
+    )))
 }
 
 fn tx_from(json_str: &str) -> Result<Transaction, JsError> {

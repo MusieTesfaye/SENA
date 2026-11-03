@@ -37,8 +37,8 @@ module sena::osp {
     const OP_CONSUME_NONCE: u8 = 0;
     const OP_DEBIT: u8 = 1;
     const OP_CREDIT: u8 = 2;
-    const OP_BIND_IDENTIFIER: u8 = 3;
-    const OP_UNBIND_IDENTIFIER: u8 = 4;
+    const OP_SET_ATTESTATION: u8 = 3;
+    const OP_REVOKE_ATTESTATION: u8 = 4;
     const OP_VERIFY_GAS_ASSET: u8 = 5;
     const OP_VERIFY_COUNCIL: u8 = 6;
     const OP_SET_GAS_ASSET: u8 = 7;
@@ -51,15 +51,16 @@ module sena::osp {
     const OP_SET_FEE_MARKET: u8 = 14;
     const OP_DISABLE_GAS_ASSET: u8 = 15;
 
-    const TAG_BOUND: u8 = 0;
-    const TAG_VACANT: u8 = 1;
+    // `social::Attestation` discriminants.
+    const TAG_ATTESTED: u8 = 0;
+    const TAG_REVOKED: u8 = 1;
 
     const MAX_U64: u64 = 18446744073709551615;
     const MAX_U128: u128 = 340282366920938463463374607431768211455;
 
     // State regions, mirroring `sena_stf::keys`.
     const REGION_ACCOUNT: vector<u8> = b"SENA:v1:state:account";
-    const REGION_SOCIAL_BY_IDENTIFIER: vector<u8> = b"SENA:v1:state:social-by-identifier";
+    const REGION_ATTESTATION: vector<u8> = b"SENA:v1:state:attestation";
     const REGION_ASSET: vector<u8> = b"SENA:v1:state:asset";
     const REGION_PARAMETER: vector<u8> = b"SENA:v1:state:parameter";
     const REGION_COUNCIL: vector<u8> = b"SENA:v1:state:council";
@@ -91,11 +92,13 @@ module sena::osp {
     /// index they would choose one that fails.
     struct Instruction has copy, drop, store {
         op: u8,
-        /// ConsumeNonce/Debit/Credit: the account. Bind: the address bound.
-        /// Unbind: the expected owner.
+        /// ConsumeNonce/Debit/Credit: the account. SetAttestation: the attested
+        /// account. RevokeAttestation: who revokes.
         account: vector<u8>,
-        /// Bind/Unbind: the hashed identifier.
+        /// SetAttestation/RevokeAttestation: the hashed identifier.
         identifier: vector<u8>,
+        /// SetAttestation/RevokeAttestation: the issuer.
+        issuer: vector<u8>,
         /// Debit/Credit/VerifyGasAsset/SetGasAsset/DisableGasAsset: the asset.
         asset: u32,
         /// Debit/Credit: the amount. VerifyGasAsset/SetGasAsset: the rate.
@@ -103,7 +106,7 @@ module sena::osp {
         /// SetFeeMarket: the floor.
         amount: u128,
         /// ConsumeNonce: the expected nonce. VerifyCouncil: the epoch.
-        /// ChargeBaseFee: the batch timestamp.
+        /// ChargeBaseFee: the batch timestamp. SetAttestation: `issued_on`.
         nonce: u64,
         /// VerifyGasAsset/SetGasAsset: the intrinsic gas. ChargeBaseFee: the
         /// gas charged. SetFeeMarket: the target.
@@ -135,6 +138,7 @@ module sena::osp {
             op,
             account: vector::empty(),
             identifier: vector::empty(),
+            issuer: vector::empty(),
             asset: 0,
             amount: 0,
             nonce: 0,
@@ -159,11 +163,14 @@ module sena::osp {
     public fun credit(account: vector<u8>, asset: u32, amount: u128): Instruction {
         let i = blank(OP_CREDIT); i.account = account; i.asset = asset; i.amount = amount; i
     }
-    public fun bind_identifier(identifier: vector<u8>, address: vector<u8>): Instruction {
-        let i = blank(OP_BIND_IDENTIFIER); i.identifier = identifier; i.account = address; i
+    public fun set_attestation(
+        identifier: vector<u8>, issuer: vector<u8>, account: vector<u8>, issued_on: u64
+    ): Instruction {
+        let i = blank(OP_SET_ATTESTATION);
+        i.identifier = identifier; i.issuer = issuer; i.account = account; i.nonce = issued_on; i
     }
-    public fun unbind_identifier(identifier: vector<u8>, expected_owner: vector<u8>): Instruction {
-        let i = blank(OP_UNBIND_IDENTIFIER); i.identifier = identifier; i.account = expected_owner; i
+    public fun revoke_attestation(identifier: vector<u8>, issuer: vector<u8>, by: vector<u8>): Instruction {
+        let i = blank(OP_REVOKE_ATTESTATION); i.identifier = identifier; i.issuer = issuer; i.account = by; i
     }
     public fun verify_gas_asset(asset: u32, rate: u128, intrinsic_gas: u64): Instruction {
         let i = blank(OP_VERIFY_GAS_ASSET); i.asset = asset; i.amount = rate; i.gas = intrinsic_gas; i
@@ -241,8 +248,14 @@ module sena::osp {
             vector::append(&mut out, i.account);
             codec::put_u32(&mut out, i.asset);
             codec::put_u128(&mut out, i.amount);
-        } else if (i.op == OP_BIND_IDENTIFIER || i.op == OP_UNBIND_IDENTIFIER) {
+        } else if (i.op == OP_SET_ATTESTATION) {
             vector::append(&mut out, i.identifier);
+            vector::append(&mut out, i.issuer);
+            vector::append(&mut out, i.account);
+            codec::put_u64(&mut out, i.nonce);
+        } else if (i.op == OP_REVOKE_ATTESTATION) {
+            vector::append(&mut out, i.identifier);
+            vector::append(&mut out, i.issuer);
             vector::append(&mut out, i.account);
         } else if (i.op == OP_VERIFY_GAS_ASSET) {
             codec::put_u32(&mut out, i.asset);
@@ -333,8 +346,11 @@ module sena::osp {
         let op = i.op;
         if (op == OP_CONSUME_NONCE || op == OP_DEBIT || op == OP_CREDIT) {
             account_key(i.account)
-        } else if (op == OP_BIND_IDENTIFIER || op == OP_UNBIND_IDENTIFIER) {
-            region_key(REGION_SOCIAL_BY_IDENTIFIER, i.identifier)
+        } else if (op == OP_SET_ATTESTATION || op == OP_REVOKE_ATTESTATION) {
+            let buf = codec::begin(REGION_ATTESTATION);
+            codec::put_field(&mut buf, i.identifier);
+            codec::put_field(&mut buf, i.issuer);
+            codec::commit(buf)
         } else if (op == OP_VERIFY_GAS_ASSET || op == OP_SET_GAS_ASSET || op == OP_DISABLE_GAS_ASSET) {
             let buf = codec::begin(REGION_ASSET);
             codec::put_field_u64(&mut buf, (i.asset as u64));
@@ -361,11 +377,14 @@ module sena::osp {
     /// every transaction runs are covered by the intrinsic gas instead.
     public fun instruction_gas(i: &Instruction): u64 {
         let op = i.op;
-        if (op == OP_DEBIT || op == OP_CREDIT || op == OP_UNBIND_IDENTIFIER) {
+        if (op == OP_DEBIT || op == OP_CREDIT || op == OP_REVOKE_ATTESTATION) {
             5000
         } else if (op == OP_VERIFY_COUNCIL) {
             10000 + 3000 * vector::length(&i.signatures)
-        } else if (op == OP_BIND_IDENTIFIER || op == OP_SET_GAS_ASSET || op == OP_SET_PARAMETER
+        } else if (op == OP_SET_ATTESTATION) {
+            // A write plus the issuer's signature, checked when compiling.
+            23000
+        } else if (op == OP_SET_GAS_ASSET || op == OP_SET_PARAMETER
             || op == OP_SET_JWK || op == OP_SET_FEE_MARKET || op == OP_SET_FEE_SPLIT
             || op == OP_DISABLE_GAS_ASSET) {
             20000
@@ -374,6 +393,28 @@ module sena::osp {
         } else {
             0
         }
+    }
+
+    // --- Attestation codec ---------------------------------------------------
+
+    /// `social::Attestation::encode`: discriminant, account, `issued_on`.
+    fun encode_attestation(revoked: bool, account: vector<u8>, issued_on: u64): vector<u8> {
+        let out = vector::singleton(if (revoked) { TAG_REVOKED } else { TAG_ATTESTED });
+        vector::append(&mut out, account);
+        codec::put_u64(&mut out, issued_on);
+        out
+    }
+
+    /// `social::Attestation::decode`: `(revoked, account, issued_on)`; aborts on
+    /// a malformed slot, as Rust's `MalformedSlot` refuses it.
+    fun decode_attestation(bytes: vector<u8>): (bool, vector<u8>, u64) {
+        let r = codec::reader(bytes);
+        let tag = codec::take_u8(&mut r);
+        assert!(tag == TAG_ATTESTED || tag == TAG_REVOKED, codec::error_unknown_variant());
+        let account = codec::take_bytes(&mut r, 32);
+        let issued_on = codec::take_u64(&mut r);
+        codec::finish(&r);
+        (tag == TAG_REVOKED, account, issued_on)
     }
 
     // --- Account codec -------------------------------------------------------
@@ -519,40 +560,24 @@ module sena::osp {
                 set_balance(&mut a, instruction.asset, held + instruction.amount);
             };
             (true, encode_account(&a))
-        } else if (op == OP_BIND_IDENTIFIER) {
+        } else if (op == OP_SET_ATTESTATION) {
+            // Revoked or not, only a later attestation replaces the one held,
+            // so a signed attestation cannot be replayed to undo a change.
             if (present) {
-                let r = codec::reader(current);
-                let tag = codec::take_u8(&mut r);
-                if (tag == TAG_BOUND) {
-                    let holder = codec::take_bytes(&mut r, 32);
-                    codec::finish(&r);
-                    // Re-binding to the same address is idempotent; taking
-                    // someone else's identifier is not permitted.
-                    if (holder != instruction.account) { return (false, vector::empty()) };
-                } else {
-                    assert!(tag == TAG_VACANT, codec::error_unknown_variant());
-                    codec::finish(&r);
-                };
+                let (_, _, standing_issued_on) = decode_attestation(current);
+                if (instruction.nonce <= standing_issued_on) { return (false, vector::empty()) };
             };
-            let out = vector::singleton(TAG_BOUND);
-            vector::append(&mut out, instruction.account);
-            (true, out)
-        } else if (op == OP_UNBIND_IDENTIFIER) {
+            (true, encode_attestation(false, instruction.account, instruction.nonce))
+        } else if (op == OP_REVOKE_ATTESTATION) {
             if (!present) { return (false, vector::empty()) };
-            let r = codec::reader(current);
-            let tag = codec::take_u8(&mut r);
-            if (tag != TAG_BOUND) {
-                assert!(tag == TAG_VACANT, codec::error_unknown_variant());
-                codec::finish(&r);
+            let (revoked, attested, issued_on) = decode_attestation(current);
+            if (revoked) { return (false, vector::empty()) };
+            if (instruction.account != instruction.issuer && instruction.account != attested) {
                 return (false, vector::empty())
             };
-            let holder = codec::take_bytes(&mut r, 32);
-            codec::finish(&r);
-            if (holder != instruction.account) { return (false, vector::empty()) };
-            // Overwritten with a vacant marker rather than removed: removal can
-            // require collapsing a branch, whose shape the proof does not
-            // describe.
-            (true, vector::singleton(TAG_VACANT))
+            // Kept, marked revoked, rather than removed: removal can require
+            // collapsing a branch, whose shape the proof does not describe.
+            (true, encode_attestation(true, attested, issued_on))
         } else if (op == OP_VERIFY_GAS_ASSET) {
             if (!present) { return (false, vector::empty()) };
             let (_, _, rate, intrinsic_gas, enabled) = decode_asset_record(current);
@@ -735,8 +760,14 @@ module sena::osp {
             i.account = codec::take_bytes(&mut r, 32);
             i.asset = codec::take_u32(&mut r);
             i.amount = codec::take_u128(&mut r);
-        } else if (op == OP_BIND_IDENTIFIER || op == OP_UNBIND_IDENTIFIER) {
+        } else if (op == OP_SET_ATTESTATION) {
             i.identifier = codec::take_bytes(&mut r, 32);
+            i.issuer = codec::take_bytes(&mut r, 32);
+            i.account = codec::take_bytes(&mut r, 32);
+            i.nonce = codec::take_u64(&mut r);
+        } else if (op == OP_REVOKE_ATTESTATION) {
+            i.identifier = codec::take_bytes(&mut r, 32);
+            i.issuer = codec::take_bytes(&mut r, 32);
             i.account = codec::take_bytes(&mut r, 32);
         } else if (op == OP_VERIFY_GAS_ASSET) {
             i.asset = codec::take_u32(&mut r);
@@ -883,12 +914,16 @@ module sena::osp {
     }
 
     #[test]
-    fun an_identifier_cannot_be_taken_from_its_holder() {
-        let (_, bound) = transition(&bind_identifier(addr(9), addr(1)), false, vector::empty());
-        let (ok, _) = transition(&bind_identifier(addr(9), addr(2)), true, bound);
+    fun an_attestation_is_replaced_only_by_a_later_one_and_revoked_only_by_its_parties() {
+        let (_, held) = transition(&set_attestation(addr(9), addr(7), addr(1), 100), false, vector::empty());
+        let (ok, _) = transition(&set_attestation(addr(9), addr(7), addr(2), 100), true, held);
         assert!(!ok, 0);
-        let (ok, released) = transition(&unbind_identifier(addr(9), addr(1)), true, bound);
-        assert!(ok && released == vector::singleton(TAG_VACANT), 1);
+        let (ok, _) = transition(&revoke_attestation(addr(9), addr(7), addr(3)), true, held);
+        assert!(!ok, 1);
+        let (ok, revoked) = transition(&revoke_attestation(addr(9), addr(7), addr(1)), true, held);
+        assert!(ok && *vector::borrow(&revoked, 0) == TAG_REVOKED, 2);
+        let (ok, _) = transition(&set_attestation(addr(9), addr(7), addr(1), 100), true, revoked);
+        assert!(!ok, 3);
     }
 
     #[test]

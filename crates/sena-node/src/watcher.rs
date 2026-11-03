@@ -48,6 +48,8 @@ pub struct WatcherConfig {
     pub keyless_setup: u8,
     /// Poseidon steps per keyless-job transaction.
     pub keyless_steps_per_tx: u64,
+    /// The chain id transactions must carry, from genesis.
+    pub chain_id: u64,
 }
 
 /// What the watcher persists.
@@ -284,6 +286,7 @@ impl<C: L1> Watcher<C> {
             keyless: self.config.keyless.as_deref(),
             base_fee: batch.base_fee,
             fee_recipient: batch.fee_recipient,
+            chain_id: self.config.chain_id,
         }
     }
 
