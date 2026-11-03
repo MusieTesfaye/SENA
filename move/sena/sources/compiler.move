@@ -93,9 +93,12 @@ module sena::compiler {
             vector::push_back(&mut out, osp::debit(sender, txcodec::asset(p), txcodec::amount(p)));
             vector::push_back(&mut out, osp::credit(to, txcodec::asset(p), txcodec::amount(p)));
         } else if (txcodec::is_register_attestation(p)) {
+            // The attested account consents by submitting it, or the issuer
+            // vouches by submitting it itself.
+            let issuer = txcodec::issuer(p);
+            if (sender != txcodec::account(p) && sender != issuer) { return (false, none) };
             // Stateless, so checked here, as the sender's own signature is: the
             // issuer's Ed25519 key is its address.
-            let issuer = txcodec::issuer(p);
             if (!keyless::verify_ed25519_strict(
                 &issuer,
                 &txcodec::attestation_signature(p),

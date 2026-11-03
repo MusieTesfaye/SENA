@@ -11,7 +11,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
+use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use sena_stf::execute::{genesis_credit, StepWitness};
 use sena_stf::gas::{native_to_asset, DEFAULT_ASSET_INTRINSIC_GAS, DEFAULT_BASE_FEE_FLOOR};
@@ -433,7 +433,7 @@ fn a_small_order_key_is_refused() {
 // --- Social Connect ----------------------------------------------------------
 
 fn handle(name: &str) -> HashedIdentifier {
-    HashedIdentifier::new(Channel::Handle, name, &NetworkSalt::new(*b"test-salt"))
+    HashedIdentifier::new("handle", name, &NetworkSalt::new(*b"test-salt"))
 }
 
 /// An issuer's signed attestation that `id` belongs to `account`, for the test
@@ -470,16 +470,35 @@ fn stored_attestation(
 }
 
 #[test]
-fn an_issuers_attestation_is_recorded_whoever_submits_it() {
+fn the_account_or_the_issuer_submits_an_attestation_and_nobody_else() {
     let alice = signer(1);
     let relayer = signer(3);
     let issuer = signer(7);
-    let mut trie = funded_trie(&[(address_of(&relayer), 90_000)]);
+    let mut trie = funded_trie(&[
+        (address_of(&alice), 90_000),
+        (address_of(&relayer), 90_000),
+        (address_of(&issuer), 90_000),
+    ]);
     let id = handle("@alice");
 
-    let tx = signed(&relayer, 0, attest(&issuer, id, address_of(&alice), 100));
-    execute_batch(&mut trie, &CTX, &[tx]).unwrap();
+    // A third party cannot make it take effect: the account has not consented.
+    let relayed = signed(&relayer, 0, attest(&issuer, id, address_of(&alice), 100));
+    assert!(matches!(
+        compile(&relayed, &CTX),
+        Err(CompileError::AttestationWithoutConsent)
+    ));
 
+    // Alice consents by submitting it herself.
+    execute_batch(
+        &mut trie,
+        &CTX,
+        &[signed(
+            &alice,
+            0,
+            attest(&issuer, id, address_of(&alice), 100),
+        )],
+    )
+    .unwrap();
     assert_eq!(
         stored_attestation(&trie, &id, &issuer),
         Some(Attestation {
@@ -487,6 +506,22 @@ fn an_issuers_attestation_is_recorded_whoever_submits_it() {
             issued_on: 100,
             revoked: false,
         })
+    );
+
+    // Or the issuer submits it, vouching for the account itself.
+    execute_batch(
+        &mut trie,
+        &CTX,
+        &[signed(
+            &issuer,
+            0,
+            attest(&issuer, id, address_of(&alice), 200),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        stored_attestation(&trie, &id, &issuer).unwrap().issued_on,
+        200
     );
 }
 
@@ -527,7 +562,7 @@ fn an_older_attestation_cannot_be_replayed_over_a_newer_one() {
     let alice = signer(1);
     let bob = signer(2);
     let issuer = signer(7);
-    let mut trie = funded_trie(&[(address_of(&alice), 90_000)]);
+    let mut trie = funded_trie(&[(address_of(&alice), 90_000), (address_of(&issuer), 90_000)]);
     let id = handle("@shared");
 
     // The issuer moves the identifier from Alice to Bob.
@@ -536,7 +571,7 @@ fn an_older_attestation_cannot_be_replayed_over_a_newer_one() {
         &CTX,
         &[
             signed(&alice, 0, attest(&issuer, id, address_of(&alice), 100)),
-            signed(&alice, 1, attest(&issuer, id, address_of(&bob), 200)),
+            signed(&issuer, 0, attest(&issuer, id, address_of(&bob), 200)),
         ],
     )
     .unwrap();
@@ -546,7 +581,7 @@ fn an_older_attestation_cannot_be_replayed_over_a_newer_one() {
     );
 
     // Alice resubmits the first attestation to take it back.
-    let replay = signed(&alice, 2, attest(&issuer, id, address_of(&alice), 100));
+    let replay = signed(&alice, 1, attest(&issuer, id, address_of(&alice), 100));
     let err = execute_batch(&mut trie, &CTX, &[replay]).unwrap_err();
     assert!(
         matches!(

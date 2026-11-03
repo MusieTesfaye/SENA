@@ -207,8 +207,8 @@ try {
   console.log("\nAttestations (Celo SocialConnect)");
   const issuerSecret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
   const issuer = wasm.ed25519Address(issuerSecret);
-  const identifier = wasm.hashIdentifier("email", "Alice@Example.com", info.network_salt);
-  check("identifiers normalise", identifier === wasm.hashIdentifier("email", "alice@example.com", info.network_salt));
+  const identifier = wasm.hashIdentifier("mailto", "Alice@Example.com", info.network_salt);
+  check("identifiers normalise", identifier === wasm.hashIdentifier("mailto", "alice@example.com", info.network_salt));
   const register = async (signer, account, issuedOn) => {
     const signature = wasm.signAttestation(signer, CHAIN_ID, identifier, account, BigInt(issuedOn));
     const payload = JSON.stringify({ kind: "register_attestation", identifier, issuer, account, issued_on: issuedOn, signature });
@@ -236,6 +236,22 @@ try {
     const response = await submit(signKeyless(JSON.stringify(t)));
     check("a tampered attestation is refused by the node", response.result === "error", JSON.stringify(response));
   }
+  // A third party (the faucet) cannot submit it for the account: no consent.
+  {
+    const signature = wasm.signAttestation(issuerSecret, CHAIN_ID, identifier, address, 100n);
+    const payload = JSON.stringify({ kind: "register_attestation", identifier, issuer, account: address, issued_on: 100, signature });
+    let refused = false;
+    try {
+      const q = await rpc("sena_gasPrice", { asset: 1 });
+      wasm.buildTransaction(CHAIN_ID, faucet, 0n, payload, 1, q.rate, BigInt(q.intrinsic_gas), q.suggested_max_fee_per_gas, "0");
+    } catch (e) { refused = /attested account or by its issuer/.test(String(e)); }
+    check("a third party cannot submit someone else's attestation", refused);
+  }
+  let badType = false;
+  try { wasm.hashIdentifier("Not A Type", "x", info.network_salt); } catch { badType = true; }
+  check("a malformed identifier type is refused", badType);
+  const twitch = wasm.hashIdentifier("twitch", "alice", info.network_salt);
+  check("any provider's prefix works (twitch)", twitch.length === 64 && twitch !== identifier);
   const real = await register(issuerSecret, address, 100);
   const height = real.response.result === "submitted" ? await confirmed(real.hash) : null;
   check(`the issuer's attestation is recorded, block ${height}`, height !== null, JSON.stringify(real.response));

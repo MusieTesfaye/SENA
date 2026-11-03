@@ -126,6 +126,13 @@ impl KeylessSession {
         keyless::oauth_nonce(&self.public_key(), self.exp_date_secs, &self.blinder)
     }
 
+    /// Signs an arbitrary message with the ephemeral key, to prove possession
+    /// of it to a service (not a transaction: see [`sign`]).
+    #[must_use]
+    pub fn sign_message(&self, message: &[u8]) -> [u8; 64] {
+        self.key.sign(message).to_bytes()
+    }
+
     /// The ephemeral key in the form Aptos services expect: its BCS encoding
     /// (`0x00` Ed25519 tag, `0x20` length, key), hex without `0x`.
     #[must_use]

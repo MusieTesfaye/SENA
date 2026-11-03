@@ -29,67 +29,46 @@ impl NetworkSalt {
     }
 }
 
-/// The kind of Web2 channel an identifier belongs to.
+/// Identifier types, as Celo's `SocialConnect` names them
+/// (`@celo/odis-identifiers` `IdentifierPrefix`).
 ///
-/// The channel is committed to alongside the identifier so that the same string
-/// registered as two different kinds of handle produces two different entries,
-/// and so that a lookup cannot be answered with an entry of the wrong kind.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Channel {
+/// A type is an open-ended string, not a closed list: an issuer that verifies
+/// a platform not listed here — Twitch, Apple, a company directory — uses a
+/// prefix of its own, and nothing on chain needs to change. Prefixes are
+/// lowercase ASCII letters, digits, `.`, `+` and `-`, at most 32 bytes
+/// ([`is_valid_prefix`]).
+pub mod prefix {
+    /// A phone number, in E.164 form.
+    pub const PHONE_NUMBER: &str = "tel";
     /// An email address.
-    Email,
-    /// An E.164 phone number.
-    Phone,
-    /// A platform-specific username or handle.
-    Handle,
+    pub const EMAIL: &str = "mailto";
+    /// An X (Twitter) username.
+    pub const TWITTER: &str = "twit";
+    /// A Facebook username.
+    pub const FACEBOOK: &str = "facebook";
+    /// An Instagram username.
+    pub const INSTAGRAM: &str = "instagram";
+    /// A Discord username.
+    pub const DISCORD: &str = "discord";
+    /// A Telegram username.
+    pub const TELEGRAM: &str = "telegram";
+    /// A Signal username.
+    pub const SIGNAL: &str = "signal";
+    /// A GitHub username.
+    pub const GITHUB: &str = "github";
 }
 
-impl Channel {
-    /// The discriminant used in canonical binary encodings.
-    ///
-    /// Fixed and explicit rather than derived from declaration order, because
-    /// the Move implementation hardcodes these values and reordering the enum
-    /// would silently change what a stored slot means.
-    #[must_use]
-    pub const fn discriminant(self) -> u8 {
-        match self {
-            Self::Email => 0,
-            Self::Phone => 1,
-            Self::Handle => 2,
-        }
-    }
-
-    /// The channel a discriminant names, if any.
-    #[must_use]
-    pub const fn from_discriminant(d: u8) -> Option<Self> {
-        match d {
-            0 => Some(Self::Email),
-            1 => Some(Self::Phone),
-            2 => Some(Self::Handle),
-            _ => None,
-        }
-    }
-
-    /// The tag committed to in the identifier hash.
-    #[must_use]
-    pub const fn tag(self) -> &'static [u8] {
-        match self {
-            Self::Email => b"email",
-            Self::Phone => b"phone",
-            Self::Handle => b"handle",
-        }
-    }
-}
-
-impl fmt::Display for Channel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Email => "email",
-            Self::Phone => "phone",
-            Self::Handle => "handle",
+/// Whether `prefix` is a well-formed identifier type: 1 to 32 bytes of
+/// lowercase ASCII letters, digits, `.`, `+` or `-`, starting with a letter.
+#[must_use]
+pub fn is_valid_prefix(prefix: &str) -> bool {
+    let b = prefix.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'+' | b'-')
         })
-    }
 }
 
 /// A social identifier stored as an opaque digest.
@@ -123,20 +102,27 @@ impl HashedIdentifier {
     /// The raw value is normalised first, so that the same identifier typed with
     /// different capitalisation or stray whitespace resolves to one entry.
     ///
+    /// The identifier type is a Celo prefix ([`prefix`]): `tel`, `mailto`,
+    /// `twit`, `github`, or any other an issuer uses. The prefix and the
+    /// plain text are committed to separately, so the same string under two
+    /// types is two identifiers, as Celo's `prefix://plaintext` makes it.
+    ///
     /// ```
-    /// use sena_primitives::{Channel, HashedIdentifier, NetworkSalt};
+    /// use sena_primitives::{prefix, HashedIdentifier, NetworkSalt};
     ///
     /// let salt = NetworkSalt::new(*b"network-salt");
-    /// let a = HashedIdentifier::new(Channel::Email, " Alice@Example.COM ", &salt);
-    /// let b = HashedIdentifier::new(Channel::Email, "alice@example.com", &salt);
+    /// let a = HashedIdentifier::new(prefix::EMAIL, " Alice@Example.COM ", &salt);
+    /// let b = HashedIdentifier::new(prefix::EMAIL, "alice@example.com", &salt);
     /// assert_eq!(a, b);
+    /// assert_ne!(a, HashedIdentifier::new("twitch", "alice@example.com", &salt));
     /// ```
     #[must_use]
-    pub fn new(channel: Channel, raw: &str, salt: &NetworkSalt) -> Self {
-        let normalised = normalise(channel, raw);
+    pub fn new(identifier_type: &str, raw: &str, salt: &NetworkSalt) -> Self {
+        let identifier_type = identifier_type.trim().to_ascii_lowercase();
+        let normalised = normalise(&identifier_type, raw);
         Self(Hash256::commit(
             CanonicalEncoder::new(domain::SOCIAL_IDENTIFIER)
-                .field(channel.tag())
+                .field(identifier_type.as_bytes())
                 .field(normalised.as_bytes())
                 .field(salt.as_bytes()),
         ))
@@ -169,25 +155,22 @@ impl fmt::Debug for HashedIdentifier {
 /// lowercasing is used rather than Unicode case folding because full case
 /// folding is table-driven and version-dependent, which would make the state
 /// root depend on the Unicode version a node was built against.
-fn normalise(channel: Channel, raw: &str) -> String {
+fn normalise(identifier_type: &str, raw: &str) -> String {
     let trimmed = raw.trim();
-    match channel {
-        // Email domains are case-insensitive, and in practice mailbox names are
-        // treated that way too by every major provider. Handles are likewise
-        // case-insensitive on every platform SENA resolves against, so the two
-        // share a rule -- they stay distinct entries because the channel tag is
-        // committed to separately in `HashedIdentifier::new`.
-        Channel::Email | Channel::Handle => trimmed.to_ascii_lowercase(),
+    if identifier_type == prefix::PHONE_NUMBER {
         // Phone numbers are compared by digits alone, so formatting punctuation
         // is dropped. A leading '+' is preserved to keep E.164 form meaningful.
-        Channel::Phone => {
-            let mut out = String::with_capacity(trimmed.len());
-            if trimmed.starts_with('+') {
-                out.push('+');
-            }
-            out.extend(trimmed.chars().filter(char::is_ascii_digit));
-            out
+        let mut out = String::with_capacity(trimmed.len());
+        if trimmed.starts_with('+') {
+            out.push('+');
         }
+        out.extend(trimmed.chars().filter(char::is_ascii_digit));
+        out
+    } else {
+        // Email domains are case-insensitive, and in practice mailbox names
+        // are treated that way too by every major provider; usernames are
+        // case-insensitive on every platform an issuer verifies today.
+        trimmed.to_ascii_lowercase()
     }
 }
 
@@ -201,52 +184,69 @@ mod tests {
 
     #[test]
     fn hashing_is_deterministic() {
-        let a = HashedIdentifier::new(Channel::Email, "user@example.com", &salt());
-        let b = HashedIdentifier::new(Channel::Email, "user@example.com", &salt());
+        let a = HashedIdentifier::new(prefix::EMAIL, "user@example.com", &salt());
+        let b = HashedIdentifier::new(prefix::EMAIL, "user@example.com", &salt());
         assert_eq!(a, b);
         println!("root={}", a.0.to_hex());
     }
 
     #[test]
     fn email_normalisation_folds_case_and_whitespace() {
-        let a = HashedIdentifier::new(Channel::Email, "  USER@Example.Com ", &salt());
-        let b = HashedIdentifier::new(Channel::Email, "user@example.com", &salt());
+        let a = HashedIdentifier::new(prefix::EMAIL, "  USER@Example.Com ", &salt());
+        let b = HashedIdentifier::new(prefix::EMAIL, "user@example.com", &salt());
         assert_eq!(a, b);
     }
 
     #[test]
     fn phone_normalisation_drops_formatting() {
-        let a = HashedIdentifier::new(Channel::Phone, "+1 (555) 010-1234", &salt());
-        let b = HashedIdentifier::new(Channel::Phone, "+15550101234", &salt());
+        let a = HashedIdentifier::new(prefix::PHONE_NUMBER, "+1 (555) 010-1234", &salt());
+        let b = HashedIdentifier::new(prefix::PHONE_NUMBER, "+15550101234", &salt());
         assert_eq!(a, b);
     }
 
     #[test]
     fn phone_normalisation_keeps_country_prefix_significant() {
-        let international = HashedIdentifier::new(Channel::Phone, "+15550101234", &salt());
-        let national = HashedIdentifier::new(Channel::Phone, "15550101234", &salt());
+        let international = HashedIdentifier::new(prefix::PHONE_NUMBER, "+15550101234", &salt());
+        let national = HashedIdentifier::new(prefix::PHONE_NUMBER, "15550101234", &salt());
         assert_ne!(international, national);
+    }
+
+    #[test]
+    fn prefixes_follow_celo() {
+        for p in [
+            prefix::PHONE_NUMBER,
+            prefix::EMAIL,
+            prefix::TWITTER,
+            prefix::GITHUB,
+            "twitch",
+            "apple",
+        ] {
+            assert!(is_valid_prefix(p), "{p}");
+        }
+        for p in ["", "Tel", "1tel", "tel://", "a b", &"x".repeat(33)] {
+            assert!(!is_valid_prefix(p), "{p:?}");
+        }
     }
 
     #[test]
     fn channels_are_separated() {
         // The same string registered as a handle and as an email must not collide.
-        let as_email = HashedIdentifier::new(Channel::Email, "alice", &salt());
-        let as_handle = HashedIdentifier::new(Channel::Handle, "alice", &salt());
+        let as_email = HashedIdentifier::new(prefix::EMAIL, "alice", &salt());
+        let as_handle = HashedIdentifier::new("handle", "alice", &salt());
         assert_ne!(as_email, as_handle);
     }
 
     #[test]
     fn a_different_salt_yields_a_different_digest() {
-        let a = HashedIdentifier::new(Channel::Handle, "alice", &salt());
-        let b = HashedIdentifier::new(Channel::Handle, "alice", &NetworkSalt::new(*b"other"));
+        let a = HashedIdentifier::new("handle", "alice", &salt());
+        let b = HashedIdentifier::new("handle", "alice", &NetworkSalt::new(*b"other"));
         assert_ne!(a, b);
     }
 
     #[test]
     fn identifier_and_salt_boundaries_are_unambiguous() {
-        let a = HashedIdentifier::new(Channel::Handle, "ab", &NetworkSalt::new(*b"c"));
-        let b = HashedIdentifier::new(Channel::Handle, "a", &NetworkSalt::new(*b"bc"));
+        let a = HashedIdentifier::new("handle", "ab", &NetworkSalt::new(*b"c"));
+        let b = HashedIdentifier::new("handle", "a", &NetworkSalt::new(*b"bc"));
         assert_ne!(a, b);
     }
 }

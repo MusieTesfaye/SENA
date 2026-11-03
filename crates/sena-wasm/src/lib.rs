@@ -7,7 +7,7 @@
 //!
 //! Build: `scripts/build-wasm.sh`.
 
-use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address};
+use sena_primitives::{is_valid_prefix, AssetId, HashedIdentifier, L2Address};
 use sena_stf::keyless::limits;
 use sena_stf::{KeylessSignature, Payload, Transaction};
 use sena_wallet::keyless::{self, Jwt, KeylessSession, SignIn};
@@ -259,26 +259,26 @@ pub fn build_transaction(
     Ok(json_of(&tx))
 }
 
-fn channel(name: &str) -> Result<Channel, JsError> {
-    match name {
-        "email" => Ok(Channel::Email),
-        "phone" => Ok(Channel::Phone),
-        "handle" => Ok(Channel::Handle),
-        other => Err(err(format!(
-            "unknown channel {other:?}; use email, phone or handle"
-        ))),
-    }
-}
-
-/// The hashed identifier for `raw` on `channel` ("email", "phone" or
-/// "handle"), under the network salt (the node's `network_salt`, hex). The
-/// plain text is normalised first and never leaves the caller.
+/// The hashed identifier for `raw` of type `identifier_type` — a Celo prefix
+/// such as `tel`, `mailto`, `twit` or `github`, or any other an issuer uses —
+/// under the network salt (the node's `network_salt`, hex). The plain text is
+/// normalised first and never leaves the caller.
 #[wasm_bindgen(js_name = hashIdentifier)]
-pub fn hash_identifier(channel_name: &str, raw: &str, salt_hex: &str) -> Result<String, JsError> {
+pub fn hash_identifier(
+    identifier_type: &str,
+    raw: &str,
+    salt_hex: &str,
+) -> Result<String, JsError> {
+    if !is_valid_prefix(identifier_type) {
+        return Err(err(format!(
+            "{identifier_type:?} is not an identifier type: use lowercase letters, digits, '.', '+' or '-'"
+        )));
+    }
     let salt = hex::decode(salt_hex.trim().trim_start_matches("0x"))
         .map_err(|_| err("network salt must be hex"))?;
-    let id = sena_wallet::hash_identifier(channel(channel_name)?, raw, &salt);
-    Ok(id.0.to_string())
+    Ok(sena_wallet::hash_identifier(identifier_type, raw, &salt)
+        .0
+        .to_string())
 }
 
 fn identifier(hex_str: &str) -> Result<HashedIdentifier, JsError> {
@@ -336,6 +336,43 @@ pub fn sign_ed25519(tx: &str, secret: &str) -> Result<String, JsError> {
 #[wasm_bindgen(js_name = ed25519Address)]
 pub fn ed25519_address(secret: &str) -> Result<String, JsError> {
     Ok(sena_wallet::ed25519_address(&bytes(secret, "secret key")?).to_string())
+}
+
+/// Signs `message` (hex) with a session's ephemeral key: proof, to an issuer,
+/// that the caller holds the key a Google sign-in committed to.
+#[wasm_bindgen(js_name = signWithSession)]
+pub fn sign_with_session(session: &str, message_hex: &str) -> Result<String, JsError> {
+    let message = hex::decode(message_hex.trim_start_matches("0x"))
+        .map_err(|_| err("message must be hex"))?;
+    Ok(hex::encode(session_from(session)?.sign_message(&message)))
+}
+
+/// Whether `signature` (hex) is `public_key`'s strict Ed25519 signature on
+/// `message` (hex), as the chain checks signatures.
+#[wasm_bindgen(js_name = verifyEd25519)]
+pub fn verify_ed25519(
+    public_key: &str,
+    signature: &str,
+    message_hex: &str,
+) -> Result<bool, JsError> {
+    let message = hex::decode(message_hex.trim_start_matches("0x"))
+        .map_err(|_| err("message must be hex"))?;
+    Ok(sena_wallet::verify_ed25519(
+        &bytes(public_key, "public key")?,
+        &bytes(signature, "signature")?,
+        &message,
+    ))
+}
+
+/// The OAuth nonce for an ephemeral public key, expiry and blinder, so a
+/// service can check a JWT was issued for the session it is shown.
+#[wasm_bindgen(js_name = oauthNonce)]
+pub fn oauth_nonce(public_key: &str, exp_date_secs: u64, blinder: &str) -> Result<String, JsError> {
+    Ok(sena_stf::keyless::oauth_nonce(
+        &bytes(public_key, "public key")?,
+        exp_date_secs,
+        &bytes(blinder, "blinder")?,
+    ))
 }
 
 /// A transaction's hash, as the node reports it.

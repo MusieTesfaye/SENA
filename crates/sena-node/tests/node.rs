@@ -4,7 +4,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address, NetworkSalt};
+use sena_primitives::{AssetId, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use sena_stf::{
     apply, Authenticator, Instruction, Payload, Transaction, WhitelistedAsset, RATE_SCALE,
@@ -567,7 +567,7 @@ fn rpc_reports_an_unknown_account_as_empty_rather_than_failing() {
 /// Alice's email, hashed under the test salt.
 fn alices_email() -> HashedIdentifier {
     HashedIdentifier::new(
-        Channel::Email,
+        sena_primitives::prefix::EMAIL,
         "alice@example.com",
         &NetworkSalt::new(*b"test-salt"),
     )

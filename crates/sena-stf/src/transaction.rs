@@ -25,10 +25,10 @@ pub enum Payload {
         amount: u128,
     },
     /// Record an issuer's signed attestation that `identifier` belongs to
-    /// `account` (REQ-SOCIAL-001, Celo's `registerAttestation`). Anyone may
-    /// submit it; the issuer's signature over
-    /// [`attestation_digest`](crate::social::attestation_digest) is what
-    /// counts, and a transaction carrying a bad one does not compile.
+    /// `account` (REQ-SOCIAL-001, Celo's `registerAttestation`). The issuer's
+    /// signature over [`attestation_digest`](crate::social::attestation_digest)
+    /// must verify, and the sender must be `account` (consenting) or the
+    /// issuer; otherwise the transaction does not compile.
     RegisterAttestation {
         /// The identifier, hashed client-side so the plain text never reaches
         /// the node (REQ-SOCIAL-003).

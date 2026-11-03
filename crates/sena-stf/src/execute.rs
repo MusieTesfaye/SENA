@@ -519,6 +519,10 @@ pub enum CompileError {
     /// An attestation's issuer signature does not verify.
     #[error("the issuer's signature on the attestation does not verify")]
     BadAttestation,
+    /// An attestation was submitted by neither the attested account nor the
+    /// issuer.
+    #[error("an attestation is submitted by the attested account or by its issuer")]
+    AttestationWithoutConsent,
 }
 
 /// What a batch is executed against, besides state.
@@ -753,6 +757,12 @@ fn compile_payload(
             issued_on,
             signature,
         } => {
+            // The account consents by submitting it (or the issuer vouches for
+            // the account by submitting it itself), so an issuer has only to
+            // verify who owns the identifier, never who owns the account.
+            if sender != *account && sender != *issuer {
+                return Err(CompileError::AttestationWithoutConsent);
+            }
             // Stateless, so checked here, as the sender's own signature is.
             let digest = attestation_digest(chain_id, identifier, issuer, account, *issued_on);
             crate::transaction::verify_ed25519_strict(issuer.as_bytes(), signature, &digest)

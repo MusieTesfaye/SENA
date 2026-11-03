@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```
-//! use sena_primitives::{Channel, HashedIdentifier, L2Address, NetworkSalt};
+//! use sena_primitives::{HashedIdentifier, L2Address, NetworkSalt};
 //!
 //! // A keyless account: an issuer hash and an identity commitment, both
 //! // Poseidon field elements computed by the wallet (see `sena_stf::keyless`).
@@ -26,10 +26,10 @@
 //!
 //! // The handle that resolves to it, stored as an opaque digest.
 //! let salt = NetworkSalt::new(*b"sena-mainnet-salt");
-//! let handle = HashedIdentifier::new(Channel::Handle, "@alice", &salt);
+//! let handle = HashedIdentifier::new("github", "@alice", &salt);
 //!
 //! assert_eq!(address, L2Address::derive_keyless(&[7; 32], &[42; 32]));
-//! assert_eq!(handle, HashedIdentifier::new(Channel::Handle, "@ALICE", &salt));
+//! assert_eq!(handle, HashedIdentifier::new("github", "@ALICE", &salt));
 //! ```
 
 #![doc(html_root_url = "https://docs.rs/sena-primitives")]
@@ -47,4 +47,4 @@ pub use address::{AssetId, L2Address};
 pub use codec::{DecodeError, Reader, Writer};
 pub use encoding::{chain_id, domain, CanonicalEncoder};
 pub use hash::{Hash256, HashParseError};
-pub use identity::{Channel, HashedIdentifier, NetworkSalt};
+pub use identity::{is_valid_prefix, prefix, HashedIdentifier, NetworkSalt};

@@ -4,8 +4,12 @@
 //! SENA follows Celo's `SocialConnect`. An *issuer* — any account that verifies
 //! ownership of a phone number, email address or handle, for instance by
 //! sending a code to it — signs an attestation that an identifier belongs to an
-//! account. Anyone may submit the signed attestation; the chain checks the
-//! issuer's signature and records it under the identifier and the issuer.
+//! account. The attested account submits it — consenting to be found by that
+//! identifier — or the issuer does; the chain checks the issuer's signature and
+//! records it under the identifier and the issuer. Unlike Celo, where anyone
+//! may submit a signed attestation, requiring the account's consent means an
+//! issuer has only to verify who owns the identifier (by OAuth, OIDC, an SMS
+//! code — its own choice), never who owns the account.
 //! Nothing is first come, first served: an identifier has no owner on chain
 //! except as some issuer attests, and a lookup names the issuers it trusts
 //! (Celo's `lookupAttestations(identifier, trustedIssuers)`).

@@ -12,8 +12,7 @@
 //! Run `cargo test -p sena-stf --test conformance -- --nocapture` to print them.
 
 use sena_primitives::{
-    domain, AssetId, CanonicalEncoder, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt,
-    Writer,
+    domain, AssetId, CanonicalEncoder, Hash256, HashedIdentifier, L2Address, NetworkSalt, Writer,
 };
 use sena_state::{MerkleTrie, Node};
 use sena_stf::{keys, Account, Attestation, MachineState, WhitelistedAsset};
@@ -195,14 +194,11 @@ fn machine_commitment_vectors() {
 fn identifier_vectors() {
     println!("\n-- identifiers --");
     let salt = NetworkSalt::new(*b"sena-conformance-salt");
-    let id = HashedIdentifier::new(Channel::Handle, "@alice", &salt);
+    let id = HashedIdentifier::new("handle", "@alice", &salt);
     vector("handle(@alice)", id.as_hash().as_bytes());
 
     // Normalisation is a consensus rule, so it is pinned too.
-    assert_eq!(
-        id,
-        HashedIdentifier::new(Channel::Handle, "  @ALICE ", &salt)
-    );
+    assert_eq!(id, HashedIdentifier::new("handle", "  @ALICE ", &salt));
 }
 
 #[test]

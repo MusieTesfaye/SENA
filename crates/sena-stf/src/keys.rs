@@ -94,7 +94,7 @@ pub fn jwk(iss_hash: &[u8; 32], jwk_hash: &[u8; 32]) -> Hash256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sena_primitives::{Channel, NetworkSalt};
+    use sena_primitives::NetworkSalt;
 
     #[test]
     fn regions_do_not_collide() {
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn keys_are_deterministic() {
         let salt = NetworkSalt::new(*b"salt");
-        let id = HashedIdentifier::new(Channel::Handle, "alice", &salt);
+        let id = HashedIdentifier::new("handle", "alice", &salt);
         let issuer = L2Address::from_bytes([9; 32]);
         assert_eq!(attestation(&id, &issuer), attestation(&id, &issuer));
         assert_ne!(

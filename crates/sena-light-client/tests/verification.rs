@@ -3,7 +3,7 @@ use std::time::Instant;
 use sena_light_client::{
     verify_account_standalone, AccountProofPayload, LightClient, LightClientError, TrustLevel,
 };
-use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
+use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::MerkleTrie;
 use sena_stf::{keys, Account, Attestation};
 
@@ -169,7 +169,7 @@ fn verifies_an_issuers_attestation() {
     let issuer = test_address(0x22);
     let other_issuer = test_address(0x33);
     let salt = NetworkSalt::new(b"test_salt".to_vec());
-    let handle = HashedIdentifier::new(Channel::Handle, "alice_web3", &salt);
+    let handle = HashedIdentifier::new("handle", "alice_web3", &salt);
 
     let slot = keys::attestation(&handle, &issuer);
     let attestation = Attestation {

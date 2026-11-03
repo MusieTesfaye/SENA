@@ -8,7 +8,7 @@
 pub mod keyless;
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use sena_primitives::{AssetId, Channel, HashedIdentifier, L2Address, NetworkSalt};
+use sena_primitives::{AssetId, HashedIdentifier, L2Address, NetworkSalt};
 use sena_stf::{attestation_digest, Authenticator, Payload, Transaction};
 
 /// What a transfer pays for gas, as a node's `sena_gasPrice` quotes it.
@@ -86,11 +86,13 @@ pub fn transfer(
     )
 }
 
-/// The hashed form of an identifier, as attestations and lookups name it:
-/// normalised, then hashed under the network's salt (REQ-SOCIAL-002).
+/// The hashed form of an identifier of type `identifier_type` (a Celo
+/// prefix: `tel`, `mailto`, `twit`, `github`, ...), as attestations and
+/// lookups name it: normalised, then hashed under the network's salt
+/// (REQ-SOCIAL-002).
 #[must_use]
-pub fn hash_identifier(channel: Channel, raw: &str, salt: &[u8]) -> HashedIdentifier {
-    HashedIdentifier::new(channel, raw, &NetworkSalt::new(salt.to_vec()))
+pub fn hash_identifier(identifier_type: &str, raw: &str, salt: &[u8]) -> HashedIdentifier {
+    HashedIdentifier::new(identifier_type, raw, &NetworkSalt::new(salt.to_vec()))
 }
 
 /// An issuer's signature attesting that `identifier` belongs to `account` on
@@ -114,6 +116,19 @@ pub fn sign_attestation(
 #[must_use]
 pub fn ed25519_address(secret: &[u8; 32]) -> L2Address {
     L2Address::from_bytes(SigningKey::from_bytes(secret).verifying_key().to_bytes())
+}
+
+/// Whether `signature` is `public_key`'s strict Ed25519 signature on
+/// `message`: canonical, and not by a small-order key, as the chain requires.
+#[must_use]
+pub fn verify_ed25519(public_key: &[u8; 32], signature: &[u8; 64], message: &[u8]) -> bool {
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    !key.is_weak()
+        && key
+            .verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+            .is_ok()
 }
 
 /// Signs `tx` with an Ed25519 key, as the account that key controls.
@@ -169,10 +184,10 @@ mod tests {
         let issuer_secret = [6; 32];
         let issuer = ed25519_address(&issuer_secret);
         let alice = ed25519_address(&[5; 32]);
-        let id = hash_identifier(Channel::Email, "Alice@Example.com", b"salt");
+        let id = hash_identifier(sena_primitives::prefix::EMAIL, "Alice@Example.com", b"salt");
         assert_eq!(
             id,
-            hash_identifier(Channel::Email, "alice@example.com", b"salt")
+            hash_identifier(sena_primitives::prefix::EMAIL, "alice@example.com", b"salt")
         );
         let register = |signature| Payload::RegisterAttestation {
             identifier: id,

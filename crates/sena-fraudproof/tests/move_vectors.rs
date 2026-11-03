@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ed25519_dalek::{Signer, SigningKey};
 use sena_fraudproof::bisection::{Dispute, Opening, Stage};
 use sena_fraudproof::{AssertionId, PartyId, TracePlayer};
-use sena_primitives::{AssetId, Channel, Hash256, HashedIdentifier, L2Address, NetworkSalt};
+use sena_primitives::{AssetId, Hash256, HashedIdentifier, L2Address, NetworkSalt};
 use sena_state::{MerkleTrie, Terminal};
 use sena_stf::batch::BatchTree;
 use sena_stf::gas::{
@@ -795,7 +795,7 @@ fn generate() -> String {
         ),
     ));
     let identifier = HashedIdentifier::new(
-        Channel::Email,
+        sena_primitives::prefix::EMAIL,
         "alice@example.com",
         &NetworkSalt::new(*b"vectors"),
     );
@@ -817,13 +817,27 @@ fn generate() -> String {
             signature: signer.sign(digest.as_bytes()).to_bytes(),
         }
     };
-    let submitter = key(2);
+    let third_party = key(2);
     cases.push(CompileCase::at(
-        "register_attestation",
+        "register_attestation_by_account",
         &sign_ed25519(
-            &submitter,
+            &alice,
+            base(addr(&alice), 0, attest(sena_stf::TEST_CHAIN_ID, &issuer)),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "register_attestation_by_issuer",
+        &sign_ed25519(
+            &issuer,
+            base(addr(&issuer), 0, attest(sena_stf::TEST_CHAIN_ID, &issuer)),
+        ),
+    ));
+    cases.push(CompileCase::at(
+        "register_attestation_by_third_party",
+        &sign_ed25519(
+            &third_party,
             base(
-                addr(&submitter),
+                addr(&third_party),
                 0,
                 attest(sena_stf::TEST_CHAIN_ID, &issuer),
             ),
@@ -832,17 +846,13 @@ fn generate() -> String {
     cases.push(CompileCase::at(
         "register_attestation_forged",
         &sign_ed25519(
-            &submitter,
-            base(
-                addr(&submitter),
-                0,
-                attest(sena_stf::TEST_CHAIN_ID, &key(8)),
-            ),
+            &alice,
+            base(addr(&alice), 0, attest(sena_stf::TEST_CHAIN_ID, &key(8))),
         ),
     ));
     cases.push(CompileCase::at(
         "register_attestation_other_chain",
-        &sign_ed25519(&submitter, base(addr(&submitter), 0, attest(5, &issuer))),
+        &sign_ed25519(&alice, base(addr(&alice), 0, attest(5, &issuer))),
     ));
     cases.push(CompileCase::at(
         "revoke_attestation",
