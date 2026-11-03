@@ -1,5 +1,13 @@
 //! Fees: metered gas, a base fee that follows demand, and payment in any
-//! whitelisted stablecoin (REQ-GAS-001 through REQ-GAS-010).
+//! whitelisted stablecoin.
+//!
+//! Requirements: fees in whitelisted stablecoins (REQ-GAS-001) with no native
+//! token to hold (REQ-GAS-002), from a governed asset ledger (REQ-GAS-003); the
+//! gas a transaction costs is evaluated at compile time (REQ-GAS-004) at the
+//! asset's rate (REQ-GAS-005), held from the sender's balance (REQ-GAS-006) and
+//! settled into the fee vault (REQ-GAS-007), with rates kept in state so a
+//! verifier reconstructs every fee (REQ-GAS-010). Converting fees into APT for
+//! L1 costs (REQ-GAS-008, REQ-GAS-009) is not implemented.
 //!
 //! The design follows Celo's fee abstraction, adapted to a chain with no
 //! native token:

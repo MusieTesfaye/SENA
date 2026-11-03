@@ -121,6 +121,7 @@ sena-node genesis --data-dir ./devnet --dev --fund "$ALICE:100000000"
 ```
 genesis written to ./devnet/genesis.json
   chain            sena-devnet-1
+  chain id         190367562503071
   challenge window 86400s
   allocations      1
   state root       239189842d65840fd9d370ef8b8903da9b96cfced72cf2e91c5fda36badff9d1
@@ -128,7 +129,10 @@ genesis written to ./devnet/genesis.json
 
 That funds Alice with 100 USDC (asset 1, six decimals). **Two operators with
 the same genesis file get the same state root** — compare it before trusting
-anyone's chain. The file it writes:
+anyone's chain. The **chain id** is a number derived from the chain's name.
+Every transaction, attestation and council approval signs it, so a signature
+made for one SENA chain is refused on every other. Wallets read it from
+`sena_getChainInfo` (`transaction_chain_id`). The file it writes:
 
 ```json
 {
@@ -351,7 +355,7 @@ aptos move run --function-id $P::assertions::initialize \
          u64:86400 u128:1000000 address:0xa address:$P u64:3600 \
   --profile proposer --max-gas 200000 --assume-yes
 
-aptos move run --function-id $P::disputes::initialize --args address:$P u8:0 \
+aptos move run --function-id $P::disputes::initialize --args address:$P u8:0 u64:190367562503071 \
   --profile proposer --max-gas 200000 --assume-yes
 ```
 
@@ -365,8 +369,10 @@ aptos move run --function-id $P::disputes::initialize --args address:$P u8:0 \
 5. the treasury, which receives what the winner of a dispute does not;
 6. the most a batch timestamp may lag L1, in seconds.
 
-`disputes::initialize` takes the keyless setup: 0 disabled, 1 Aptos mainnet
-ceremony, 2 the insecure devnet key.
+`disputes::initialize` takes the keyless setup (0 disabled, 1 Aptos mainnet
+ceremony, 2 the insecure devnet key) and the **chain id** `sena-node genesis`
+printed. A disputed transaction signed for another chain is then
+uncompilable on L1, as it is on L2.
 
 Always pass `--max-gas`: without it the CLI simulates first, and the
 simulation endpoint can time out.
@@ -567,10 +573,60 @@ The wallet's README covers the rest: a Google OAuth client, `bun run faucet`,
 `bun run dev`, and sending between two Google accounts.
 
 Two tests drive the WebAssembly package against a live node.
-`crates/sena-wasm/tests/e2e.mjs` (36 checks) has a keyless account send each
+`crates/sena-wasm/tests/e2e.mjs` (46 checks) has a keyless account send each
 stablecoin, paying its fee in that coin, then checks balances, history,
-CORS and refusals. The wallet's `bun run test:e2e` (28 checks) does the same
-through the wallet's UI in Chromium.
+attestations, CORS and refusals. The wallet's `bun run test:e2e` (37 checks)
+does the same through the wallet's UI in Chromium, and links, pays and unlinks
+identities.
+
+### Identities: paying an email, a phone or a username
+
+SENA copies Celo's SocialConnect. Nothing on chain decides who owns
+`alice@example.com`. Instead, **issuers** vouch for it:
+
+1. An issuer checks that someone owns an identifier, however it likes: a
+   Google, Apple or Twitch sign-in, a GitHub or X login, an SMS code.
+2. It signs an **attestation**: this identifier belongs to this account, as of
+   this time, on this chain.
+3. The account submits it in a `register_attestation` transaction. That is the
+   account's consent to be found by the identifier. The issuer may also submit
+   it, vouching for the account itself; nobody else can.
+4. A sender hashes the identifier and asks the node what the issuers *they
+   trust* have attested (`sena_lookupAttestations`). Different wallets can trust
+   different issuers.
+
+The identifier never goes on chain in plain text. It is hashed with its type
+(the Celo **prefix**: `mailto`, `tel`, `twit`, `github`, `discord`, or any
+short lowercase name) and the network salt:
+
+```js
+const identifier = sena.hashIdentifier("mailto", "alice@example.com", info.network_salt);
+const { attestations } = await rpc("sena_lookupAttestations", {
+  identifier,
+  trusted_issuers: ["0x0919…3ec7"],
+});
+// [{ issuer: "0x0919…3ec7", account: "0x760c…60af", issued_on: 1762180000 }]
+```
+
+The chain checks:
+- the issuer's Ed25519 signature over the chain id, identifier, account and
+  time;
+- that the sender is the attested account or the issuer;
+- that a newer attestation is not replaced by an older one.
+
+Disputes check the same on Aptos, so a sequencer cannot credit a forged
+attestation. `revoke_attestation` from the issuer or the account removes it.
+
+**The issuer.** The wallet repository ships one, `issuer.ts`. It works with
+any OpenID Connect provider, any OAuth 2 provider with a user-info endpoint,
+and Twilio Verify, all configured in `issuer.config.json`. Its README covers
+setting it up. Anyone can run an issuer; an issuer's address is its Ed25519
+key.
+
+**What it does not protect.** The network salt is public, so an identifier
+can be confirmed by guessing it, and phone numbers can be tried one by one.
+Celo prevents this with ODIS, a rate-limited service that turns an identifier
+into a private pepper. SENA has no ODIS yet.
 
 ## 8. Governance
 
@@ -761,12 +817,12 @@ honest chain, a caught fraud, and a withdrawal refused before finality.
 | `sena_getAccountTransactions` | `address`, optional `limit` (50) | sent and received transactions, newest first, queued ones included, with the fee each paid |
 | `sena_getConfirmation` | `hash` | `pending`, `soft_confirmed` or `finalized`, with the height |
 | `sena_getBlock` | `height` | header (timestamp, base fee, tip recipient), transactions, trace length, start positions, assertion |
-| `sena_getChainInfo` | — | chain id, height, finalized height, window, state root, mempool size |
+| `sena_getChainInfo` | — | chain name, `transaction_chain_id`, `network_salt`, height, finalized height, window, state root, mempool size |
 | `sena_getStateRoot` · `sena_getFinalizedHeight` | — | |
 | `sena_getAssertion` | `id` | status and time left in its window |
 | `sena_getAccountProof` | `address`, optional `height` | a Merkle proof for light clients |
 | `sena_getWithdrawalProof` | `address` | a proof against the latest finalized root |
-| `sena_resolveIdentifier` | `identifier` | the address a hashed handle is bound to |
+| `sena_lookupAttestations` | `identifier`, `trusted_issuers` (up to 16) | each trusted issuer's attestation: `issuer`, `account`, `issued_on` |
 | `sena_getTraceCommitments` | `height`, `steps` | machine-state commitments (the relayer uses these to dissect) |
 | `sena_getDaBlob` | `height` | the block's batch data, as published |
 
@@ -780,7 +836,7 @@ Amounts are decimal strings, because JSON numbers cannot carry a `u128`.
 | `assertions::post` | chain, parent, pre-root, post-root, timestamp, base fee, tip recipient, transactions, start positions, trace length, bond |
 | `assertions::open_challenge` | chain, assertion, bond |
 | `assertions::finalize` | chain, assertion |
-| `disputes::initialize` | chain, keyless setup |
+| `disputes::initialize` | chain, keyless setup, transaction chain id |
 | `disputes::open` · `dissect` · `select` · `one_step` · `claim_timeout` | the bisection game |
 | `disputes::prove_uncompilable` · `prove_start_gap` · `prove_trace_length` | structural fraud proofs |
 | `keyless_jobs::start` · `advance` · `finish` | a keyless verdict across transactions |
@@ -788,7 +844,7 @@ Amounts are decimal strings, because JSON numbers cannot carry a `u128`.
 
 Views: `assertions::{assertion_count, assertion_at, record, status,
 challengers, challenge_window, minimum_bond, escrow_balance}`,
-`disputes::{dispute_state, disputed_step, winner, keyless_setup}`,
+`disputes::{dispute_state, disputed_step, winner, keyless_setup, chain_id}`,
 `keyless_jobs::progress`,
 `bridge::{custody_balance, deposit_count, is_spent, is_overdue}`.
 
@@ -796,7 +852,7 @@ challengers, challenge_window, minimum_bond, escrow_balance}`,
 
 | Field | Meaning |
 |---|---|
-| `chain_id`, `network_salt` | the chain's identity; the salt hashes social handles |
+| `chain_id`, `network_salt` | the chain's name (its number, signed by every transaction, is derived from it) and the salt identifiers are hashed with |
 | `challenge_window_secs` | at least 86,400 |
 | `minimum_bond` | decimal string |
 | `gas_assets[]` | `asset`, `symbol`, `rate` (units per 10⁶ native units), `intrinsic_gas` (default 10,000), `enabled` |
@@ -832,8 +888,12 @@ they touch:
   address rather than an L2 one. Today L2 balances come only from genesis.
 - **No dispute has been played on testnet**, and the relayer and watcher have
   run against localnets only.
-- **No live keyless sign-in** against Aptos's prover and pepper services, and
-  training-wheels signatures are unchecked.
+- **Live keyless sign-in is tested by hand only**, not in an automated test,
+  and training-wheels signatures are unchecked.
+- **No ODIS.** Identifiers are hashed with a public salt, so they can be
+  guessed.
+- **Testnet runs the previous package**, from before the chain id and
+  attestations.
 - **Recovery after a rejected assertion is manual.**
 - **No governance or fee-distribution CLI**; both are built with `sena_stf`.
 - **`sena-node verify` is a stub** — use `watch`.

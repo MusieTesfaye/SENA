@@ -6,7 +6,8 @@ tests and evidence. Written by hand it would be stale within a week, so it is
 generated: requirement IDs are read from the SRS, then located in the Rust and
 Move sources and in the test suite.
 
-Usage:  python3 docs/beta/traceability.py > docs/beta/TRACEABILITY.md
+Usage:  python3 docs/beta/traceability.py          # rewrite TRACEABILITY.md
+        python3 docs/beta/traceability.py --check  # fail if it is stale
 """
 from __future__ import annotations
 
@@ -60,7 +61,10 @@ def link(path: str) -> str:
     return f"[`{pathlib.Path(path).name}`](../../{path})"
 
 
-def main() -> None:
+OUT = ROOT / "docs/beta/TRACEABILITY.md"
+
+
+def render() -> str:
     ids = requirement_ids()
     if not ids:
         sys.exit("no requirement IDs found; is the SRS present?")
@@ -77,23 +81,36 @@ def main() -> None:
         status = "implemented" if has_impl else "not implemented"
         rows.append(f"| `{req}` | {status} | {impl} | {tests} |")
 
-    print("# Requirements traceability")
-    print()
-    print("**Generated** by `docs/beta/traceability.py` — do not edit by hand.")
-    print()
-    print("Maps every requirement in the SRS to the code that cites it and the tests")
-    print("that exercise it. A requirement showing `—` in both columns is not")
-    print("implemented; that is information, not an error.")
-    print()
-    print("A citation means the source file names the requirement ID. It is evidence of")
-    print("intent, not proof of correctness — read the cited code and its tests before")
-    print("treating a row as satisfied.")
-    print()
-    print(f"**{covered} of {len(ids)} requirements are cited somewhere in the implementation.**")
-    print()
-    print("| Requirement | Status | Implementation | Tests |")
-    print("|---|---|---|---|")
-    print("\n".join(rows))
+    lines = [
+        "# Requirements traceability",
+        "",
+        "**Generated** by `docs/beta/traceability.py` — do not edit by hand.",
+        "",
+        "Maps every requirement in the SRS to the code that cites it and the tests",
+        "that exercise it. A requirement showing `—` in both columns is not",
+        "implemented; that is information, not an error.",
+        "",
+        "A citation means the source file names the requirement ID. It is evidence of",
+        "intent, not proof of correctness — read the cited code and its tests before",
+        "treating a row as satisfied.",
+        "",
+        f"**{covered} of {len(ids)} requirements are cited somewhere in the implementation.**",
+        "",
+        "| Requirement | Status | Implementation | Tests |",
+        "|---|---|---|---|",
+        *rows,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    text = render()
+    if "--check" in sys.argv[1:]:
+        if OUT.read_text(encoding="utf-8") != text:
+            sys.exit(f"{OUT.relative_to(ROOT)} is stale; run python3 docs/beta/traceability.py")
+        return
+    OUT.write_text(text, encoding="utf-8")
+    print(f"wrote {OUT.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

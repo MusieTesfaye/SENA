@@ -27,6 +27,8 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Doc tests
         run: cargo test --workspace --doc
+      - name: Traceability matrix is current
+        run: python3 docs/beta/traceability.py --check
 
   determinism:
     name: determinism check

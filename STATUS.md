@@ -1,6 +1,6 @@
 # Status
 
-**Unreleased (after 0.2.0-beta)** · 318 Rust tests + 78 Move tests passing · **deployed to Aptos testnet** · not audited
+**Unreleased (after 0.2.0-beta)** · 331 Rust tests + 78 Move tests passing · **deployed to Aptos testnet** · not audited
 
 > **Fraud proofs work on a real Aptos node.** On a localnet, a batch whose
 > keyless transfer was forged a thousandfold was posted with its batch data,
@@ -36,7 +36,9 @@ assumed not to work.
 | Sparse Merkle state with inclusion and non-inclusion proofs | `sena-state` | Property tests over arbitrary key sets |
 | Deterministic execution producing a disputable trace | `sena-stf` | Same batch, same root, order-independent |
 | Transfers, nonces, replay protection, strict Ed25519 | `sena-stf` | A key can spend only from its own account |
-| Social handles resolving to addresses | `sena-stf` | Binding, release, and theft-prevention tested |
+| **Federated attestations** (Celo's `FederatedAttestations`): an issuer signs that a hashed email, phone or social identifier belongs to an account; lookups name the issuers they trust | `sena-stf`, `move/sena`, `sena-node` | The issuer's signature and the account's consent are checked on L2 and on L1; forged, third-party, stale, other-chain and revoked cases agree in Rust and Move |
+| **A chain id in every signature**: transactions, attestations and council approvals | `sena-stf`, `move/sena` | A transfer signed for another chain is refused on L2 and in a dispute |
+| **An issuer for any provider** ([wallet `issuer.ts`](https://github.com/MusieTesfaye/wallet)): OpenID Connect (Google, Apple, Twitch, ...), OAuth 2 with user info (GitHub, Discord, X, ...), Twilio Verify for phones | wallet | 17 checks against a live node with stand-in providers that speak the same protocols; no real provider has signed in in a test |
 | **Celo-style fees**: metered gas, EIP-1559 base fee with a floor, hold / refund / tip / base, any whitelisted stablecoin ([`docs/FEES.md`](docs/FEES.md)) | `sena-stf`, `move/sena` | Settlement sums to the hold exactly; base fee rises, falls and floors; a wrong declared rate, intrinsic gas or base fee is a failing step; 31 compile and 26 transition cases agree on L1 |
 | Governed fee split and permissionless distribution (Celo's `FeeHandler`) | `sena-stf` | Shares paid, burn and rounding credited to no one, a wrong split refused |
 | Guardian circuit breaker: a smaller quorum may only disable a fee asset | `sena-stf`, `move/sena` | One guardian disables; the same signature cannot re-enable |
@@ -44,7 +46,7 @@ assumed not to work.
 | Governance bounded by an allowlist, council epochs | `sena-stf` | Council cannot reach the dispute system; replayed approvals refused |
 | **Keyless accounts on the Aptos Keyless circuit** | `sena-stf` | Aptos's sample proof verifies; every intermediate value matches aptos-core |
 | Keyless wallet flow: session, nonce, authenticator, signing | `sena-wallet`, `sena-wasm` | Assembled sample sign-in verifies; a proof for other inputs is refused |
-| **A browser wallet on the live node** | [wallet](https://github.com/MusieTesfaye/wallet), `crates/sena-wasm/tests/e2e.mjs` | Keyless transfers in all four stablecoins, built and signed in WebAssembly, confirmed by a live node; the wallet's UI tested in Chromium. No live Google sign-in yet |
+| **A browser wallet on the live node** | [wallet](https://github.com/MusieTesfaye/wallet), `crates/sena-wasm/tests/e2e.mjs` | Keyless transfers in all four stablecoins, built and signed in WebAssembly, confirmed by a live node; the wallet's UI tested in Chromium (35 checks, linking an identity and paying a phone number included). Live Google sign-in exercised by hand only |
 | Bonded assertions, bisection, one-step adjudication (Rust) | `sena-fraudproof` | Honest party wins wherever fraud is placed (property test) |
 | **Every instruction adjudicable on L1**, keyless included | `move/sena` | Move recompiles each disputed transaction and agrees with Rust on every generated case |
 | **Batch data published on L1**; L1 computes the batch root | `move/sena` | A post whose data does not match its claim cannot be made |
@@ -118,7 +120,12 @@ but have not run on a live network.
 
 ### 3. On testnet, but only the lifecycle and a deposit
 
-The current package is published on Aptos testnet
+**The testnet package predates the chain id and attestations.** The package
+on testnet is the earlier fee-market one; this revision changes
+`disputes::initialize` and the transaction format, so it must be published at
+new addresses before testnet matches the code.
+
+That package is published on Aptos testnet
 ([evidence](docs/beta/evidence/04-testnet-deployment.md)): the assertion
 lifecycle passed 11/11 with real APT bonds, and 1 USDC of Circle's testnet
 USDC was deposited into bridge custody. Not yet done on testnet:
@@ -142,8 +149,9 @@ The package is larger than one transaction and is published with
 SENA verifies proofs for the Aptos Keyless circuit; it does not produce them.
 Wallets use the Aptos prover and pepper services through
 `sena_node::keyless_client`, whose request and response shapes follow the
-services' published API but have been exercised here only against fixtures —
-no live sign-in has been run. Consequences:
+services' published API. The automated tests use fixtures and Aptos's sample
+proof; the browser wallet calls the live services, and that has been exercised
+by hand only, not in a test. Consequences:
 
 - Proving availability is Aptos's. If the prover is down, new keyless sessions
   cannot start (existing sessions keep working until their ephemeral keys
@@ -191,6 +199,10 @@ Forced inclusion exists in `sena::bridge` but is not wired into the Rust node.
 - No peer-to-peer layer.
 - `scripts/bridge-test.sh withdraw` is not automated end to end on a live
   network; withdrawals are tested in Move and in Rust.
+- The sequencer earns fees in stablecoins but pays Aptos gas in APT. Nothing
+  converts one into the other; the operator funds the relayer's APT by hand.
+- The attestation issuer is one process with one key in a file. There is no
+  hosted issuer, no key rotation, and no ODIS-style quota on lookups.
 
 ---
 
@@ -213,11 +225,31 @@ are that implementation. Discussed in
 [`crates/sena-stf/src/instruction.rs`](crates/sena-stf/src/instruction.rs).
 
 **Salted identifier hashes resist disclosure, not enumeration.** The state does
-not publish anyone's contact details, but a guess can be confirmed.
+not publish anyone's contact details, but a guess can be confirmed: phone
+numbers in particular are few enough to try them all. Celo answers this with
+ODIS, a rate-limited blind-signature service that turns the identifier into a
+pepper only its owner's quota can buy. SENA does not have one yet; the network
+salt is public.
+
+**Attestations are only as good as the issuers you trust.** An issuer that
+lies, or is compromised, can attest someone else's email to its own account.
+Wallets name the issuers they trust in every lookup, and the reference wallet
+refuses to pay when two trusted issuers disagree. A sender should still check
+the address the first time.
+
+**Losing the sign-in loses the account.** A keyless address is derived from the
+provider account and the pepper. If the provider account is lost or the pepper
+source changes, the address cannot be signed for. There is no social recovery
+yet.
 
 ---
 
 ## Fixed in this revision
+
+- **First-come handles let anyone claim anyone's email or phone.** They are
+  replaced by issuer-signed attestations that need the account's consent.
+- **Signatures were valid on every SENA chain.** Transactions, attestations
+  and council approvals now commit to the chain id.
 
 - **Any key could spend from any Ed25519 account.** Authentication now requires
   `sender == public_key` and verifies strictly, as Aptos does.

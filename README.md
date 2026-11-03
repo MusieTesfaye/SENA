@@ -1,8 +1,8 @@
 # SENA Network
 
 A Layer 2 blockchain that puts Web2 ergonomics into the protocol itself — sign in
-with Google or Apple, send to a handle instead of a hex address, pay fees in
-stablecoins — and anchors settlement to **Aptos L1** with enforceable **fraud
+with Google or any OpenID Connect provider, send to an email address or phone
+number instead of a hex address, pay fees in stablecoins — and anchors settlement to **Aptos L1** with enforceable **fraud
 proofs**.
 
 <p>
@@ -26,6 +26,9 @@ proofs**.
 >
 > [`docs/END_TO_END.md`](docs/END_TO_END.md) walks through the whole system,
 > from a local L2 to a dispute settled on Aptos, with real output.
+>
+> [`docs/SECURITY.md`](docs/SECURITY.md) answers, in plain language, what
+> protects a wallet user's coins and what does not yet.
 
 ## Quickstart
 
@@ -214,7 +217,7 @@ network rather than in every application:
 |---|---|
 | Seed phrases | OIDC keyless accounts — sign in with an existing Web2 identity |
 | Buying a gas token | Pay fees in whitelisted stablecoins, Celo-style: metered gas, a demand-driven base fee, refunds and tips ([`docs/FEES.md`](docs/FEES.md)) |
-| `0x7f3a9c…` addresses | Human-readable handles, stored as salted hashes |
+| `0x7f3a9c…` addresses | Celo-style attestations: issuers you choose vouch that an email, phone or social account belongs to an address; only salted hashes go on chain |
 | Trusting the operator | Bonded state roots, published data, permissionless fraud proofs |
 
 ## How it fits together

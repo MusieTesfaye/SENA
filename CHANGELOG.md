@@ -5,6 +5,42 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### Identities, as in Celo's SocialConnect
+
+- **Breaking:** first-come handle binding is gone. It let the first person to
+  claim an email or phone number take it. In its place are **federated
+  attestations** (Celo's `FederatedAttestations`). An issuer signs that a
+  hashed identifier belongs to an account. The account submits it
+  (`register_attestation`), consenting to be found by it, or the issuer
+  submits it. Either can revoke it (`revoke_attestation`). The issuer's
+  signature, the consent rule and ordering by `issued_on` are checked on L2 and
+  in disputes on Aptos.
+- Identifier types are Celo's open prefixes (`tel`, `mailto`, `twit`,
+  `github`, `discord`, ...; `sena_primitives::prefix`) rather than a fixed
+  list. A new platform needs no protocol change.
+- RPC: `sena_lookupAttestations { identifier, trusted_issuers }` replaces
+  `sena_resolveIdentifier`. Senders choose the issuers they trust.
+- `sena-wasm`: `hashIdentifier(prefix, ...)`, `signAttestation`,
+  `verifyEd25519`, and `buildTransaction` for any payload.
+- The wallet repository gains `issuer.ts`, an issuer for any OpenID Connect
+  provider, OAuth 2 provider or Twilio Verify, and the wallet links, unlinks
+  and pays identities.
+
+### A chain id in every signature
+
+- **Breaking:** transactions start with a `chain_id` (48 bits of a hash of the
+  chain's name, so it stays exact as a JSON number). It is in the signing
+  digest, as are attestations and council approvals. A signature for one SENA
+  chain is refused on every other, on L2 and on L1.
+- `disputes::initialize` takes the chain id; `disputes::chain_id` is a view.
+  `sena_getChainInfo` reports `transaction_chain_id` and `network_salt`, and
+  `sena-node genesis` prints the id. The package must be republished.
+
+### Builds
+
+- The Binaries workflow builds `sena-node` for Windows, macOS and Linux, and
+  tests each build by running the wallet's devnet and faucet with it.
+
 ### A browser wallet
 
 - `sena-wallet`: the I/O-free wallet logic, moved out of

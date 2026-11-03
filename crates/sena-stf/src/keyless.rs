@@ -1,4 +1,11 @@
-//! Keyless accounts on the Aptos Keyless circuit (REQ-AUTH-002..004).
+//! Keyless accounts on the Aptos Keyless circuit.
+//!
+//! Requirements: an OpenID Connect identity signs as an account
+//! (REQ-AUTH-001) at an address derived from `aud`, `sub` and a pepper
+//! (REQ-AUTH-002), through a short-lived ephemeral key (REQ-AUTH-003,
+//! REQ-AUTH-004). The proof is computed elsewhere and only verified here
+//! (REQ-AUTH-005, REQ-AUTH-006), by a pure function that verifier nodes re-run
+//! and `sena::keyless` re-runs on L1 in a dispute (REQ-AUTH-007).
 //!
 //! # The relation
 //!
