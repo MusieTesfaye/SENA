@@ -1,0 +1,13 @@
+# Tunnel mode: deploy/setup.sh --tunnel <domain>. Caddy listens on
+# 127.0.0.1:8088 only, for a tunnel (ngrok, cloudflared) to forward the
+# domain to, and routes by path (see Caddyfile.tunnel).
+services:
+  issuer:
+    environment:
+      ISSUER_PUBLIC_URL: https://${SENA_HOST}/issuer
+  caddy:
+    ports: !override [ "127.0.0.1:8088:80" ]
+    volumes: !override
+      - "./Caddyfile.tunnel:/etc/caddy/Caddyfile:ro"
+      - "./data/caddy:/data"
+      - "./data/wallet:/srv/wallet:ro"

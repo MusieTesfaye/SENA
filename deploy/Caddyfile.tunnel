@@ -1,0 +1,58 @@
+# Tunnel mode (deploy/setup.sh --tunnel <domain>): everything on one HTTPS
+# name that a tunnel such as ngrok forwards here.
+#
+#   /          the web wallet, built for this domain
+#   /rpc       the node
+#   /faucet    the faucet
+#   /issuer    the identity issuer
+#
+# The tunnel ends TLS and connects from a private address, so Caddy takes the
+# client's IP from the X-Forwarded-For the tunnel sets (the rightmost address
+# not in a private range) and passes on only that one address. A client cannot
+# pick its own rate-limit bucket by sending the header itself.
+{
+	auto_https off
+	servers {
+		trusted_proxies static private_ranges
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+:80 {
+	@rpc path /rpc /rpc/*
+	handle @rpc {
+		uri strip_prefix /rpc
+		reverse_proxy node:8545 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@faucet path /faucet /faucet/*
+	handle @faucet {
+		uri strip_prefix /faucet
+		reverse_proxy faucet:3001 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@issuer path /issuer /issuer/*
+	handle @issuer {
+		uri strip_prefix /issuer
+		reverse_proxy issuer:3002 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		root * /srv/wallet
+		header {
+			Strict-Transport-Security "max-age=31536000"
+			X-Content-Type-Options nosniff
+			Referrer-Policy no-referrer
+			X-Frame-Options DENY
+		}
+		try_files {path} /index.html
+		file_server
+	}
+}

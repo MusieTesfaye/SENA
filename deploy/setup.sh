@@ -2,7 +2,12 @@
 # Sets up a public SENA testnet on this machine, settling on Aptos testnet.
 #
 #   git clone https://github.com/MusieTesfaye/SENA && cd SENA
-#   deploy/setup.sh
+#   deploy/setup.sh            a public server, with HTTPS
+#   deploy/setup.sh --local    this computer only, on http://localhost
+#   deploy/setup.sh --tunnel <domain>
+#                              this computer, published over HTTPS by a tunnel
+#                              (ngrok, cloudflared) on one domain; also builds
+#                              and serves the web wallet there
 #
 # Safe to re-run: each step is skipped once done, so after funding the Aptos
 # accounts, or after a reboot, run it again and it carries on. What it does:
@@ -26,6 +31,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+LOCAL=0 TUNNEL=0
+[ "${1:-}" = "--local" ] && LOCAL=1
+if [ "${1:-}" = "--tunnel" ]; then
+  TUNNEL=1
+  SENA_HOST=${2:?usage: setup.sh --tunnel <domain>, e.g. your-name.ngrok-free.app}
+  SENA_HOST=${SENA_HOST#https://}; SENA_HOST=${SENA_HOST%/}
+  export COMPOSE_FILE=docker-compose.yml:docker-compose.tunnel.yml
+  WALLET_ORIGINS=${WALLET_ORIGINS:-https://$SENA_HOST,https://phkknehihpoajnkoiabbbknbjaonflad.chromiumapp.org,chrome-extension://phkknehihpoajnkoiabbbknbjaonflad}
+fi
+if [ $LOCAL = 1 ]; then
+  # docker-compose.local.yml publishes the services on 127.0.0.1 instead of
+  # behind Caddy. Compose reads COMPOSE_FILE for every command below.
+  export COMPOSE_FILE=docker-compose.yml:docker-compose.local.yml
+  SENA_HOST=localhost
+  WALLET_ORIGINS=${WALLET_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+fi
+
 CHAIN_NAME=${SENA_CHAIN_NAME:-sena-testnet-1}
 APTOS_NETWORK=${APTOS_NETWORK:-testnet}
 APTOS_URL=${APTOS_URL:-https://api.testnet.aptoslabs.com/v1}
@@ -48,7 +70,7 @@ DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="$SUDO docker"
 # Oracle's Ubuntu images ship iptables rules that reject everything but SSH,
 # in addition to the cloud's security list. Open 80 and 443 here; the
 # security list is done in the Oracle console (see deploy/README.md).
-if command -v iptables >/dev/null && $SUDO iptables -S INPUT 2>/dev/null | grep -q -- "-j REJECT"; then
+if [ $LOCAL = 0 ] && [ $TUNNEL = 0 ] && command -v iptables >/dev/null && $SUDO iptables -S INPUT 2>/dev/null | grep -q -- "-j REJECT"; then
   for port in 80 443; do
     if ! $SUDO iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; then
       $SUDO iptables -I INPUT 1 -p tcp --dport $port -j ACCEPT
@@ -186,14 +208,36 @@ compose "${profiles[@]}" up -d
 FAUCET=$(field keys/faucet.json address)
 ISSUER=$(field keys/issuer.json address)
 
+if [ $LOCAL = 1 ]; then
+  RPC_URL=http://127.0.0.1:8545 FAUCET_URL=http://127.0.0.1:3001 ISSUER_URL=http://localhost:3002
+elif [ $TUNNEL = 1 ]; then
+  RPC_URL=https://$SENA_HOST/rpc FAUCET_URL=https://$SENA_HOST/faucet ISSUER_URL=https://$SENA_HOST/issuer
+else
+  RPC_URL=https://rpc.$SENA_HOST FAUCET_URL=https://faucet.$SENA_HOST ISSUER_URL=https://issuer.$SENA_HOST
+fi
+if [ $TUNNEL = 1 ]; then
+  bold "7. Build the web wallet for https://$SENA_HOST"
+  # In a container, with its own node_modules volume, so a checkout shared
+  # with the host (Windows, macOS) keeps its own. The wallet's .env still
+  # supplies VITE_GOOGLE_CLIENT_ID; the network settings below override it.
+  $DOCKER run --rm -v "$(cd "$WALLET_DIR" && pwd)":/app -v sena-wallet-modules:/app/node_modules -w /app \
+    -e VITE_SENA_RPC_URL="$RPC_URL" -e VITE_FAUCET_URL="$FAUCET_URL" -e VITE_ISSUER_URL="$ISSUER_URL" \
+    -e VITE_TRUSTED_ISSUERS="$ISSUER" -e VITE_POLL_MS=5000 \
+    oven/bun:1-slim sh -c 'bun install --frozen-lockfile >/dev/null && bun run build:all >/dev/null' \
+    || { echo "the wallet did not build"; exit 1; }
+  # Emptied, not replaced: Caddy has the directory itself mounted.
+  tool node sh -c 'mkdir -p /data/wallet && find /data/wallet -mindepth 1 -delete'
+  $DOCKER run --rm -v "$(cd "$WALLET_DIR" && pwd)/dist":/from:ro -v "$(pwd)/data":/data oven/bun:1-slim cp -r /from/. /data/wallet/
+  note "the wallet is at https://$SENA_HOST/ (and its extension at /sena-extension.zip)"
+fi
 cat > data/testnet.json <<EOF
 {
   "chain": "$CHAIN_NAME",
   "transaction_chain_id": $CHAIN_ID,
   "genesis_state_root": "$STATE_ROOT",
-  "rpc": "https://rpc.$SENA_HOST",
-  "faucet": "https://faucet.$SENA_HOST",
-  "issuer": "https://issuer.$SENA_HOST",
+  "rpc": "$RPC_URL",
+  "faucet": "$FAUCET_URL",
+  "issuer": "$ISSUER_URL",
   "issuer_address": "$ISSUER",
   "faucet_address": "$FAUCET",
   "aptos_contract": "$CONTRACT",
@@ -205,14 +249,23 @@ bold "Done"
 cat data/testnet.json
 cat <<EOF
 
-For the wallet and the site on Vercel, set:
-  VITE_SENA_RPC_URL=https://rpc.$SENA_HOST
-  VITE_FAUCET_URL=https://faucet.$SENA_HOST
-  VITE_ISSUER_URL=https://issuer.$SENA_HOST
+For the wallet (its .env) and the site, set:
+  VITE_SENA_RPC_URL=$RPC_URL
+  VITE_FAUCET_URL=$FAUCET_URL
+  VITE_ISSUER_URL=$ISSUER_URL
   VITE_TRUSTED_ISSUERS=$ISSUER
   VITE_APTOS_CONTRACT=$CONTRACT
 
-Check it:   curl -s https://rpc.$SENA_HOST -d '{"method":"sena_getChainInfo"}'
+Check it:   curl -s $RPC_URL -d '{"method":"sena_getChainInfo"}'
 Logs:       docker compose -f deploy/docker-compose.yml logs -f
 Contracts:  https://explorer.aptoslabs.com/account/$CONTRACT?network=$APTOS_NETWORK
 EOF
+if [ $TUNNEL = 1 ]; then cat <<EOF
+
+Now start the tunnel to http://127.0.0.1:8088, e.g. with ngrok:
+  ngrok http 8088 --url https://$SENA_HOST
+and open https://$SENA_HOST/
+In your Google OAuth client, add https://$SENA_HOST as an authorised
+JavaScript origin and https://$SENA_HOST/ as a redirect URI.
+EOF
+fi

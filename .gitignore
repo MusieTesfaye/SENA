@@ -12,6 +12,6 @@ Cargo.lock.bak
 /wallet-devnet/
 
 # deploy/setup.sh: the server's keys, chain and settings
-/deploy/data/
-/deploy/.env
+/deploy/data*/
+/deploy/.env*
 .proxy-ca.crt

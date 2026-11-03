@@ -16,6 +16,58 @@ One server runs the whole public testnet:
 server's IP, such as `129-146-20-31.sslip.io`, unless you set `SENA_HOST` to a
 domain of your own.
 
+## Or: run it on your own computer
+
+The same kit runs on a Windows, macOS or Linux PC. It settles on the real
+Aptos testnet either way.
+
+| Mode | Command | Reachable at |
+|---|---|---|
+| Local | `deploy/setup.sh --local` | `http://127.0.0.1:8545` (node), `:3001` (faucet), `:3002` (issuer); this PC only |
+| Tunnel | `deploy/setup.sh --tunnel <domain>` | `https://<domain>/` (wallet), `/rpc`, `/faucet`, `/issuer`, through ngrok or cloudflared |
+
+Tunnel mode builds the web wallet for the domain and serves it with the chain,
+behind one HTTPS name. Caddy listens on `127.0.0.1:8088` for the tunnel. The
+client's IP for rate limiting is taken from the tunnel's `X-Forwarded-For`,
+rightmost first, so a client cannot forge its way past the faucet's limits.
+
+**On Windows**, use WSL 2:
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+   with the WSL 2 backend.
+2. In an administrator PowerShell, run `wsl --install -d Ubuntu-24.04`, then
+   restart.
+3. In Docker Desktop, open *Settings → Resources → WSL integration* and turn
+   on Ubuntu-24.04.
+4. Open the Ubuntu terminal. Clone both repositories into your Linux home
+   folder (`~`), not `/mnt/c`, which is much slower:
+
+   ```sh
+   git clone -b claude/exciting-ritchie-8g61na https://github.com/MusieTesfaye/SENA
+   git clone https://github.com/MusieTesfaye/wallet
+   echo "VITE_GOOGLE_CLIENT_ID=<your client id>" > wallet/.env
+   SENA/deploy/setup.sh --tunnel <your-domain>.ngrok-free.app
+   ```
+
+**With ngrok:**
+
+1. Sign up at [ngrok.com](https://ngrok.com).
+2. Claim your free static domain under *Domains*.
+3. Install the agent and run `ngrok config add-authtoken <token>`.
+4. After `setup.sh`, run `ngrok http 8088 --url https://<your-domain>`.
+
+The first time a browser opens the domain, ngrok's free plan shows a warning
+page; click *Visit Site*. The free plan also caps monthly requests and
+bandwidth. The wallet built for a tunnel refreshes every 5 seconds to save
+them, and ngrok's dashboard shows your usage.
+
+Add `https://<your-domain>` to your Google OAuth client as an authorised
+JavaScript origin, and `https://<your-domain>/` as a redirect URI.
+
+A PC is a test bed, not a server. While it sleeps, the relayer stops posting
+blocks to Aptos, and a block more than an hour old can no longer be posted.
+Keep it awake while you use it.
+
 ## 1. Create the server (Oracle Cloud free tier)
 
 1. **Compute → Instances → Create instance.**

@@ -1,0 +1,24 @@
+# Local mode: the testnet on your own computer (deploy/setup.sh --local).
+# The node, faucet and issuer listen on 127.0.0.1 only, over plain HTTP, and
+# Caddy does not run: there is no public name to get a certificate for.
+services:
+  node:
+    ports: [ "127.0.0.1:8545:8545" ]
+    # Clients reach it directly, so X-Forwarded-For must not be trusted.
+    command: >
+      sena-node run --data-dir /data/chain --listen 0.0.0.0:8545
+      --block-interval 2 --fee-recipient ${SEQUENCER_ADDRESS}
+      --cors-origin "*"
+  faucet:
+    ports: [ "127.0.0.1:3001:3001" ]
+    environment:
+      FAUCET_TRUST_PROXY: "0"
+      FAUCET_PER_IP_PER_HOUR: "0"
+      FAUCET_TOTAL_PER_HOUR: "0"
+      FAUCET_COOLDOWN_SECS: "10"
+  issuer:
+    ports: [ "127.0.0.1:3002:3002" ]
+    environment:
+      ISSUER_PUBLIC_URL: http://localhost:3002
+  caddy:
+    profiles: [ public ]
