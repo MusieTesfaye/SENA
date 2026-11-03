@@ -32,6 +32,7 @@
 pub mod da;
 pub mod genesis;
 pub mod http;
+pub mod jwk_sync;
 pub mod keyless_client;
 pub mod l1;
 pub mod mempool;

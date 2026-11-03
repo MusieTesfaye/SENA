@@ -46,6 +46,18 @@ pub enum Request {
         /// The issuers whose attestations to return, at most 16.
         trusted_issuers: Vec<L2Address>,
     },
+    /// The governance council: members, thresholds, and the epoch the next
+    /// governance payload must be signed for.
+    #[serde(rename = "sena_getCouncil")]
+    GetCouncil,
+    /// Whether keyless proofs over an identity provider's JWK are accepted.
+    #[serde(rename = "sena_getJwk")]
+    GetJwk {
+        /// The provider's issuer, e.g. `https://accounts.google.com`.
+        iss: String,
+        /// The key's RSA modulus, base64url, as its JWKS publishes it.
+        n: String,
+    },
     /// Report a transaction's confirmation status.
     #[serde(rename = "sena_getConfirmation")]
     GetConfirmation {
@@ -209,6 +221,22 @@ pub enum Response {
         /// The attestations.
         attestations: Vec<IssuedAttestation>,
     },
+    /// The governance council.
+    Council {
+        /// Members' Ed25519 keys, hex, in index order.
+        members: Vec<String>,
+        /// Signatures needed for any update.
+        threshold: u32,
+        /// Signatures needed to disable a fee asset.
+        guardian_threshold: u32,
+        /// The epoch the next governance payload must be signed for.
+        epoch: u64,
+    },
+    /// A JWK's standing.
+    Jwk {
+        /// `true` accepted, `false` retired, `None` never set.
+        active: Option<bool>,
+    },
     /// A transaction's confirmation status.
     Confirmation(Confirmation),
     /// An assertion's status.
@@ -252,6 +280,8 @@ pub enum Response {
         post_state_root: Hash256,
         /// The transactions, in execution order.
         transactions: Vec<Transaction>,
+        /// Their hashes, in the same order.
+        hashes: Vec<Hash256>,
         /// The assertion covering it, if one has been posted.
         assertion: Option<AssertionId>,
         /// Number of execution steps, which bisection searches over.
@@ -523,6 +553,7 @@ fn block_response(sequencer: &Sequencer, height: u64) -> Response {
             pre_state_root: block.pre_state_root,
             post_state_root: block.post_state_root,
             transactions: block.transactions.clone(),
+            hashes: block.transactions.iter().map(Transaction::hash).collect(),
             assertion: sequencer.assertion_for(block.height),
             trace_length: block.trace.len() as u64,
             tx_starts: block.trace.tx_starts.clone(),
@@ -563,6 +594,43 @@ fn gas_price(sequencer: &Sequencer, asset: AssetId) -> Response {
 }
 
 /// The standing attestations `trusted_issuers` have made for `identifier`.
+/// The governance council, as stored.
+fn council(sequencer: &Sequencer) -> Response {
+    let Some(bytes) = sequencer.state.get(&keys::council()) else {
+        return Response::Error {
+            message: "this chain has no council".to_owned(),
+        };
+    };
+    match sena_stf::Council::decode(bytes) {
+        Ok(c) => Response::Council {
+            members: c.members.iter().map(hex::encode).collect(),
+            threshold: c.threshold,
+            guardian_threshold: c.guardian_threshold,
+            epoch: c.epoch,
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Whether keyless proofs over a provider's RSA key are accepted.
+fn jwk(sequencer: &Sequencer, iss: &str, n: &str) -> Response {
+    let hashes = sena_stf::keyless::iss_hash(iss)
+        .and_then(|i| sena_stf::keyless::rsa_jwk_hash_b64(n).map(|j| (i, j)));
+    match hashes {
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+        Ok((i, j)) => Response::Jwk {
+            active: sequencer
+                .state
+                .get(&keys::jwk(&i, &j))
+                .and_then(|b| sena_stf::execute::decode_jwk_record(b).ok()),
+        },
+    }
+}
+
 fn lookup_attestations(
     sequencer: &Sequencer,
     identifier: &HashedIdentifier,
@@ -729,6 +797,10 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
             identifier,
             trusted_issuers,
         } => lookup_attestations(sequencer, &identifier, &trusted_issuers),
+
+        Request::GetCouncil => council(sequencer),
+
+        Request::GetJwk { iss, n } => jwk(sequencer, &iss, &n),
 
         Request::GetConfirmation { hash } => Response::Confirmation(sequencer.confirmation(&hash)),
 

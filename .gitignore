@@ -10,3 +10,8 @@ Cargo.lock.bak
 
 # scripts/wallet-devnet.py: chain data and the faucet key
 /wallet-devnet/
+
+# deploy/setup.sh: the server's keys, chain and settings
+/deploy/data/
+/deploy/.env
+.proxy-ca.crt

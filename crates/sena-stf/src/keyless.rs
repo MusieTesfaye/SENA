@@ -1,6 +1,6 @@
 //! Keyless accounts on the Aptos Keyless circuit.
 //!
-//! Requirements: an OpenID Connect identity signs as an account
+//! Requirements: an OIDC identity signs as an account
 //! (REQ-AUTH-001) at an address derived from `aud`, `sub` and a pepper
 //! (REQ-AUTH-002), through a short-lived ephemeral key (REQ-AUTH-003,
 //! REQ-AUTH-004). The proof is computed elsewhere and only verified here

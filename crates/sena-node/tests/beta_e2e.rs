@@ -124,6 +124,7 @@ impl TestNode {
             rate_limit_per_minute: 10_000,
             max_body_bytes: 1 << 20,
             cors_origins: Vec::new(),
+            trust_forwarded_for: false,
         };
 
         let flag = Arc::clone(&shutdown);
@@ -534,6 +535,7 @@ fn start_authenticated(
         rate_limit_per_minute: 5,
         max_body_bytes: 2_048,
         cors_origins: Vec::new(),
+        trust_forwarded_for: false,
     };
 
     let flag = Arc::clone(&shutdown);

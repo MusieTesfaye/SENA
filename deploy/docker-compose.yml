@@ -1,0 +1,97 @@
+# The SENA testnet: an L2 sequencer posting to Aptos testnet, a watcher that
+# re-executes every assertion, the faucet, the attestation issuer, Google key
+# rotation, and HTTPS. `deploy/setup.sh` creates data/ and .env, then starts it.
+#
+# Only Caddy publishes ports. The node trusts X-Forwarded-For for rate
+# limiting, which is safe only because nothing reaches it except through Caddy.
+
+x-node: &node
+  build: { context: .., dockerfile: deploy/node.Dockerfile }
+  image: sena-node:local
+  restart: unless-stopped
+  volumes: [ "./data:/data" ]
+  logging: { options: { max-size: "20m", max-file: "5" } }
+
+services:
+  node:
+    <<: *node
+    command: >
+      sena-node run --data-dir /data/chain --listen 0.0.0.0:8545
+      --block-interval 2 --fee-recipient ${SEQUENCER_ADDRESS}
+      --cors-origin "*" --trust-forwarded-for --rate-limit 300
+
+  relayer:
+    <<: *node
+    depends_on: [ node ]
+    working_dir: /data/aptos
+    command: >
+      sena-node relay --rpc http://node:8545 --aptos-url ${APTOS_URL}
+      --contract ${CONTRACT} --profile proposer --account ${CONTRACT}
+      --state /data/relayer.json --poll-interval 15
+
+  watcher:
+    <<: *node
+    working_dir: /data/aptos
+    command: >
+      sena-node watch --data-dir /data/watcher --aptos-url ${APTOS_URL}
+      --contract ${CONTRACT} --profile challenger --account ${CHALLENGER}
+      --state /data/watcher.json --poll-interval 30
+
+  jwk-sync:
+    <<: *node
+    depends_on: [ node ]
+    command: >
+      sena-node jwk-sync --rpc http://node:8545 --key-file /data/keys/council.json
+      --state /data/jwk-sync.json --interval 3600
+
+  faucet:
+    build:
+      context: ${WALLET_DIR:-../../wallet}
+      dockerfile: Dockerfile.services
+    image: sena-services:local
+    restart: unless-stopped
+    depends_on: [ node ]
+    command: bun server.ts
+    volumes: [ "./data/keys/faucet.json:/keys/faucet.json:ro" ]
+    environment:
+      FAUCET_KEY_FILE: /keys/faucet.json
+      VITE_SENA_RPC_URL: http://node:8545
+      WALLET_ORIGINS: "*"
+      FAUCET_TRUST_PROXY: "1"
+      FAUCET_DRIP: "100000000"
+      FAUCET_COOLDOWN_SECS: "300"
+      FAUCET_PER_IP_PER_HOUR: "12"
+      FAUCET_TOTAL_PER_HOUR: "600"
+
+  # Starts only when data/issuer/issuer.config.json exists (setup.sh adds the
+  # "issuer" profile then). Secrets go in data/issuer/issuer.env.
+  issuer:
+    image: sena-services:local
+    profiles: [ issuer ]
+    restart: unless-stopped
+    depends_on: [ node, faucet ]
+    command: bun issuer.ts
+    volumes:
+      - "./data/keys/issuer.json:/keys/issuer.json:ro"
+      - "./data/issuer:/issuer:ro"
+    env_file:
+      - path: ./data/issuer/issuer.env
+        required: false
+    environment:
+      ISSUER_CONFIG: /issuer/issuer.config.json
+      ISSUER_KEY_FILE: /keys/issuer.json
+      ISSUER_PORT: "3002"
+      ISSUER_PUBLIC_URL: https://issuer.${SENA_HOST}
+      VITE_SENA_RPC_URL: http://node:8545
+      WALLET_ORIGINS: ${WALLET_ORIGINS}
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [ node, faucet ]
+    ports: [ "80:80", "443:443" ]
+    environment:
+      SENA_HOST: ${SENA_HOST}
+    volumes:
+      - "./Caddyfile:/etc/caddy/Caddyfile:ro"
+      - "./data/caddy:/data"

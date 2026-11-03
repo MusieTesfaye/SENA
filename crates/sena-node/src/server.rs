@@ -46,6 +46,11 @@ pub struct ServerConfig {
     /// `http://localhost:5173`; `*` allows any. Empty allows none, so a web
     /// page cannot reach the node unless its operator says so.
     pub cors_origins: Vec<String>,
+    /// Rate-limit by the last address in `X-Forwarded-For` rather than the
+    /// connecting peer. Only for a node reachable solely through a reverse
+    /// proxy that sets the header (Caddy, nginx); otherwise a client could
+    /// name any address it likes.
+    pub trust_forwarded_for: bool,
 }
 
 /// A fixed-window request counter, keyed by client.
@@ -92,6 +97,7 @@ impl Default for ServerConfig {
             rate_limit_per_minute: 600,
             max_body_bytes: 1 << 20,
             cors_origins: Vec::new(),
+            trust_forwarded_for: false,
         }
     }
 }
@@ -231,6 +237,23 @@ pub fn run(
     Ok(())
 }
 
+/// Who a request counts against for rate limiting: the connecting peer, or,
+/// behind a trusted proxy, the address the proxy appended last.
+fn client_of(request: &HttpRequest, trust_forwarded_for: bool) -> String {
+    if trust_forwarded_for {
+        if let Some(ip) = request
+            .header("X-Forwarded-For")
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+        {
+            return ip.to_string();
+        }
+    }
+    request
+        .remote
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
+}
+
 /// The CORS headers for a request: none unless its `Origin` is allowed.
 fn cors_headers(allowed: &[String], request: &HttpRequest) -> Vec<(String, String)> {
     let Some(origin) = request.header("Origin").map(ToOwned::to_owned) else {
@@ -290,9 +313,7 @@ fn serve(
         }
     }
 
-    let client = request
-        .remote
-        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
+    let client = client_of(request, config.trust_forwarded_for);
     if !limiter.allow(&client, unix_now(), config.rate_limit_per_minute) {
         return error_json("rate limit exceeded");
     }
@@ -324,4 +345,34 @@ fn error_json(message: &str) -> String {
         message: message.to_owned(),
     })
     .unwrap_or_else(|_| "{\"result\":\"error\",\"message\":\"internal\"}".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(forwarded: Option<&str>) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_owned(),
+            headers: forwarded
+                .map(|f| vec![("X-Forwarded-For".to_owned(), f.to_owned())])
+                .unwrap_or_default(),
+            body: Body::Text(String::new()),
+            remote: Some("172.18.0.2".parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn forwarded_for_counts_only_when_trusted() {
+        // A client cannot pick its own bucket on a directly reachable node.
+        assert_eq!(client_of(&request(Some("1.2.3.4")), false), "172.18.0.2");
+        // Behind a proxy, the address the proxy appended last is the client.
+        assert_eq!(
+            client_of(&request(Some("9.9.9.9, 1.2.3.4")), true),
+            "1.2.3.4"
+        );
+        // A missing or garbled header falls back to the peer.
+        assert_eq!(client_of(&request(None), true), "172.18.0.2");
+        assert_eq!(client_of(&request(Some("not an ip")), true), "172.18.0.2");
+    }
 }

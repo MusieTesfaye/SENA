@@ -5,6 +5,7 @@
 //! sena-node run --data-dir ./devnet             # run a sequencer with RPC
 //! sena-node verify --rpc http://127.0.0.1:8545  # independently verify a chain
 //! sena-node keygen                              # a keypair for testing
+//! sena-node jwk-sync --key-file council.json    # follow Google's key rotations
 //! ```
 
 use std::sync::atomic::AtomicBool;
@@ -41,6 +42,13 @@ enum Command {
         #[arg(long)]
         fund: Vec<String>,
     },
+    /// Print a genesis file's chain, transaction chain id and state root, as
+    /// JSON, after validating it.
+    InspectGenesis {
+        /// Data directory holding genesis.json.
+        #[arg(long, default_value = "./sena-data")]
+        data_dir: String,
+    },
     /// Run a sequencer and serve JSON-RPC over HTTP.
     Run {
         /// Data directory holding genesis.json and any saved state.
@@ -72,6 +80,10 @@ enum Command {
         /// `http://localhost:5173`; repeatable. Without it, browsers cannot.
         #[arg(long)]
         cors_origin: Vec<String>,
+        /// Rate-limit by `X-Forwarded-For`, for a node reachable only through
+        /// a reverse proxy that sets it. Never on a node clients reach directly.
+        #[arg(long)]
+        trust_forwarded_for: bool,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -137,6 +149,33 @@ enum Command {
         /// Where progress is persisted.
         #[arg(long, default_value = "./sena-data/relayer.json")]
         state: String,
+    },
+    /// Keep the chain's accepted keyless JWKs in step with a provider's
+    /// rotations, by council-signed `SetJwk` updates. For a test network
+    /// whose council is this one key (threshold 1).
+    JwkSync {
+        /// L2 RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// JSON file with the council member's `secret` (hex). The same key
+        /// sends the updates and pays their fees.
+        #[arg(long)]
+        key_file: String,
+        /// The provider's issuer.
+        #[arg(long, default_value = "https://accounts.google.com")]
+        iss: String,
+        /// The provider's JWKS endpoint.
+        #[arg(long, default_value = "https://www.googleapis.com/oauth2/v3/certs")]
+        jwks_url: String,
+        /// Fee asset.
+        #[arg(long, default_value_t = 1)]
+        fee_asset: u32,
+        /// Where accepted keys are remembered, to retire them once withdrawn.
+        #[arg(long, default_value = "./sena-data/jwk-sync.json")]
+        state: String,
+        /// Seconds between rounds; zero runs one round and exits.
+        #[arg(long, default_value_t = 3600)]
+        interval: u64,
     },
     /// Watch Aptos L1, re-execute every assertion from the batch data
     /// published there, and challenge any that is wrong.
@@ -235,6 +274,7 @@ fn main() {
             dev,
             fund,
         } => genesis(&data_dir, dev, &fund),
+        Command::InspectGenesis { data_dir } => inspect_genesis(&data_dir),
         Command::Run {
             data_dir,
             listen,
@@ -244,6 +284,7 @@ fn main() {
             rate_limit,
             fee_recipient,
             cors_origin,
+            trust_forwarded_for,
         } => serve(
             &data_dir,
             run_for,
@@ -254,6 +295,7 @@ fn main() {
                 auth_token,
                 rate_limit_per_minute: rate_limit,
                 cors_origins: cors_origin,
+                trust_forwarded_for,
                 ..ServerConfig::default()
             },
         ),
@@ -291,6 +333,15 @@ fn main() {
             bond,
             state,
         } => relay(rpc, rpc_token, &aptos, bond, state),
+        Command::JwkSync {
+            rpc,
+            key_file,
+            iss,
+            jwks_url,
+            fee_asset,
+            state,
+            interval,
+        } => jwk_sync(rpc, &key_file, iss, jwks_url, fee_asset, state, interval),
         Command::Watch {
             data_dir,
             aptos,
@@ -345,6 +396,25 @@ fn genesis(data_dir: &str, dev: bool, fund: &[String]) -> Result<(), String> {
     println!();
     println!("Compare that state root with another operator before exchanging");
     println!("transactions: identical roots mean you are on the same chain.");
+    Ok(())
+}
+
+fn inspect_genesis(data_dir: &str) -> Result<(), String> {
+    let store = Store::open(data_dir).map_err(|e| e.to_string())?;
+    let config = store
+        .load_genesis()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no genesis.json in {data_dir}"))?;
+    config.validate().map_err(|e| e.to_string())?;
+    let root = config.state_root().map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "chain": config.chain_id,
+            "transaction_chain_id": config.transaction_chain_id(),
+            "state_root": root.to_string(),
+        })
+    );
     Ok(())
 }
 
@@ -546,6 +616,52 @@ fn watch(
         || watcher.step(),
         |r| *r == sena_node::WatchReport::default(),
     )
+}
+
+fn jwk_sync(
+    rpc: String,
+    key_file: &str,
+    iss: String,
+    jwks_url: String,
+    fee_asset: u32,
+    state: String,
+    interval: u64,
+) -> Result<(), String> {
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(key_file).map_err(|e| format!("reading {key_file}: {e}"))?,
+    )
+    .map_err(|e| format!("{key_file} is not JSON: {e}"))?;
+    let secret: [u8; 32] = file["secret"]
+        .as_str()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{key_file} needs a 32-byte hex \"secret\""))?;
+    let sync = sena_node::jwk_sync::JwkSyncConfig {
+        rpc,
+        iss,
+        jwks_url,
+        key: SigningKey::from_bytes(&secret),
+        fee_asset,
+        state: state.into(),
+    };
+    loop {
+        match sync.round() {
+            Ok(r) if r == sena_node::jwk_sync::SyncReport::default() => {
+                println!("jwk-sync: up to date");
+            }
+            Ok(r) => println!(
+                "jwk-sync: accepted {:?}, retired {:?}",
+                r.accepted, r.retired
+            ),
+            // A failed round is retried next time; only a one-shot run fails.
+            Err(e) if interval > 0 => eprintln!("jwk-sync: {e}"),
+            Err(e) => return Err(e),
+        }
+        if interval == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 fn keygen() {

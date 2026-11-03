@@ -41,8 +41,9 @@ the batch provably invalid. Wallets read them, and the current base fee, from
 | Every transaction (Ethereum's intrinsic gas) | 21,000 |
 | Fee asset's own intrinsic gas (USDC at genesis) | 10,000 |
 | Keyless authenticator (Groth16 + Poseidon) | 100,000 |
-| Debit, Credit, Unbind | 5,000 each |
-| Bind identifier, any governance write | 20,000 |
+| Debit, Credit, revoke an attestation | 5,000 each |
+| Register an attestation (a write plus the issuer's signature) | 23,000 |
+| Any governance write | 20,000 |
 | Council verification | 10,000 + 3,000 per signature |
 | Fee split check | 2,000 |
 

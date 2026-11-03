@@ -1,0 +1,8 @@
+target
+**/build
+attic
+docs
+wallet-devnet
+deploy/data
+deploy/.env
+.git

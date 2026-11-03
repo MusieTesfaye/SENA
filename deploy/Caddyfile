@@ -1,0 +1,15 @@
+# HTTPS in front of every public service. Certificates are automatic: Let's
+# Encrypt, falling back to ZeroSSL. SENA_HOST is <ip-with-dashes>.sslip.io,
+# or your own domain; "localhost" gets Caddy's local CA, for testing.
+rpc.{$SENA_HOST} {
+	encode gzip
+	reverse_proxy node:8545
+}
+
+faucet.{$SENA_HOST} {
+	reverse_proxy faucet:3001
+}
+
+issuer.{$SENA_HOST} {
+	reverse_proxy issuer:3002
+}
