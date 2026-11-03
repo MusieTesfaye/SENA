@@ -23,6 +23,8 @@ const aptosLink = network.aptosContract
       <tr><td>Challenge window</td><td>{{ info ? info.challenge_window_secs / 3600 + ' hours' : '…' }}</td></tr>
       <tr><td>Settles on</td><td>Aptos {{ network.aptosNetwork }}<template v-if="aptosLink"> · <a :href="aptosLink" target="_blank" rel="noopener">contracts</a></template></td></tr>
       <tr v-if="network.wallet"><td>Web wallet</td><td><a :href="network.wallet">{{ network.wallet }}</a></td></tr>
+      <tr v-if="network.extension"><td>Browser extension</td><td><a :href="network.extension">Download (Chrome, Edge, Brave)</a></td></tr>
+      <tr><td>MetaMask Snap</td><td class="sena-mono">{{ network.snap }}</td></tr>
     </tbody>
   </table>
 </template>

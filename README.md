@@ -29,6 +29,10 @@ proofs**.
 >
 > [`docs/SECURITY.md`](docs/SECURITY.md) answers, in plain language, what
 > protects a wallet user's coins and what does not yet.
+>
+> [`docs/LAUNCH.md`](docs/LAUNCH.md) puts the public testnet online: the chain
+> on one server ([`deploy/`](deploy/README.md)), the website (`site/`), the
+> wallet, its browser extension and the MetaMask Snap.
 
 ## Quickstart
 

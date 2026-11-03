@@ -34,7 +34,7 @@ domain of your own.
 ## 2. Run the setup
 
 ```sh
-git clone https://github.com/MusieTesfaye/SENA
+git clone -b claude/exciting-ritchie-8g61na https://github.com/MusieTesfaye/SENA   # main, once merged
 cd SENA
 deploy/setup.sh
 ```
@@ -89,10 +89,10 @@ a redirect URI in its developer console. `<id>` is the provider's `id` in the
 config.
 
 Set the web addresses the issuer may send people back to. These are the
-wallet's Vercel URL and the extension's origin:
+wallet's Vercel URL and the SENA extension's two addresses (its id is fixed):
 
 ```sh
-WALLET_ORIGINS=https://sena-wallet.vercel.app,chrome-extension://<extension-id> deploy/setup.sh
+WALLET_ORIGINS=https://sena-wallet.vercel.app,https://phkknehihpoajnkoiabbbknbjaonflad.chromiumapp.org,chrome-extension://phkknehihpoajnkoiabbbknbjaonflad deploy/setup.sh
 ```
 
 ## Operating it
