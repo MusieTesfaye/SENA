@@ -252,6 +252,73 @@ fn bool_of(v: &Value) -> Result<bool, L1Error> {
     v.as_bool().ok_or_else(|| L1Error::Malformed(v.to_string()))
 }
 
+/// Reads deposit `id` of the chain at `contract()` from `sena::deposits::record`.
+///
+/// `Ok(None)` only when L1 answered that it holds no such deposit; any failure
+/// to ask is an error, never "absent", because a watcher that mistook an
+/// unreachable fullnode for a missing deposit would challenge an honest batch.
+///
+/// # Errors
+///
+/// Returns [`L1Error`] if L1 cannot be read or answers in an unexpected shape.
+pub fn deposit_record<C: L1 + ?Sized>(
+    l1: &C,
+    id: u64,
+) -> Result<Option<sena_stf::DepositRecord>, L1Error> {
+    let v = l1.view(
+        "deposits::record",
+        &[Arg::Address(l1.contract()), Arg::U64(id)],
+    )?;
+    if v.len() != 4 {
+        return Err(L1Error::Malformed(format!("deposits::record: {v:?}")));
+    }
+    if !bool_of(&v[0])? {
+        return Ok(None);
+    }
+    let recipient: [u8; 32] = bytes_of(&v[1])?
+        .try_into()
+        .map_err(|_| L1Error::Malformed("deposit recipient is not 32 bytes".into()))?;
+    let asset =
+        u32::try_from(u64_of(&v[2])?).map_err(|_| L1Error::Malformed("deposit asset".into()))?;
+    Ok(Some(sena_stf::DepositRecord {
+        recipient: sena_primitives::L2Address::from_bytes(recipient),
+        asset: sena_primitives::AssetId(asset),
+        amount: u128_of(&v[3])?,
+    }))
+}
+
+/// Reads every deposit that `transactions` claim from L1.
+///
+/// # Errors
+///
+/// Returns [`L1Error`] if any of them cannot be read.
+pub fn deposits_for<C: L1 + ?Sized>(
+    l1: &C,
+    transactions: &[sena_stf::Transaction],
+) -> Result<std::collections::BTreeMap<u64, sena_stf::DepositRecord>, L1Error> {
+    let mut log = std::collections::BTreeMap::new();
+    for tx in transactions {
+        if let sena_stf::Payload::Deposit { id, .. } = tx.payload {
+            if let Some(record) = deposit_record(l1, id)? {
+                log.insert(id, record);
+            }
+        }
+    }
+    Ok(log)
+}
+
+/// Adds the Aptos node API key from `NODE_API_KEY`, if set -- the variable the
+/// Aptos CLI reads too, so the agents' CLI calls and their own REST calls
+/// share one key. Public fullnodes rate-limit anonymous callers hard.
+pub fn with_api_key(req: ureq::Request) -> ureq::Request {
+    match std::env::var("NODE_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            req.set("Authorization", &format!("Bearer {}", key.trim()))
+        }
+        _ => req,
+    }
+}
+
 /// Parses `sena::assertions::record`.
 ///
 /// # Errors
@@ -432,7 +499,7 @@ impl AptosCli {
 
     fn get(&self, path: &str) -> Result<Value, L1Error> {
         let url = format!("{}{path}", self.rest_url.trim_end_matches('/'));
-        ureq::get(&url)
+        with_api_key(ureq::get(&url))
             .timeout(Duration::from_secs(20))
             .call()
             .map_err(|e| L1Error::Transport(e.to_string()))?

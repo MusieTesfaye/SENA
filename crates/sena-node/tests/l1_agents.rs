@@ -654,6 +654,32 @@ fn a_relayer_that_lost_its_state_does_not_post_twice() {
 }
 
 #[test]
+fn a_relayer_will_not_adopt_an_assertion_someone_else_posted() {
+    // The id omits the proposer, so another account can post our next block
+    // first. Adopting it would leave it undefended: only the recorded
+    // proposer can play its disputes.
+    let world = World::new("taken-over");
+    let thief = Node {
+        sequencer: Rc::clone(&world.sequencer),
+        forge: None,
+    };
+    let config = RelayerConfig {
+        bond: BOND,
+        state_path: world.dir.join("thief.json"),
+    };
+    Relayer::new(world.l1("0xbad"), thief, config)
+        .unwrap()
+        .step()
+        .unwrap();
+
+    match world.relayer(None).step() {
+        Err(RelayError::NotOurs(1, who)) => assert_eq!(who, "0xbad"),
+        other => panic!("expected NotOurs for block 1, got {other:?}"),
+    }
+    assert_eq!(world.chain.borrow().calls("assertions::post").len(), 2);
+}
+
+#[test]
 fn a_forged_post_state_is_bisected_to_one_step_and_rejected() {
     let world = World::new("forged");
     let forged = Hash256([0x66; 32]);

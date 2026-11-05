@@ -35,6 +35,18 @@ pub enum Request {
         /// The account to read.
         address: L2Address,
     },
+    /// Escrows (payments to identifiers), oldest first: those for any of
+    /// `identifiers`, and those `sender` opened. Each with its standing record,
+    /// so a wallet can build the claim or refund without guessing.
+    #[serde(rename = "sena_getEscrows")]
+    GetEscrows {
+        /// Hashed identifiers to find escrows for, at most 16.
+        #[serde(default)]
+        identifiers: Vec<HashedIdentifier>,
+        /// An account whose own escrows to list too.
+        #[serde(default)]
+        sender: Option<L2Address>,
+    },
     /// What the issuers the caller trusts attest about a hashed identifier
     /// (REQ-SOCIAL-004; Celo's `lookupAttestations`). Revoked attestations
     /// are left out. Trust is the caller's choice: the chain records what any
@@ -102,10 +114,18 @@ pub enum Request {
     /// The proof is made against the most recent **finalized** assertion, not
     /// the current root, because that is what the L1 bridge checks against. A
     /// proof against the current root would be rejected on chain.
+    /// Prove the withdrawal record `sender`'s transaction `nonce` wrote, for
+    /// `sena::bridge::claim`.
     #[serde(rename = "sena_getWithdrawalProof")]
     GetWithdrawalProof {
-        /// The account to prove a balance for.
-        address: L2Address,
+        /// The L2 account that withdrew.
+        sender: L2Address,
+        /// The nonce of its withdrawing transaction.
+        nonce: u64,
+        /// The state root to prove against: a finalized L1 assertion's
+        /// post-state. The current root if absent.
+        #[serde(default)]
+        state_root: Option<Hash256>,
     },
     /// Produce an account's state with a Sparse Merkle Proof for ultralight mobile clients.
     #[serde(rename = "sena_getAccountProof")]
@@ -214,6 +234,11 @@ pub enum Response {
         /// clients whose JSON numbers are doubles do not silently round them.
         #[serde(with = "balances")]
         balances: Vec<(u32, u128)>,
+    },
+    /// Escrows matching a `sena_getEscrows` query.
+    Escrows {
+        /// The escrows.
+        escrows: Vec<EscrowEntry>,
     },
     /// The standing attestations for an identifier, one per trusted issuer
     /// that has one, in the order the issuers were named.
@@ -343,23 +368,25 @@ pub enum Response {
     ///
     /// Encoded as hex because these go straight into `aptos move run` arguments.
     WithdrawalProof {
-        /// The assertion the proof is against. Must be finalized on L1.
-        assertion_height: u64,
+        /// The block whose post-state the proof is against.
+        height: u64,
         /// Root the proof reconstructs to.
         state_root: Hash256,
-        /// The account's stored bytes.
-        account_value: String,
+        /// The record's stored bytes: recipient, asset, amount.
+        record: String,
+        /// The Aptos address the record pays.
+        to: String,
+        /// The asset withdrawn.
+        asset: u32,
+        /// The amount withdrawn.
+        #[serde(with = "sena_primitives::serde_hex::u128_string")]
+        amount: u128,
         /// Sibling hashes, root-first.
         siblings: Vec<String>,
-        /// Whether the path ends in a leaf.
-        terminal_is_leaf: bool,
-        /// The key at the terminal, if it is a leaf.
+        /// The key at the terminal leaf (the record's slot).
         terminal_key: String,
-        /// The value digest at the terminal, if it is a leaf.
+        /// The value digest at the terminal leaf.
         terminal_value_hash: String,
-        /// Whether the covering assertion has finalized. A withdrawal submitted
-        /// while this is false will be refused on chain.
-        finalized: bool,
     },
     /// An account's state accompanied by a cryptographic Merkle proof for ultralight mobile clients.
     AccountProof {
@@ -403,46 +430,66 @@ pub enum Response {
 /// Made against the most recent **finalized** assertion rather than the current
 /// root. A proof against an unfinalized root is one the bridge refuses, and
 /// handing one out would let the user discover that as a failed transaction.
-fn withdrawal_proof(sequencer: &Sequencer, address: L2Address) -> Response {
-    let height = sequencer.finalized_height();
-    if height == 0 {
+fn withdrawal_proof(
+    sequencer: &Sequencer,
+    sender: L2Address,
+    nonce: u64,
+    state_root: Option<Hash256>,
+) -> Response {
+    let current = sequencer.state.root();
+    let root = state_root.unwrap_or(current);
+    // Only roots this node produced: the current one, or a block's.
+    let height = if root == current {
+        Some(sequencer.blocks.len() as u64)
+    } else {
+        sequencer
+            .blocks
+            .iter()
+            .position(|b| b.post_state_root == root)
+            .map(|i| i as u64 + 1)
+    };
+    let Some(height) = height else {
         return Response::Error {
-            message: "no assertion has finalized yet; nothing is withdrawable".to_owned(),
-        };
-    }
-
-    let Some(block) = usize::try_from(height - 1)
-        .ok()
-        .and_then(|i| sequencer.blocks.get(i))
-    else {
-        return Response::Error {
-            message: format!("no block at finalized height {height}"),
+            message: format!("no block of this node reached state root {root}"),
         };
     };
 
-    let root = block.post_state_root;
-    let slot = keys::account(&address);
+    let slot = keys::withdrawal(&sender, nonce);
     let proof = sequencer.state.prove_at(root, &slot);
-    let value = sequencer
-        .state
-        .get(&slot)
-        .map(<[u8]>::to_vec)
-        .unwrap_or_default();
-
-    let (terminal_is_leaf, terminal_key, terminal_value_hash) = match &proof.terminal {
-        sena_state::Terminal::Leaf { key, value_hash } => (true, key.to_hex(), value_hash.to_hex()),
-        sena_state::Terminal::Empty => (false, String::new(), String::new()),
+    // A record is written once and never changed, so the current value is
+    // the value under every root that holds it.
+    let record = match (&proof.terminal, sequencer.state.get(&slot)) {
+        (sena_state::Terminal::Leaf { key, value_hash }, Some(value))
+            if *key == slot && *value_hash == sena_state::hash_value(value) =>
+        {
+            value.to_vec()
+        }
+        _ => {
+            return Response::Error {
+                message: format!(
+                    "no withdrawal by {sender} at nonce {nonce} under state root {root}"
+                ),
+            }
+        }
     };
-
+    let Ok((to, asset, amount)) = sena_stf::execute::decode_withdrawal(&record) else {
+        return Response::Error {
+            message: "the withdrawal record is malformed".to_owned(),
+        };
+    };
+    let sena_state::Terminal::Leaf { key, value_hash } = proof.terminal else {
+        unreachable!("matched above")
+    };
     Response::WithdrawalProof {
-        assertion_height: height,
+        height,
         state_root: root,
-        account_value: hex::encode(value),
+        record: hex::encode(&record),
+        to: format!("0x{}", hex::encode(to)),
+        asset: asset.get(),
+        amount,
         siblings: proof.siblings.iter().map(Hash256::to_hex).collect(),
-        terminal_is_leaf,
-        terminal_key,
-        terminal_value_hash,
-        finalized: true,
+        terminal_key: key.to_hex(),
+        terminal_value_hash: value_hash.to_hex(),
     }
 }
 
@@ -631,6 +678,56 @@ fn jwk(sequencer: &Sequencer, iss: &str, n: &str) -> Response {
     }
 }
 
+/// One escrow, as `sena_getEscrows` reports it.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct EscrowEntry {
+    /// Who opened it.
+    pub sender: L2Address,
+    /// The nonce of the transaction that opened it.
+    pub nonce: u64,
+    /// The block it was opened in.
+    pub height: u64,
+    /// The record as state holds it now (`released` once claimed or refunded).
+    pub record: sena_stf::Escrow,
+}
+
+fn escrows(
+    sequencer: &Sequencer,
+    identifiers: &[HashedIdentifier],
+    sender: Option<L2Address>,
+) -> Response {
+    if identifiers.len() > MAX_TRUSTED_ISSUERS {
+        return Response::Error {
+            message: format!("ask about at most {MAX_TRUSTED_ISSUERS} identifiers"),
+        };
+    }
+    let mut out = Vec::new();
+    for block in &sequencer.blocks {
+        for tx in &block.transactions {
+            let sena_stf::Payload::EscrowSend { identifier, .. } = &tx.payload else {
+                continue;
+            };
+            if !identifiers.contains(identifier) && sender != Some(tx.sender) {
+                continue;
+            }
+            let Some(record) = sequencer
+                .state
+                .get(&keys::escrow(&tx.sender, tx.nonce))
+                .and_then(|b| sena_stf::Escrow::decode(b).ok())
+            else {
+                continue;
+            };
+            out.push(EscrowEntry {
+                sender: tx.sender,
+                nonce: tx.nonce,
+                height: block.height,
+                record,
+            });
+        }
+    }
+    Response::Escrows { escrows: out }
+}
+
 fn lookup_attestations(
     sequencer: &Sequencer,
     identifier: &HashedIdentifier,
@@ -662,6 +759,7 @@ fn lookup_attestations(
 fn concerns(tx: &Transaction, address: &L2Address) -> bool {
     tx.sender == *address
         || matches!(&tx.payload, sena_stf::Payload::Transfer { to, .. } if to == address)
+        || matches!(&tx.payload, sena_stf::Payload::Deposit { recipient, .. } if recipient == address)
 }
 
 /// `address`'s transactions, newest first, queued ones included.
@@ -690,7 +788,12 @@ fn account_transactions(
         if out.len() >= limit {
             break;
         }
-        let ctx = block.context(sequencer.keyless().map(AsRef::as_ref), sequencer.chain_id());
+        // Fees only: a deposit pays none, so no log is needed.
+        let ctx = block.context(
+            sequencer.keyless().map(AsRef::as_ref),
+            sequencer.chain_id(),
+            None,
+        );
         for tx in block.transactions.iter().rev() {
             if out.len() >= limit {
                 break;
@@ -761,6 +864,8 @@ fn da_blob(sequencer: &Sequencer, height: u64) -> Response {
 ///
 /// `chain_id` is reported back so a client can tell at a glance whether it is
 /// talking to the network it thinks it is.
+// One arm per RPC method: a flat table, clearer whole than split.
+#[allow(clippy::too_many_lines)]
 pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Response {
     match request {
         Request::SubmitTransaction(transaction) => match sequencer.submit(*transaction) {
@@ -798,6 +903,11 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
             trusted_issuers,
         } => lookup_attestations(sequencer, &identifier, &trusted_issuers),
 
+        Request::GetEscrows {
+            identifiers,
+            sender,
+        } => escrows(sequencer, &identifiers, sender),
+
         Request::GetCouncil => council(sequencer),
 
         Request::GetJwk { iss, n } => jwk(sequencer, &iss, &n),
@@ -832,7 +942,11 @@ pub fn handle(sequencer: &mut Sequencer, chain_id: &str, request: Request) -> Re
 
         Request::GetBlock { height } => block_response(sequencer, height),
 
-        Request::GetWithdrawalProof { address } => withdrawal_proof(sequencer, address),
+        Request::GetWithdrawalProof {
+            sender,
+            nonce,
+            state_root,
+        } => withdrawal_proof(sequencer, sender, nonce, state_root),
 
         Request::GetAccountProof { address, height } => account_proof(sequencer, address, height),
 

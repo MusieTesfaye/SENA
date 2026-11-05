@@ -30,6 +30,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod da;
+pub mod deposits;
 pub mod genesis;
 pub mod http;
 pub mod jwk_sync;

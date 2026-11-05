@@ -28,6 +28,11 @@ module sena::txcodec {
     const PAYLOAD_REVOKE_ATTESTATION: u8 = 2;
     const PAYLOAD_GOVERNANCE: u8 = 3;
     const PAYLOAD_DISTRIBUTE_FEES: u8 = 4;
+    const PAYLOAD_DEPOSIT: u8 = 5;
+    const PAYLOAD_WITHDRAW: u8 = 6;
+    const PAYLOAD_ESCROW_SEND: u8 = 7;
+    const PAYLOAD_ESCROW_CLAIM: u8 = 8;
+    const PAYLOAD_ESCROW_REFUND: u8 = 9;
 
     const UPDATE_SET_GAS_ASSET: u8 = 0;
     const UPDATE_SET_PARAMETER: u8 = 1;
@@ -290,6 +295,33 @@ module sena::txcodec {
             p.amount = take_u128(&mut c);
             p.split = take_field(&mut c);
             if (!c.ok || !split_is_well_formed(p.split)) { return option::none() };
+        } else if (kind == PAYLOAD_ESCROW_SEND) {
+            // `Payload::EscrowSend`: the expiry is kept in `epoch`.
+            p.identifier = take_bytes(&mut c, 32);
+            p.issuer = take_bytes(&mut c, 32);
+            p.asset = take_u32(&mut c);
+            p.amount = take_u128(&mut c);
+            p.epoch = take_u64(&mut c);
+        } else if (kind == PAYLOAD_ESCROW_CLAIM || kind == PAYLOAD_ESCROW_REFUND) {
+            // The escrow's sender in `to`, its nonce in `epoch`, the record in
+            // `split`; a record that is not canonical does not decode, as in Rust.
+            p.to = take_bytes(&mut c, 32);
+            p.epoch = take_u64(&mut c);
+            p.split = take_field(&mut c);
+            if (!c.ok || vector::length(&p.split) != 93 || *vector::borrow(&p.split, 0) > 1) {
+                return option::none()
+            };
+        } else if (kind == PAYLOAD_WITHDRAW) {
+            // `Payload::Withdraw`: the L1 recipient is kept in `to`.
+            p.to = take_bytes(&mut c, 32);
+            p.asset = take_u32(&mut c);
+            p.amount = take_u128(&mut c);
+        } else if (kind == PAYLOAD_DEPOSIT) {
+            // `Payload::Deposit`: the id is kept in `epoch`, the recipient in `to`.
+            p.epoch = take_u64(&mut c);
+            p.to = take_bytes(&mut c, 32);
+            p.asset = take_u32(&mut c);
+            p.amount = take_u128(&mut c);
         } else {
             return option::none()
         };
@@ -425,6 +457,13 @@ module sena::txcodec {
     public fun is_revoke_attestation(p: &Payload): bool { p.kind == PAYLOAD_REVOKE_ATTESTATION }
     public fun is_governance(p: &Payload): bool { p.kind == PAYLOAD_GOVERNANCE }
     public fun is_distribute_fees(p: &Payload): bool { p.kind == PAYLOAD_DISTRIBUTE_FEES }
+    public fun is_deposit(p: &Payload): bool { p.kind == PAYLOAD_DEPOSIT }
+    public fun is_withdraw(p: &Payload): bool { p.kind == PAYLOAD_WITHDRAW }
+    public fun is_escrow_send(p: &Payload): bool { p.kind == PAYLOAD_ESCROW_SEND }
+    public fun is_escrow_claim(p: &Payload): bool { p.kind == PAYLOAD_ESCROW_CLAIM }
+    public fun is_escrow_refund(p: &Payload): bool { p.kind == PAYLOAD_ESCROW_REFUND }
+    /// Deposit: the L1 deposit id.
+    public fun deposit_id(p: &Payload): u64 { p.epoch }
     public fun to(p: &Payload): vector<u8> { p.to }
     public fun asset(p: &Payload): u32 { p.asset }
     public fun amount(p: &Payload): u128 { p.amount }

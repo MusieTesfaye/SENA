@@ -37,13 +37,19 @@ module sena::dispute_e2e_test {
 
     // --- Compiler conformance -------------------------------------------------
 
-    #[test]
-    fun the_l1_compiler_matches_the_node_on_every_case() {
+    #[test(chain = @0xC4A1)]
+    fun the_l1_compiler_matches_the_node_on_every_case(chain: &signer) {
+        // The deposit log the Rust cases compiled against.
+        let chain_addr = std::signer::address_of(chain);
+        sena::deposits::register_bridge(chain, @0xB1, v::deposit_log_asset());
+        sena::deposits::append_for_test(
+            chain_addr, @0xB1, v::deposit_log_recipient(), v::deposit_log_asset(), v::deposit_log_amount()
+        );
         let n = v::compile_case_count();
         let i = 0;
         while (i < n) {
             let (bytes, ts, setup, expected_ok, expected_program, expected_digest, base_fee) = v::compile_case(i);
-            let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup, 0);
+            let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup, 0, chain_addr);
             assert!(ok == expected_ok, 1000 + i);
             if (ok) {
                 assert!(vector::length(&program) == vector::length(&expected_program), 2000 + i);
@@ -69,7 +75,7 @@ module sena::dispute_e2e_test {
     fun council_verification_consumes_the_epoch_as_the_node_does() {
         // The council-signed SetJwk; its fifth step is VerifyCouncil.
         let (bytes, ts, setup, _, _, _, base_fee) = v::compile_case(v::council_case());
-        let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup, 0);
+        let (ok, program) = compiler::compile(bytes, ts, base_fee, v::batch_fee_recipient(), setup, 0, @0x0);
         assert!(ok, 0);
         let verify = vector::borrow(&program, 4);
         assert!(osp::encode_instruction(verify) == v::council_instruction(), 1);
@@ -142,6 +148,7 @@ module sena::dispute_e2e_test {
         account::create_account_for_test(signer::address_of(admin));
         let (mint_ref, metadata) = create_asset(admin);
         assertions::initialize(admin, v::genesis_root(), WINDOW, BOND, metadata, TREASURY, MAX_BATCH_AGE);
+        assertions::set_proposers(admin, signer::address_of(admin), vector[signer::address_of(admin), signer::address_of(proposer)]);
         disputes::initialize(admin, signer::address_of(admin), keyless::setup_aptos_devnet_insecure(), 0);
         account::create_account_for_test(TREASURY);
         fund(&mint_ref, metadata, signer::address_of(proposer));
@@ -317,7 +324,7 @@ module sena::dispute_e2e_test {
         let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, v::batch_timestamp(), setup));
         assert!(done && ok, 0);
         let (inline_ok, _) = compiler::compile(
-            tx, v::batch_timestamp(), v::batch_base_fee(), v::batch_fee_recipient(), setup, 0
+            tx, v::batch_timestamp(), v::batch_base_fee(), v::batch_fee_recipient(), setup, 0, @0x0
         );
         assert!(inline_ok, 1);
 
@@ -327,7 +334,7 @@ module sena::dispute_e2e_test {
         keyless_jobs::start(challenger, admin_addr, tx, late, setup);
         let (done, ok) = keyless_jobs::verdict(admin_addr, keyless_jobs::job_id(tx, late, setup));
         assert!(done && !ok, 2);
-        let (inline_ok, _) = compiler::compile(tx, late, v::batch_base_fee(), v::batch_fee_recipient(), setup, 0);
+        let (inline_ok, _) = compiler::compile(tx, late, v::batch_base_fee(), v::batch_fee_recipient(), setup, 0, @0x0);
         assert!(!inline_ok, 3);
     }
 

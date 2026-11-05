@@ -21,6 +21,43 @@ mod region {
     pub const JWK: &[u8] = b"SENA:v1:state:jwk";
     pub const FEE_MARKET: &[u8] = b"SENA:v1:state:fee-market";
     pub const FEE_SPLIT: &[u8] = b"SENA:v1:state:fee-split";
+    pub const DEPOSIT_CURSOR: &[u8] = b"SENA:v1:state:deposit-cursor";
+    pub const WITHDRAWAL: &[u8] = b"SENA:v1:state:withdrawal";
+    pub const ESCROW: &[u8] = b"SENA:v1:state:escrow";
+}
+
+/// Key of the escrow opened by `sender`'s transaction `nonce`: unique per
+/// transaction, written when it opens and once more when it is released.
+#[must_use]
+pub fn escrow(sender: &L2Address, nonce: u64) -> Hash256 {
+    Hash256::commit(
+        CanonicalEncoder::new(region::ESCROW)
+            .field(sender.as_bytes())
+            .u64(nonce),
+    )
+}
+
+/// Key of the withdrawal record written by `sender`'s transaction `nonce`.
+///
+/// Unique per transaction, because a nonce is consumed once, and written
+/// once: `sena::bridge::claim` pays each record at most once against any
+/// finalized root that holds it.
+#[must_use]
+pub fn withdrawal(sender: &L2Address, nonce: u64) -> Hash256 {
+    Hash256::commit(
+        CanonicalEncoder::new(region::WITHDRAWAL)
+            .field(sender.as_bytes())
+            .u64(nonce),
+    )
+}
+
+/// Key of the deposit cursor: the id of the last L1 deposit credited.
+///
+/// One slot, written by [`crate::Instruction::ConsumeDeposit`], which is what
+/// makes each deposit credit exactly once and in L1 order.
+#[must_use]
+pub fn deposit_cursor() -> Hash256 {
+    Hash256::commit(CanonicalEncoder::new(region::DEPOSIT_CURSOR))
 }
 
 /// Key of an account's state.

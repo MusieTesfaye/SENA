@@ -225,6 +225,24 @@ pub enum RelayError {
     /// L1 found wrong, and nothing more can be built on it. Operator action.
     #[error("assertion for block {0} was rejected on L1; halting")]
     Rejected(u64),
+    /// Our next assertion's id is already on L1 under another proposer.
+    /// Operator action: that account must be removed from the proposer list
+    /// (or was never on it, and the contract predates the fix).
+    #[error("assertion for block {0} was posted by {1}, not us; halting")]
+    NotOurs(u64, String),
+}
+
+/// How long a challenge may sit without a live game before anyone may
+/// dismiss it (`MOVE_TIMEOUT` in `sena::disputes`).
+const MOVE_TIMEOUT_SECS: u64 = 21600;
+
+/// Whether two Aptos addresses are the same, whatever their formatting.
+fn same_address(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let h = s.trim().trim_start_matches("0x").to_ascii_lowercase();
+        format!("{h:0>64}")
+    };
+    norm(a) == norm(b)
 }
 
 /// The proposer's L1 agent.
@@ -319,14 +337,24 @@ impl<C: L1, S: L2Source> Relayer<C, S> {
             // A crash between a successful post and saving it leaves the
             // assertion on L1 but not in our state; posting it again would
             // abort on the duplicate id forever.
-            let already_posted = self
+            let existing = self
                 .l1
                 .view(
                     "assertions::record",
                     &[Arg::Address(self.l1.contract()), Arg::Bytes(id.to_vec())],
                 )
-                .is_ok();
-            if !already_posted {
+                .ok();
+            // The id does not include the proposer, so someone else may have
+            // posted ours first. Building on it would leave it undefended --
+            // only the recorded proposer can play its disputes -- so stop
+            // rather than adopt it.
+            if let Some(v) = &existing {
+                let record = l1::parse_record(v)?;
+                if !same_address(&record.proposer, &self.l1.address()) {
+                    return Err(RelayError::NotOurs(height, record.proposer));
+                }
+            }
+            if existing.is_none() {
                 self.l1.submit(
                     "assertions::post",
                     &[
@@ -406,6 +434,33 @@ impl<C: L1, S: L2Source> Relayer<C, S> {
                     &[Arg::Address(self.l1.contract()), Arg::Bytes(did.clone())],
                 )?)?;
                 if !d.exists || d.stage == 2 {
+                    // A challenge with no live game freezes the assertion
+                    // until it is dismissed; after MOVE_TIMEOUT anyone may.
+                    let opened = self
+                        .l1
+                        .view(
+                            "assertions::challenge_opened_at",
+                            &[
+                                Arg::Address(self.l1.contract()),
+                                Arg::Bytes(id_bytes.clone()),
+                                Arg::Address(challenger.to_owned()),
+                            ],
+                        )
+                        .ok()
+                        .and_then(|v| v.first().and_then(|x| l1::u128_of(x).ok()));
+                    if let Some(opened) = opened {
+                        if u128::from(now) > opened + u128::from(MOVE_TIMEOUT_SECS) {
+                            self.l1.submit(
+                                "disputes::dismiss_stale_challenge",
+                                &[
+                                    Arg::Address(self.l1.contract()),
+                                    Arg::Bytes(id_bytes.clone()),
+                                    Arg::Address(challenger.to_owned()),
+                                ],
+                            )?;
+                            report.timeouts_claimed += 1;
+                        }
+                    }
                     continue;
                 }
                 if d.turn == 0 && d.stage == 0 && !d.has_offer {

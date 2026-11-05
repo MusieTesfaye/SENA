@@ -87,6 +87,70 @@ impl Attestation {
     }
 }
 
+/// A payment to an identifier, held until whoever the issuer attests it to
+/// claims it, or its sender takes it back after `expires_at` (Celo's
+/// `Escrow`). State holds it under the sending transaction's sender and nonce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Escrow {
+    /// The hashed identifier it is for.
+    pub identifier: HashedIdentifier,
+    /// The issuer whose attestation of the identifier the sender trusts.
+    pub issuer: L2Address,
+    /// The asset held.
+    pub asset: sena_primitives::AssetId,
+    /// The amount held.
+    #[serde(with = "sena_primitives::serde_hex::u128_string")]
+    pub amount: u128,
+    /// From this batch time on, the sender may take it back and nobody may
+    /// claim it.
+    pub expires_at: u64,
+    /// Whether it has been claimed or taken back.
+    pub released: bool,
+}
+
+impl Escrow {
+    /// Encodes the record: a one-byte discriminant (0 open, 1 released), the
+    /// identifier, the issuer, the asset, the amount and the expiry.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(u8::from(self.released))
+            .bytes32(self.identifier.as_hash().as_bytes())
+            .bytes32(self.issuer.as_bytes())
+            .u32(self.asset.get())
+            .u128(self.amount)
+            .u64(self.expires_at);
+        w.finish()
+    }
+
+    /// Decodes a stored record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MalformedAttestation`] unless the bytes are canonical.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MalformedAttestation> {
+        let inner = || -> Result<Self, DecodeError> {
+            let mut r = Reader::new(bytes);
+            let released = match r.u8()? {
+                0 => false,
+                1 => true,
+                other => return Err(DecodeError::UnknownVariant(other)),
+            };
+            let out = Self {
+                released,
+                identifier: HashedIdentifier(sena_primitives::Hash256(r.bytes32()?)),
+                issuer: L2Address::from_bytes(r.bytes32()?),
+                asset: sena_primitives::AssetId(r.u32()?),
+                amount: r.u128()?,
+                expires_at: r.u64()?,
+            };
+            r.finish()?;
+            Ok(out)
+        };
+        inner().map_err(|_| MalformedAttestation)
+    }
+}
+
 /// What an issuer signs to attest that `identifier` belongs to `account` on
 /// the chain `chain_id`. The issuer's address is its Ed25519 public key.
 #[must_use]

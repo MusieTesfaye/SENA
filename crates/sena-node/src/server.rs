@@ -51,6 +51,11 @@ pub struct ServerConfig {
     /// proxy that sets the header (Caddy, nginx); otherwise a client could
     /// name any address it likes.
     pub trust_forwarded_for: bool,
+    /// Where L1 deposits are read from, or `None` to credit none.
+    pub deposits_from: Option<crate::deposits::RestReader>,
+    /// Seconds between reads of the L1 deposit log. Public fullnodes limit
+    /// anonymous callers, so not every block.
+    pub deposits_poll_secs: u64,
 }
 
 /// A fixed-window request counter, keyed by client.
@@ -98,6 +103,8 @@ impl Default for ServerConfig {
             max_body_bytes: 1 << 20,
             cors_origins: Vec::new(),
             trust_forwarded_for: false,
+            deposits_from: None,
+            deposits_poll_secs: 15,
         }
     }
 }
@@ -123,6 +130,20 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Writes the node's state, chain and blocks to the store.
+fn persist(
+    store: &Store,
+    genesis: &crate::genesis::GenesisConfig,
+    sequencer: &Sequencer,
+) -> Result<(), crate::store::StoreError> {
+    store.save(
+        genesis,
+        &sequencer.state,
+        &sequencer.chain.snapshot(),
+        &sequencer.blocks,
+    )
 }
 
 /// Runs the node until `shutdown` is set.
@@ -167,9 +188,17 @@ pub fn run(
         "  rate limit       {}/min per client",
         config.rate_limit_per_minute
     );
+    match &config.deposits_from {
+        Some(r) => println!(
+            "  L1 deposits      {}::deposits at {}",
+            r.contract, r.rest_url
+        ),
+        None => println!("  L1 deposits      not read"),
+    }
 
     let mut limiter = RateLimiter::default();
     let mut last_block = unix_now();
+    let mut last_deposit_read = 0u64;
     let mut last_persist = unix_now();
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -179,6 +208,16 @@ pub fn run(
 
         if now.saturating_sub(last_block) >= config.block_interval_secs {
             last_block = now;
+            let due = now.saturating_sub(last_deposit_read) >= config.deposits_poll_secs;
+            if let Some(reader) = config.deposits_from.as_ref().filter(|_| due) {
+                last_deposit_read = now;
+                match crate::deposits::poll(sequencer, reader) {
+                    Ok(0) => {}
+                    Ok(n) => println!("read {n} new L1 deposit(s)"),
+                    // Retried next interval; blocks go on without them.
+                    Err(error) => eprintln!("reading L1 deposits failed: {error}"),
+                }
+            }
             match sequencer.produce(config.max_block_transactions) {
                 Ok(Some((block, id))) => {
                     println!(
@@ -189,6 +228,12 @@ pub fn run(
                         block.post_state_root,
                         hex::encode(&id.0.as_bytes()[..8]),
                     );
+                    // Saved before any request can read it: a block the
+                    // relayer posts to L1 must survive a restart, or the
+                    // restarted chain seals a different block at that height
+                    // and settlement halts on the mismatch.
+                    persist(store, genesis, sequencer)?;
+                    last_persist = now;
                 }
                 Ok(None) => {}
                 Err(error) => eprintln!("block production failed: {error}"),
@@ -198,12 +243,7 @@ pub fn run(
 
         if now.saturating_sub(last_persist) >= config.persist_interval_secs {
             last_persist = now;
-            store.save(
-                genesis,
-                &sequencer.state,
-                &sequencer.chain.snapshot(),
-                &sequencer.blocks,
-            )?;
+            persist(store, genesis, sequencer)?;
         }
 
         if let Some(incoming) = server.recv_timeout(Duration::from_millis(200)) {
@@ -227,12 +267,7 @@ pub fn run(
     }
 
     // A final persist, so a clean shutdown never loses the last few blocks.
-    store.save(
-        genesis,
-        &sequencer.state,
-        &sequencer.chain.snapshot(),
-        &sequencer.blocks,
-    )?;
+    persist(store, genesis, sequencer)?;
     println!("state persisted to {}", store.path().display());
     Ok(())
 }
@@ -252,6 +287,14 @@ fn client_of(request: &HttpRequest, trust_forwarded_for: bool) -> String {
     request
         .remote
         .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
+}
+
+/// Whether `a == b`, in time that depends only on their lengths.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The CORS headers for a request: none unless its `Origin` is allowed.
@@ -306,9 +349,9 @@ fn serve(
     if let Some(expected) = &config.auth_token {
         let presented = request.header("Authorization").unwrap_or_default();
         let offered = presented.strip_prefix("Bearer ").unwrap_or(presented);
-        // Length-independent comparison is unnecessary here: the token is a
-        // shared secret over a local transport, not a per-message MAC.
-        if offered != expected {
+        // Compared in constant time: `--listen` can bind a public address,
+        // and an early-exit comparison leaks how much of a guess was right.
+        if !constant_time_eq(offered.as_bytes(), expected.as_bytes()) {
             return error_json("unauthorised: a valid bearer token is required");
         }
     }

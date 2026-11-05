@@ -173,7 +173,7 @@ pub fn assemble_signature(
         &parsed,
         &sign_in(&s, pepper, exp_horizon_secs, jwk_n, extra_field)?,
         proved.proof,
-        Some(proved.public_inputs_hash),
+        Some(&proved.public_inputs_hash),
     )
     .map_err(err)?;
     Ok(json_of(&sig))

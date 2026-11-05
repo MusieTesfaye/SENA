@@ -51,11 +51,12 @@ pub mod wire;
 pub use account::{Account, BalanceError};
 pub use execute::{
     apply, compile, execute_batch, fee_charge, gas_required, transition, verify_step, BatchContext,
-    BatchError, CompileError, ExecutionTrace, StepError, StepWitness, FEE_VAULT, TEST_CHAIN_ID,
+    BatchError, CompileError, DepositLog, DepositRecord, ExecutionTrace, StepError, StepWitness,
+    DEPOSIT_SENDER, FEE_VAULT, TEST_CHAIN_ID,
 };
 pub use gas::{FeeMarket, FeeSplit, GasError, WhitelistedAsset, PRICE_SCALE, RATE_SCALE};
 pub use governance::{Council, CouncilSignature, GovernanceError, GovernanceUpdate};
 pub use instruction::{Instruction, MachineState};
 pub use keyless::{KeylessConfig, KeylessError, KeylessSignature};
-pub use social::{attestation_digest, Attestation, MalformedAttestation};
+pub use social::{attestation_digest, Attestation, Escrow, MalformedAttestation};
 pub use transaction::{AuthError, Authenticator, Payload, Transaction};

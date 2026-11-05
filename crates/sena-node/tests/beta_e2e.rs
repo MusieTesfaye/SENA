@@ -125,6 +125,8 @@ impl TestNode {
             max_body_bytes: 1 << 20,
             cors_origins: Vec::new(),
             trust_forwarded_for: false,
+            deposits_from: None,
+            deposits_poll_secs: 15,
         };
 
         let flag = Arc::clone(&shutdown);
@@ -536,6 +538,8 @@ fn start_authenticated(
         max_body_bytes: 2_048,
         cors_origins: Vec::new(),
         trust_forwarded_for: false,
+        deposits_from: None,
+        deposits_poll_secs: 15,
     };
 
     let flag = Arc::clone(&shutdown);
@@ -660,10 +664,7 @@ fn an_oversized_request_body_is_refused() {
 }
 
 #[test]
-fn a_withdrawal_proof_is_refused_before_anything_finalizes() {
-    // A proof against a non-finalized root would be rejected on chain, so the
-    // node must not hand one out and let the user discover that as a failed
-    // transaction.
+fn no_withdrawal_proof_for_a_withdrawal_never_made() {
     let alice = signer(14);
     let config = dev_genesis(&alice);
     let node = TestNode::start(&config, temp_dir("wproof"));
@@ -671,13 +672,15 @@ fn a_withdrawal_proof_is_refused_before_anything_finalizes() {
     match call(
         &node.endpoint,
         &Request::GetWithdrawalProof {
-            address: address_of(&alice),
+            sender: address_of(&alice),
+            nonce: 0,
+            state_root: None,
         },
     ) {
         Response::Error { message } => {
-            assert!(message.contains("finalized"), "unexpected: {message}");
+            assert!(message.contains("no withdrawal"), "unexpected: {message}");
         }
-        other => panic!("a proof was produced with nothing finalized: {other:?}"),
+        other => panic!("a proof was produced for nothing: {other:?}"),
     }
 }
 

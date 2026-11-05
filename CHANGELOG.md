@@ -5,6 +5,12 @@ while below 1.0 the protocol may change in breaking ways between releases.
 
 ## [Unreleased]
 
+### Aptos CLI 9.6.0
+
+- The Move contracts now build with Aptos CLI `9.6.0` (was `7.9.0`), with the
+  framework pinned to `07490157`, the tree tagged `aptos-cli-v9.6.0`. CI and
+  the wallet's `scripts/testnet.ts` use the same version. 9.6.0 needs a CPU
+  with AVX2.
 ### Identities, as in Celo's SocialConnect
 
 - **Breaking:** first-come handle binding is gone. It let the first person to

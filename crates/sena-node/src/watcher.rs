@@ -25,8 +25,8 @@ use sena_primitives::{CanonicalEncoder, Hash256};
 use sena_state::{MerkleTrie, Terminal};
 use sena_stf::batch::BatchTree;
 use sena_stf::{
-    apply, compile, Authenticator, BatchContext, Instruction, KeylessConfig, MachineState,
-    Transaction,
+    apply, compile, Authenticator, BatchContext, DepositRecord, Instruction, KeylessConfig,
+    MachineState, Transaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -279,14 +279,20 @@ impl<C: L1> Watcher<C> {
             .map_err(WatchError::State)
     }
 
-    /// The context a published batch executes in, from its header.
-    fn ctx(&self, batch: &l1::PublishedBatch) -> BatchContext<'_> {
+    /// The context a published batch executes in, from its header, with the
+    /// L1 deposits it claims as read from L1 itself.
+    fn ctx<'a>(
+        &'a self,
+        batch: &l1::PublishedBatch,
+        deposits: &'a std::collections::BTreeMap<u64, DepositRecord>,
+    ) -> BatchContext<'a> {
         BatchContext {
             timestamp: batch.timestamp,
             keyless: self.config.keyless.as_deref(),
             base_fee: batch.base_fee,
             fee_recipient: batch.fee_recipient,
             chain_id: self.config.chain_id,
+            deposits: Some(deposits),
         }
     }
 
@@ -302,10 +308,13 @@ impl<C: L1> Watcher<C> {
     /// # Errors
     ///
     /// Returns the first [`WatchError`]; progress before it is persisted.
+    /// A failing game does not stop new assertions being examined: one stuck
+    /// dispute must not leave every later fraud unchallenged.
     pub fn step(&mut self) -> Result<WatchReport, WatchError> {
         let mut report = WatchReport::default();
-        self.play(&mut report)?;
+        let played = self.play(&mut report);
         self.examine(&mut report)?;
+        played?;
         Ok(report)
     }
 
@@ -329,9 +338,11 @@ impl<C: L1> Watcher<C> {
                     None => {
                         let batch = self.batch(&id, &rec)?;
                         let txs = decode_all(&batch.tx_bytes).unwrap_or_default();
-                        let r = replay(&self.replica, &txs, &self.ctx(&batch)).map_err(|_| {
-                            WatchError::State("a verified batch stopped replaying".into())
-                        })?;
+                        let log = l1::deposits_for(&self.l1, &txs)?;
+                        let r =
+                            replay(&self.replica, &txs, &self.ctx(&batch, &log)).map_err(|_| {
+                                WatchError::State("a verified batch stopped replaying".into())
+                            })?;
                         self.replica = r.post;
                         self.state.head = hex::encode(&id);
                         report.verified += 1;
@@ -369,7 +380,8 @@ impl<C: L1> Watcher<C> {
                 "an assertion on our head starts elsewhere".into(),
             ));
         }
-        let r = match replay(&self.replica, &txs, &self.ctx(&batch)) {
+        let log = l1::deposits_for(&self.l1, &txs)?;
+        let r = match replay(&self.replica, &txs, &self.ctx(&batch, &log)) {
             Ok(r) => r,
             Err(i) => return Ok(Some(Fault::Uncompilable(i))),
         };
@@ -552,10 +564,23 @@ impl<C: L1> Watcher<C> {
         Ok(())
     }
 
+    /// Plays every open game. Each game's failure is its own: the rest are
+    /// still played, and the first error is returned at the end.
     fn play(&mut self, report: &mut WatchReport) -> Result<(), WatchError> {
         let games = self.state.games.clone();
         let now = self.l1.now()?;
+        let mut first_error = None;
         for game in games {
+            if let Err(e) = self.play_one(&game, now, report) {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn play_one(&mut self, game: &Game, now: u64, report: &mut WatchReport) -> Result<(), WatchError> {
+        {
+            let game = game.clone();
             let id = unhex(&game.assertion);
             let rec = self.record(&id)?;
             let did = l1::dispute_id(&id, &self.l1.address());
@@ -567,14 +592,21 @@ impl<C: L1> Watcher<C> {
                 self.state.games.retain(|g| *g != game);
                 self.save()?;
                 report.concluded += 1;
-                continue;
+                return Ok(());
+            }
+            // Our own deadline has passed: L1 refuses any move now, and
+            // retrying it every round would only fail. The game ends when
+            // someone claims the timeout.
+            if d.turn == 1 && now > d.deadline {
+                return Ok(());
             }
             let batch = self.batch(&id, &rec)?;
             let txs = decode_all(&batch.tx_bytes)
                 .map_err(|_| WatchError::State("game over undecodable data".into()))?;
             let pre = MerkleTrie::from_bytes(&unhex(&game.pre_state))
                 .map_err(|e| WatchError::State(e.to_string()))?;
-            let r = replay(&pre, &txs, &self.ctx(&batch))
+            let log = l1::deposits_for(&self.l1, &txs)?;
+            let r = replay(&pre, &txs, &self.ctx(&batch, &log))
                 .map_err(|_| WatchError::State("game over uncompilable data".into()))?;
             let contract = self.l1.contract();
             if d.turn == 1 && d.stage == 0 && d.has_offer {

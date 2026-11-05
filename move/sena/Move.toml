@@ -13,11 +13,9 @@ sena = "_"
 # under the package, and a build that cannot be reproduced cannot be the basis
 # for a deployed package hash (BETA_BUILD_PLAN.md W-02).
 #
-# This commit is the tree tagged `aptos-cli-v7.9.0`, chosen so the framework and
-# the CLI that compiles it come from the same revision. Later framework
-# revisions use Move 2 syntax that CLI 7.9.0 cannot parse, and later CLIs do not
-# run on every machine -- see move/README.md.
+# This commit is the tree tagged `aptos-cli-v9.6.0`, chosen so the framework and
+# the CLI that compiles it come from the same revision -- see move/README.md.
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-core.git"
-rev = "46d871fa1feb61ffafb73353a0755e8cc3aaed9d"
+rev = "07490157d3250932a385010878a3c5ae7c1338bb"
 subdir = "aptos-move/framework/aptos-framework"

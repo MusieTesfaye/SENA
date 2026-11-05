@@ -16,16 +16,16 @@
 /// pause hooks run on every move, and calling the plain entry point would either
 /// abort or bypass controls the issuer requires.
 ///
-/// # Who may withdraw
+/// # Withdrawals
 ///
-/// The claimant's Aptos address **is** the L2 address. A withdrawal proves the
-/// balance at `keys::account(claimant)` and pays that same account. Letting a
-/// claimant name an arbitrary L2 address would let anyone withdraw against any
-/// balance they could produce a proof for, which is every balance, since proofs
-/// are public.
+/// A withdrawal is an L2 transaction first: it burns the amount on the L2 and
+/// records who to pay on L1. `claim` pays that record, once, against a
+/// finalized root. The L2 balance is therefore reduced before custody pays,
+/// and custody never pays against a balance that is still spendable on L2.
 module sena::bridge {
     use std::signer;
     use std::vector;
+    use aptos_std::from_bcs;
     use aptos_std::table::{Self, Table};
     use aptos_framework::dispatchable_fungible_asset;
     use aptos_framework::event;
@@ -36,6 +36,7 @@ module sena::bridge {
 
     use sena::assertions;
     use sena::codec;
+    use sena::deposits;
     use sena::osp;
     use sena::trie;
 
@@ -47,19 +48,26 @@ module sena::bridge {
     const E_ALREADY_INITIALIZED: u64 = 43;
     /// The proven balance is zero, so there is nothing to withdraw.
     const E_NOTHING_TO_WITHDRAW: u64 = 44;
-    /// The account slot does not belong to the claimant.
-    const E_SLOT_NOT_CLAIMANTS: u64 = 45;
+    /// The withdrawal record is for another asset, or malformed.
+    const E_WRONG_ASSET: u64 = 45;
     /// The deposit amount is zero.
     const E_ZERO_AMOUNT: u64 = 46;
     /// Custody holds less than the withdrawal requires.
     const E_CUSTODY_SHORTFALL: u64 = 47;
+    /// An L2 recipient is a 32-byte address.
+    const E_BAD_RECIPIENT: u64 = 48;
+    /// Only the bridge's account may do this.
+    const E_NOT_OPERATOR: u64 = 49;
+    /// This submitter already submitted this payload.
+    const E_ALREADY_SUBMITTED: u64 = 50;
+
+    /// Domain tag for forced-entry ids.
+    const DOMAIN_FORCED: vector<u8> = b"SENA:v1:forced-entry";
 
     /// How long the sequencer has to include a forced transaction before anyone
     /// may include it and the sequencer's bond becomes slashable (REQ-FRAUD-029).
     const FORCED_INCLUSION_TIMEOUT: u64 = 86400;
 
-    /// Domain tag for the withdrawal identifier.
-    const DOMAIN_WITHDRAWAL: vector<u8> = b"SENA:v1:withdrawal";
     /// Domain tag for the L2 account state key, mirroring `sena_stf::keys`.
     const DOMAIN_ACCOUNT_KEY: vector<u8> = b"SENA:v1:state:account";
 
@@ -91,16 +99,26 @@ module sena::bridge {
 
     #[event]
     struct Deposited has drop, store {
-        /// Who deposited, and whose L2 account is credited.
+        /// Who deposited on L1.
         depositor: address,
+        /// The L2 account credited.
+        recipient: vector<u8>,
         amount: u64,
-        /// Sequence number; the L2 credits each exactly once.
+        /// The chain-wide id in `sena::deposits`; the L2 credits each exactly
+        /// once, in order.
         deposit_id: u64,
     }
 
     #[event]
+    struct ForcedSubmitted has drop, store {
+        submitter: address,
+        entry_id: vector<u8>,
+    }
+
+    #[event]
     struct Withdrawn has drop, store {
-        claimant: address,
+        /// Who was paid: the recipient the L2 record names.
+        recipient: address,
         amount: u64,
         assertion: vector<u8>,
         withdrawal_id: vector<u8>,
@@ -119,7 +137,11 @@ module sena::bridge {
         // Custody lives in its own object rather than the admin's primary store,
         // so the admin's own balance of the asset can never be confused with, or
         // spent as, user deposits.
-        let constructor = object::create_object(admin_addr);
+        // Owned by no one: the owner of a store can withdraw from it through
+        // the framework's transfer functions, bypassing `claim` entirely.
+        // Payouts still work through `custody_extend`. Created that way rather
+        // than transferred, since some assets' stores cannot be transferred.
+        let constructor = object::create_object(assertions::burn_address());
         let custody_extend = object::generate_extend_ref(&constructor);
         let custody = fungible_asset::create_store(&constructor, metadata);
 
@@ -135,17 +157,34 @@ module sena::bridge {
         });
     }
 
-    /// Deposits the bridged asset, to be credited on the L2.
+    /// Deposits the bridged asset to the depositor's own address on the L2.
     ///
-    /// Crediting happens on the L2 when the sequencer observes the emitted
-    /// event. The `deposit_id` is what makes that exactly-once: a sequencer
-    /// replaying events must not credit the same deposit twice.
+    /// The depositor's Aptos address is used as the L2 address, which is what
+    /// `withdraw` pays. An L2 account whose address is an Ed25519 key or a
+    /// keyless identity is not an Aptos address; use `deposit_to` for those.
     public entry fun deposit(
         depositor: &signer,
         bridge_addr: address,
         amount: u64,
     ) acquires Bridge {
+        deposit_to(depositor, bridge_addr, bcs_address_bytes(signer::address_of(depositor)), amount)
+    }
+
+    /// Deposits the bridged asset, to be credited to `recipient` on the L2.
+    ///
+    /// The deposit is appended to the chain's log in `sena::deposits`, which
+    /// is what the L2 credits from and what L1 checks a credit against in a
+    /// dispute. Each deposit gets the next chain-wide id; the L2 credits them
+    /// once each, in order. Aborts unless the chain's owner registered this
+    /// bridge, so a bridge nobody vouched for cannot mint L2 balances.
+    public entry fun deposit_to(
+        depositor: &signer,
+        bridge_addr: address,
+        recipient: vector<u8>,
+        amount: u64,
+    ) acquires Bridge {
         assert!(amount > 0, E_ZERO_AMOUNT);
+        assert!(vector::length(&recipient) == 32, E_BAD_RECIPIENT);
         let bridge = borrow_global_mut<Bridge>(bridge_addr);
         let from = primary_fungible_store::ensure_primary_store_exists(
             signer::address_of(depositor), bridge.metadata
@@ -157,10 +196,14 @@ module sena::bridge {
         dispatchable_fungible_asset::deposit(bridge.custody, assets);
 
         bridge.deposit_count = bridge.deposit_count + 1;
+        let deposit_id = deposits::append(
+            bridge.chain, bridge_addr, recipient, bridge.l2_asset_id, amount
+        );
         event::emit(Deposited {
             depositor: signer::address_of(depositor),
+            recipient,
             amount,
-            deposit_id: bridge.deposit_count,
+            deposit_id,
         });
     }
 
@@ -178,101 +221,64 @@ module sena::bridge {
         std::bcs::to_bytes(&addr)
     }
 
-    /// Derives the identifier a withdrawal is recorded under.
+    /// Pays a withdrawal recorded on the L2, against a finalized assertion.
     ///
-    /// Computed from what the withdrawal *is* -- the assertion, the account and
-    /// the asset -- rather than supplied by the caller. A caller-chosen
-    /// identifier would let the same proof be presented repeatedly under
-    /// different ids, which is a drained bridge rather than a bookkeeping
-    /// inconvenience.
+    /// A withdrawal starts on the L2: a `Withdraw` transaction burns the
+    /// amount there and writes a record -- recipient, asset, amount -- into a
+    /// slot unique to its sender and nonce (`keys::withdrawal`). Once a
+    /// finalized assertion's state holds that record, anyone may submit this
+    /// call, and the record's recipient is paid. Checked, each load-bearing:
     ///
-    /// One withdrawal per account per asset per finalized assertion. The whole
-    /// proven balance leaves at once, so there is no partial-withdrawal
-    /// accounting to get wrong.
-    public fun withdrawal_id(
-        assertion: vector<u8>,
-        l2_address: address,
-        l2_asset_id: u32,
-    ): vector<u8> {
-        let buf = codec::begin(DOMAIN_WITHDRAWAL);
-        codec::put_field(&mut buf, assertion);
-        codec::put_field(&mut buf, bcs_address_bytes(l2_address));
-        let asset_field = vector::empty<u8>();
-        codec::put_u32(&mut asset_field, l2_asset_id);
-        codec::put_field(&mut buf, asset_field);
-        codec::commit(buf)
-    }
-
-    /// Withdraws the balance proven against a finalized assertion.
+    /// 1. the assertion has finalized -- `finalized_root` aborts otherwise;
+    /// 2. the proof shows the slot derived from `(l2_sender, l2_nonce)` holds
+    ///    `record` under that root;
+    /// 3. the record is for this bridge's asset;
+    /// 4. this record has not been paid. Spent-ness is keyed by the slot, not
+    ///    the assertion: the record stays in every later root, and keying by
+    ///    assertion would pay it once per assertion.
     ///
-    /// Four things are checked, and each is load-bearing:
-    ///
-    /// 1. the assertion has finalized -- `finalized_root` aborts otherwise, so a
-    ///    pending or challenged root cannot be withdrawn against however
-    ///    well-formed the proof;
-    /// 2. the proof reconstructs to that root, making it a claim about SENA's
-    ///    state rather than about nothing;
-    /// 3. the slot proven is the claimant's own;
-    /// 4. this withdrawal has not already been paid.
-    public entry fun withdraw(
-        claimant: &signer,
+    /// The amount and recipient come from the proven record, never from the
+    /// caller, so who submits the claim does not matter.
+    public entry fun claim(
+        _caller: &signer,
         bridge_addr: address,
         assertion_id: vector<u8>,
-        account_value: vector<u8>,
+        l2_sender: vector<u8>,
+        l2_nonce: u64,
+        record: vector<u8>,
         siblings: vector<vector<u8>>,
-        terminal_is_leaf: bool,
         terminal_key: vector<u8>,
         terminal_value_hash: vector<u8>,
     ) acquires Bridge {
-        let claimant_addr = signer::address_of(claimant);
         let bridge = borrow_global_mut<Bridge>(bridge_addr);
-
-        // Aborts unless the assertion has finalized.
         let root = assertions::finalized_root(bridge.chain, assertion_id);
 
-        // The slot is derived from the claimant, never accepted from them.
-        let slot = account_slot(claimant_addr);
-        if (terminal_is_leaf) {
-            assert!(terminal_key == slot, E_SLOT_NOT_CLAIMANTS);
-        };
+        let slot = osp::withdrawal_key(l2_sender, l2_nonce);
+        let proof = trie::new_proof(siblings, trie::leaf_terminal(terminal_key, terminal_value_hash));
+        trie::verify_inclusion(&proof, root, slot, trie::hash_value(record));
+        assert!(!table::contains(&bridge.spent, slot), E_ALREADY_WITHDRAWN);
 
-        let terminal = if (terminal_is_leaf) {
-            trie::leaf_terminal(terminal_key, terminal_value_hash)
-        } else {
-            trie::empty_terminal()
-        };
-        let proof = trie::new_proof(siblings, terminal);
-        trie::verify_inclusion(&proof, root, slot, trie::hash_value(account_value));
-
-        let id = withdrawal_id(assertion_id, claimant_addr, bridge.l2_asset_id);
-        assert!(!table::contains(&bridge.spent, id), E_ALREADY_WITHDRAWN);
-
-        // The proven account state decides the amount. Taking it as an argument
-        // would make the proof decorative.
-        let account = osp::decode_account(account_value);
-        let balance = osp::account_balance(&account, bridge.l2_asset_id);
-        assert!(balance > 0, E_NOTHING_TO_WITHDRAW);
-        // L2 balances are u128; a bridged amount must fit the asset's u64.
-        assert!(balance <= 18446744073709551615, E_CUSTODY_SHORTFALL);
-        let amount = (balance as u64);
+        let (ok, to, asset, amount) = osp::decode_withdrawal(record);
+        assert!(ok && asset == bridge.l2_asset_id, E_WRONG_ASSET);
+        assert!(amount > 0, E_NOTHING_TO_WITHDRAW);
+        // L2 amounts are u128; a bridged amount must fit the asset's u64.
+        assert!(amount <= 18446744073709551615, E_CUSTODY_SHORTFALL);
+        let amount = (amount as u64);
         assert!(fungible_asset::balance(bridge.custody) >= amount, E_CUSTODY_SHORTFALL);
 
-        table::add(&mut bridge.spent, id, true);
+        table::add(&mut bridge.spent, slot, true);
 
+        let recipient = from_bcs::to_address(to);
         let custody_signer = object::generate_signer_for_extending(&bridge.custody_extend);
-        let assets = dispatchable_fungible_asset::withdraw(
-            &custody_signer, bridge.custody, amount
-        );
-        let to = primary_fungible_store::ensure_primary_store_exists(
-            claimant_addr, bridge.metadata
-        );
-        dispatchable_fungible_asset::deposit(to, assets);
+        let assets = dispatchable_fungible_asset::withdraw(&custody_signer, bridge.custody, amount);
+        let dest = primary_fungible_store::ensure_primary_store_exists(recipient, bridge.metadata);
+        dispatchable_fungible_asset::deposit(dest, assets);
 
         event::emit(Withdrawn {
-            claimant: claimant_addr,
+            recipient,
             amount,
             assertion: assertion_id,
-            withdrawal_id: id,
+            withdrawal_id: slot,
         });
     }
 
@@ -281,13 +287,19 @@ module sena::bridge {
     /// A fraud proof system a sequencer can neutralise by refusing service is
     /// not a security guarantee, so users need a path that does not depend on
     /// the sequencer's cooperation.
+    ///
+    /// The entry's id is derived from the submitter and the payload, never
+    /// chosen by the caller: a caller-chosen id could be taken first by
+    /// someone else, blocking the user's forced transaction.
     public entry fun force_include(
         submitter: &signer,
         bridge_addr: address,
-        entry_id: vector<u8>,
         payload: vector<u8>,
     ) acquires Bridge {
+        let entry_id = forced_entry_id(signer::address_of(submitter), payload);
         let bridge = borrow_global_mut<Bridge>(bridge_addr);
+        assert!(!table::contains(&bridge.forced, entry_id), E_ALREADY_SUBMITTED);
+        event::emit(ForcedSubmitted { submitter: signer::address_of(submitter), entry_id });
         table::add(&mut bridge.forced, entry_id, ForcedEntry {
             submitter: signer::address_of(submitter),
             payload,
@@ -296,8 +308,18 @@ module sena::bridge {
         });
     }
 
-    /// Marks a forced entry as included by the sequencer.
-    public fun mark_included(bridge_addr: address, entry_id: vector<u8>) acquires Bridge {
+    /// The id a forced entry is recorded under.
+    public fun forced_entry_id(submitter: address, payload: vector<u8>): vector<u8> {
+        let buf = codec::begin(DOMAIN_FORCED);
+        codec::put_field(&mut buf, bcs_address_bytes(submitter));
+        codec::put_field(&mut buf, payload);
+        codec::commit(buf)
+    }
+
+    /// Marks a forced entry as included. Only the bridge's own account may:
+    /// anyone else marking entries included would switch forced inclusion off.
+    public entry fun mark_included(operator: &signer, bridge_addr: address, entry_id: vector<u8>) acquires Bridge {
+        assert!(signer::address_of(operator) == bridge_addr, E_NOT_OPERATOR);
         let bridge = borrow_global_mut<Bridge>(bridge_addr);
         assert!(table::contains(&bridge.forced, entry_id), E_NO_SUCH_ENTRY);
         table::borrow_mut(&mut bridge.forced, entry_id).included = true;
@@ -320,6 +342,11 @@ module sena::bridge {
 
     #[view]
     /// Total assets held in custody. Must equal the sum of L2 liabilities.
+    public fun custody_store(bridge_addr: address): address acquires Bridge {
+        object::object_address(&borrow_global<Bridge>(bridge_addr).custody)
+    }
+
+    #[view]
     public fun custody_balance(bridge_addr: address): u64 acquires Bridge {
         fungible_asset::balance(borrow_global<Bridge>(bridge_addr).custody)
     }
@@ -336,14 +363,4 @@ module sena::bridge {
         assert!(FORCED_INCLUSION_TIMEOUT == 86400, 0);
     }
 
-    #[test]
-    fun withdrawal_ids_are_bound_to_what_they_pay() {
-        // The id must change with every field it commits to, or one proof pays
-        // twice.
-        let a = withdrawal_id(x"11", @0xA, 1);
-        assert!(a != withdrawal_id(x"22", @0xA, 1), 0); // different assertion
-        assert!(a != withdrawal_id(x"11", @0xB, 1), 1); // different account
-        assert!(a != withdrawal_id(x"11", @0xA, 2), 2); // different asset
-        assert!(a == withdrawal_id(x"11", @0xA, 1), 3); // deterministic
-    }
 }

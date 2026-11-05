@@ -290,17 +290,15 @@ cargo fmt --all -- --check
 ```
 
 The Move contracts need the [Aptos CLI](https://aptos.dev/tools/aptos-cli/),
-**version 7.9.0 specifically**:
+**version 9.6.0 specifically**:
 
 ```sh
 aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
 ```
 
-The version is pinned in both directions and it matters. Prebuilt releases from
-`7.14.2` onward abort with SIGILL on CPUs without AVX2 — every Intel
-Atom-lineage chip. And `Move.toml` pins the framework to the commit tagged
-`aptos-cli-v7.9.0`, because later framework revisions use Move 2 syntax that
-`7.9.0` cannot parse. See [`move/README.md`](move/README.md).
+The version is pinned, and `Move.toml` pins the framework to the commit tagged
+`aptos-cli-v9.6.0`, so compiler and framework come from one revision. The CLI
+needs a CPU with AVX2. See [`move/README.md`](move/README.md).
 
 ## Beta planning
 

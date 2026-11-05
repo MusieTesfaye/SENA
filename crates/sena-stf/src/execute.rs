@@ -34,6 +34,41 @@ pub const FEE_VAULT: L2Address = L2Address::from_bytes([0xFE; 32]);
 /// The chain id of [`BatchContext::without_keyless`], for tests and tools that
 /// run without a configured network.
 pub const TEST_CHAIN_ID: u64 = 0;
+/// The sender of every deposit transaction ([`Transaction::deposit`]).
+///
+/// Not an account anyone holds: 32 bytes of `0xD0` is not a point any signer
+/// controls, and deposit transactions carry no signature. Nothing is ever
+/// debited from it.
+pub const DEPOSIT_SENDER: L2Address = L2Address::from_bytes([0xD0; 32]);
+
+/// One entry of the L1 deposit log (`sena::deposits`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct DepositRecord {
+    /// The L2 account the depositor named.
+    pub recipient: L2Address,
+    /// The L2 asset id of the bridge that took custody.
+    pub asset: AssetId,
+    /// The amount taken into custody.
+    #[serde(with = "sena_primitives::serde_hex::u128_string")]
+    pub amount: u128,
+}
+
+/// Read access to the L1 deposit log, by deposit id.
+///
+/// Not L2 state: the log lives on Aptos, is append-only, and every party reads
+/// the same entries, so compiling against it is as deterministic as compiling
+/// against the batch header. The sequencer and watcher read it from L1;
+/// `sena::compiler` reads the same table directly.
+pub trait DepositLog: Sync + core::fmt::Debug {
+    /// Deposit `id`, or `None` if L1 has not recorded it.
+    fn deposit(&self, id: u64) -> Option<DepositRecord>;
+}
+
+impl DepositLog for std::collections::BTreeMap<u64, DepositRecord> {
+    fn deposit(&self, id: u64) -> Option<DepositRecord> {
+        self.get(&id).copied()
+    }
+}
 
 /// Why a single step failed.
 ///
@@ -128,6 +163,121 @@ pub enum StepError {
     /// The fee split in force is not the one declared, or there is none.
     #[error("the declared fee split is not the one in force")]
     FeeSplitMismatch,
+    /// The escrow is not open as the transaction describes it.
+    #[error("no open escrow matches")]
+    NoSuchEscrow,
+    /// A claim after the escrow expired, or a refund before it did.
+    #[error("the escrow is not releasable this way at this time")]
+    EscrowNotReleasable,
+    /// The issuer does not (or no longer) attest the identifier to this account.
+    #[error("the identifier is not attested to this account by this issuer")]
+    NotAttested,
+    /// A withdrawal record already exists in its slot.
+    #[error("the withdrawal is already recorded")]
+    WithdrawalExists,
+    /// A deposit was credited out of L1 order, or twice.
+    #[error("deposit {id} does not follow the last deposit credited, {last}")]
+    DepositOutOfOrder {
+        /// The deposit the instruction credits.
+        id: u64,
+        /// The last deposit already credited.
+        last: u64,
+    },
+}
+
+/// The escrow steps: open, check the claimant's attestation, release.
+fn escrow_transition(
+    instruction: &Instruction,
+    current: Option<&[u8]>,
+) -> Result<Vec<u8>, StepError> {
+    match instruction {
+        Instruction::CreateEscrow { record, .. } => {
+            if current.is_some() || record.released {
+                return Err(StepError::NoSuchEscrow);
+            }
+            Ok(record.encode())
+        }
+        Instruction::VerifyAttestation { account, .. } => {
+            let bytes = current.ok_or(StepError::NotAttested)?;
+            let standing = Attestation::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+            if standing.revoked || standing.account != *account {
+                return Err(StepError::NotAttested);
+            }
+            Ok(bytes.to_vec())
+        }
+        Instruction::ReleaseEscrow {
+            record,
+            now,
+            refund,
+            ..
+        } => {
+            let bytes = current.ok_or(StepError::NoSuchEscrow)?;
+            let standing =
+                crate::social::Escrow::decode(bytes).map_err(|_| StepError::MalformedSlot)?;
+            if standing.released || standing != *record {
+                return Err(StepError::NoSuchEscrow);
+            }
+            let expired = *now >= standing.expires_at;
+            if expired != *refund {
+                return Err(StepError::EscrowNotReleasable);
+            }
+            Ok(crate::social::Escrow {
+                released: true,
+                ..standing
+            }
+            .encode())
+        }
+        _ => unreachable!("only escrow steps are routed here"),
+    }
+}
+
+/// Encodes a withdrawal record: the L1 recipient, the asset, the amount.
+#[must_use]
+pub fn encode_withdrawal(to: &[u8; 32], asset: AssetId, amount: u128) -> Vec<u8> {
+    let mut out = to.to_vec();
+    out.extend_from_slice(&asset.get().to_be_bytes());
+    out.extend_from_slice(&amount.to_be_bytes());
+    out
+}
+
+/// Decodes a withdrawal record.
+///
+/// # Errors
+///
+/// Returns [`StepError::MalformedSlot`] unless it is exactly 52 bytes.
+pub fn decode_withdrawal(bytes: &[u8]) -> Result<([u8; 32], AssetId, u128), StepError> {
+    let (to, rest) = bytes
+        .split_first_chunk::<32>()
+        .ok_or(StepError::MalformedSlot)?;
+    let (asset, rest) = rest
+        .split_first_chunk::<4>()
+        .ok_or(StepError::MalformedSlot)?;
+    let amount: [u8; 16] = rest.try_into().map_err(|_| StepError::MalformedSlot)?;
+    Ok((
+        *to,
+        AssetId(u32::from_be_bytes(*asset)),
+        u128::from_be_bytes(amount),
+    ))
+}
+
+/// Encodes the deposit cursor: the id of the last deposit credited.
+#[must_use]
+pub fn encode_deposit_cursor(last: u64) -> Vec<u8> {
+    last.to_be_bytes().to_vec()
+}
+
+/// Decodes the deposit cursor; an absent slot means no deposit yet.
+///
+/// # Errors
+///
+/// Returns [`StepError::MalformedSlot`] unless the slot is exactly eight bytes.
+pub fn decode_deposit_cursor(bytes: Option<&[u8]>) -> Result<u64, StepError> {
+    match bytes {
+        None => Ok(0),
+        Some(b) => Ok(u64::from_be_bytes(
+            b.try_into().map_err(|_| StepError::MalformedSlot)?,
+        )),
+    }
 }
 
 /// Encodes a JWK acceptance record: one byte, `1` accepted, `0` retired.
@@ -239,6 +389,24 @@ pub fn transition(instruction: &Instruction, current: Option<&[u8]>) -> Result<V
             Ok(bytes.to_vec())
         }
         Instruction::SetJwk { active, .. } => Ok(encode_jwk_record(*active)),
+        Instruction::CreateEscrow { .. }
+        | Instruction::VerifyAttestation { .. }
+        | Instruction::ReleaseEscrow { .. } => escrow_transition(instruction, current),
+        Instruction::RecordWithdrawal {
+            to, asset, amount, ..
+        } => {
+            if current.is_some() {
+                return Err(StepError::WithdrawalExists);
+            }
+            Ok(encode_withdrawal(to, *asset, *amount))
+        }
+        Instruction::ConsumeDeposit { id } => {
+            let last = decode_deposit_cursor(current)?;
+            if last.checked_add(1) != Some(*id) {
+                return Err(StepError::DepositOutOfOrder { id: *id, last });
+            }
+            Ok(encode_deposit_cursor(*id))
+        }
     }
 }
 
@@ -523,6 +691,56 @@ pub enum CompileError {
     /// issuer.
     #[error("an attestation is submitted by the attested account or by its issuer")]
     AttestationWithoutConsent,
+    /// A deposit transaction is not the canonical one for its payload, credits
+    /// nothing, or is not in the L1 deposit log as it claims.
+    #[error("deposit {0} is not recorded on L1 as claimed")]
+    UnknownDeposit(u64),
+    /// An escrow of nothing, or one already expired when it opens.
+    #[error("an escrow must hold a positive amount and expire after the batch")]
+    BadEscrow,
+    /// A withdrawal of nothing.
+    #[error("a withdrawal must move a positive amount")]
+    BadWithdrawal,
+    /// A deposit payload outside a deposit transaction.
+    #[error("only a deposit transaction may carry a deposit payload")]
+    NotADepositTransaction,
+}
+
+/// The instructions crediting a deposit, if `transaction` is the canonical
+/// deposit transaction for a deposit the log holds exactly as it claims.
+fn compile_deposit(
+    transaction: &Transaction,
+    ctx: &BatchContext<'_>,
+) -> Result<Vec<Instruction>, CompileError> {
+    let Payload::Deposit {
+        id,
+        recipient,
+        asset,
+        amount,
+    } = transaction.payload
+    else {
+        return Err(CompileError::NotADepositTransaction);
+    };
+    let recorded = ctx.deposits.and_then(|log| log.deposit(id));
+    let claimed = DepositRecord {
+        recipient,
+        asset,
+        amount,
+    };
+    if *transaction != Transaction::deposit(ctx.chain_id, id, recipient, asset, amount)
+        || amount == 0
+        || recorded != Some(claimed)
+    {
+        return Err(CompileError::UnknownDeposit(id));
+    }
+    Ok(vec![
+        Instruction::ConsumeDeposit { id },
+        Instruction::Credit {
+            account: recipient,
+            asset,
+            amount,
+        },
+    ])
 }
 
 /// What a batch is executed against, besides state.
@@ -547,6 +765,9 @@ pub struct BatchContext<'a> {
     /// This chain's id ([`sena_primitives::chain_id`] of its name). Fixed at
     /// genesis, and on L1 when the contracts are initialised.
     pub chain_id: u64,
+    /// The L1 deposit log deposit transactions are checked against, or `None`
+    /// where no deposit can compile (a wallet quoting a fee, a test).
+    pub deposits: Option<&'a dyn DepositLog>,
 }
 
 impl BatchContext<'_> {
@@ -560,6 +781,7 @@ impl BatchContext<'_> {
             base_fee: gas::DEFAULT_BASE_FEE_FLOOR,
             fee_recipient: FEE_VAULT,
             chain_id: TEST_CHAIN_ID,
+            deposits: None,
         }
     }
 
@@ -618,6 +840,12 @@ pub fn compile(
             chain: ctx.chain_id,
         });
     }
+    // A deposit is valid by the L1 log, not by a signature, and pays no fee.
+    if matches!(transaction.payload, Payload::Deposit { .. })
+        || transaction.sender == DEPOSIT_SENDER
+    {
+        return compile_deposit(transaction, ctx);
+    }
     transaction.authenticate(&ctx.keyless_context())?;
 
     let sender = transaction.sender;
@@ -649,14 +877,22 @@ pub fn compile(
             base_fee: ctx.base_fee,
             gas: charge.gas_used,
         },
-        // Celo's debitGasFees: the whole limit, before the payload runs.
-        Instruction::Debit {
-            account: sender,
-            asset,
-            amount: charge.hold,
-        },
     ]);
-    instructions.extend(payload);
+    let hold = Instruction::Debit {
+        account: sender,
+        asset,
+        amount: charge.hold,
+    };
+    // Celo's debitGasFees: the whole limit, before the payload runs -- except
+    // a claim, which may be a new account's first transaction, with nothing
+    // to pay from but the escrow it claims; it pays from that, after.
+    if matches!(transaction.payload, Payload::EscrowClaim { .. }) {
+        instructions.extend(payload);
+        instructions.push(hold);
+    } else {
+        instructions.push(hold);
+        instructions.extend(payload);
+    }
     // Celo's creditGasFees, which never credits a zero amount.
     for (account, amount) in [
         (sender, charge.refund),
@@ -681,12 +917,8 @@ pub fn compile(
 /// Returns [`CompileError`] if the payload does not compile.
 pub fn gas_required(transaction: &Transaction) -> Result<u64, CompileError> {
     let mut payload = Vec::new();
-    compile_payload(
-        &transaction.payload,
-        transaction.sender,
-        transaction.chain_id,
-        &mut payload,
-    )?;
+    // Gas does not depend on the batch time, so a quote needs none.
+    compile_payload(transaction, None, &mut payload)?;
     Ok(gas::gas_used(transaction, &payload)?)
 }
 
@@ -709,12 +941,7 @@ fn charge_and_payload(
     ctx: &BatchContext<'_>,
 ) -> Result<(gas::FeeCharge, Vec<Instruction>), CompileError> {
     let mut payload = Vec::new();
-    compile_payload(
-        &transaction.payload,
-        transaction.sender,
-        transaction.chain_id,
-        &mut payload,
-    )?;
+    compile_payload(transaction, Some(ctx.timestamp), &mut payload)?;
     let charge = gas::settle(
         transaction.gas_limit,
         gas::gas_used(transaction, &payload)?,
@@ -729,12 +956,13 @@ fn charge_and_payload(
 /// Appends the instructions a payload compiles to, between holding the fee and
 /// settling it.
 fn compile_payload(
-    payload: &Payload,
-    sender: L2Address,
-    chain_id: u64,
+    transaction: &Transaction,
+    now: Option<u64>,
     instructions: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
-    match payload {
+    let sender = transaction.sender;
+    let chain_id = transaction.chain_id;
+    match &transaction.payload {
         Payload::Transfer { to, asset, amount } => {
             if *to == sender {
                 return Err(CompileError::SelfTransfer);
@@ -793,34 +1021,7 @@ fn compile_payload(
                 signatures: signatures.clone(),
                 guardian: update.guardian_may_apply(),
             });
-            instructions.push(match update {
-                GovernanceUpdate::SetGasAsset { record } => Instruction::SetGasAsset {
-                    record: record.clone(),
-                },
-                GovernanceUpdate::SetParameter { name, value } => Instruction::SetParameter {
-                    name: name.clone(),
-                    value: *value,
-                },
-                GovernanceUpdate::SetJwk {
-                    iss_hash,
-                    jwk_hash,
-                    active,
-                } => Instruction::SetJwk {
-                    iss_hash: *iss_hash,
-                    jwk_hash: *jwk_hash,
-                    active: *active,
-                },
-                GovernanceUpdate::SetFeeMarket { floor, target } => Instruction::SetFeeMarket {
-                    floor: *floor,
-                    target: *target,
-                },
-                GovernanceUpdate::SetFeeSplit { split } => Instruction::SetFeeSplit {
-                    split: split.clone(),
-                },
-                GovernanceUpdate::DisableGasAsset { asset } => {
-                    Instruction::DisableGasAsset { asset: *asset }
-                }
-            });
+            instructions.push(governance_instruction(update));
         }
         Payload::DistributeFees {
             asset,
@@ -832,8 +1033,164 @@ fn compile_payload(
             }
             compile_distribution(*asset, *amount, split, instructions)?;
         }
+        Payload::Deposit { .. } => return Err(CompileError::NotADepositTransaction),
+        Payload::Withdraw { to, asset, amount } => {
+            compile_withdrawal(
+                sender,
+                transaction.nonce,
+                *to,
+                *asset,
+                *amount,
+                instructions,
+            )?;
+        }
+        Payload::EscrowSend { .. } | Payload::EscrowClaim { .. } | Payload::EscrowRefund { .. } => {
+            compile_escrow(transaction, now, instructions)?;
+        }
     }
 
+    Ok(())
+}
+
+/// The instruction that applies a council-approved update.
+fn governance_instruction(update: &GovernanceUpdate) -> Instruction {
+    match update {
+        GovernanceUpdate::SetGasAsset { record } => Instruction::SetGasAsset {
+            record: record.clone(),
+        },
+        GovernanceUpdate::SetParameter { name, value } => Instruction::SetParameter {
+            name: name.clone(),
+            value: *value,
+        },
+        GovernanceUpdate::SetJwk {
+            iss_hash,
+            jwk_hash,
+            active,
+        } => Instruction::SetJwk {
+            iss_hash: *iss_hash,
+            jwk_hash: *jwk_hash,
+            active: *active,
+        },
+        GovernanceUpdate::SetFeeMarket { floor, target } => Instruction::SetFeeMarket {
+            floor: *floor,
+            target: *target,
+        },
+        GovernanceUpdate::SetFeeSplit { split } => Instruction::SetFeeSplit {
+            split: split.clone(),
+        },
+        GovernanceUpdate::DisableGasAsset { asset } => {
+            Instruction::DisableGasAsset { asset: *asset }
+        }
+    }
+}
+
+/// An escrow payload's instructions (Celo's `Escrow`), at batch time `now`
+/// (`None` when only quoting gas, which does not depend on it).
+///
+/// - send: debit the sender and open the escrow in this transaction's slot;
+/// - claim: the named issuer must attest the identifier to the claimant, the
+///   escrow must be open as described and unexpired; then credit the claimant;
+/// - refund: the escrow must be the sender's own, open and expired; then
+///   credit the sender.
+fn compile_escrow(
+    transaction: &Transaction,
+    now: Option<u64>,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    let sender = transaction.sender;
+    match &transaction.payload {
+        Payload::EscrowSend {
+            identifier,
+            issuer,
+            asset,
+            amount,
+            expires_at,
+        } => {
+            if *amount == 0 || now.is_some_and(|t| *expires_at <= t) {
+                return Err(CompileError::BadEscrow);
+            }
+            instructions.push(Instruction::Debit {
+                account: sender,
+                asset: *asset,
+                amount: *amount,
+            });
+            instructions.push(Instruction::CreateEscrow {
+                sender,
+                nonce: transaction.nonce,
+                record: crate::social::Escrow {
+                    identifier: *identifier,
+                    issuer: *issuer,
+                    asset: *asset,
+                    amount: *amount,
+                    expires_at: *expires_at,
+                    released: false,
+                },
+            });
+        }
+        Payload::EscrowClaim {
+            sender: from,
+            nonce,
+            record,
+        }
+        | Payload::EscrowRefund {
+            sender: from,
+            nonce,
+            record,
+        } => {
+            let refund = matches!(transaction.payload, Payload::EscrowRefund { .. });
+            if record.released || record.amount == 0 || (refund && *from != sender) {
+                return Err(CompileError::BadEscrow);
+            }
+            if !refund {
+                instructions.push(Instruction::VerifyAttestation {
+                    identifier: record.identifier,
+                    issuer: record.issuer,
+                    account: sender,
+                });
+            }
+            instructions.push(Instruction::ReleaseEscrow {
+                sender: *from,
+                nonce: *nonce,
+                record: *record,
+                now: now.unwrap_or(0),
+                refund,
+            });
+            instructions.push(Instruction::Credit {
+                account: sender,
+                asset: record.asset,
+                amount: record.amount,
+            });
+        }
+        _ => return Err(CompileError::BadEscrow),
+    }
+    Ok(())
+}
+
+/// A withdrawal: burned on the L2 here, and recorded for
+/// `sena::bridge::claim` to pay on L1 once the block finalizes.
+fn compile_withdrawal(
+    sender: L2Address,
+    nonce: u64,
+    to: [u8; 32],
+    asset: AssetId,
+    amount: u128,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    if amount == 0 {
+        return Err(CompileError::BadWithdrawal);
+    }
+    instructions.push(Instruction::Debit {
+        account: sender,
+        asset,
+        amount,
+    });
+    instructions.push(Instruction::RecordWithdrawal {
+        account: sender,
+        nonce,
+        to,
+        asset,
+        amount,
+    });
     Ok(())
 }
 

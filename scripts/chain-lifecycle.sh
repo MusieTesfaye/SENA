@@ -10,8 +10,7 @@
 # Usage:
 #   scripts/chain-lifecycle.sh [devnet|testnet|local]
 #
-# Requires the Aptos CLI 7.9.0 (later releases abort on CPUs without AVX2; see
-# move/README.md).
+# Requires the Aptos CLI 9.6.0, matching the framework pin (see move/README.md).
 
 set -uo pipefail
 
@@ -148,7 +147,7 @@ fi
 step "2. Publish the package"
 # The package is over the 64 KiB transaction limit, so it goes up in chunks,
 # through the framework's `large_packages` module. That now lives at 0x7 on
-# every network; CLI 7.9.0 still defaults to its old testnet address, where
+# every network; older CLIs (7.9.0) default to its old testnet address, where
 # staging fails with LINKER_ERROR.
 publish_out=$(aptos move publish --package-dir move/sena --named-addresses "sena=$ADDR" \
   --chunked-publish --large-packages-module-address 0x7 --profile "$PROFILE" "${PUBLISH_GAS_ARGS[@]}" 2>&1)

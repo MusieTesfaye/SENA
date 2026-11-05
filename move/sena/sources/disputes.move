@@ -57,6 +57,11 @@ module sena::disputes {
     /// The leaf is a keyless transaction whose verdict has not been computed;
     /// run `keyless_jobs::start`, `advance` and `finish` for it first.
     const E_KEYLESS_NOT_VERIFIED: u64 = 65;
+    /// The registry is not the chain's own: it must live at the chain's
+    /// address, created by the chain's account.
+    const E_UNBOUND_REGISTRY: u64 = 66;
+    /// The challenge still has a live game, or has not waited long enough.
+    const E_CHALLENGE_NOT_STALE: u64 = 67;
 
     const PARTY_DEFENDER: u8 = 0;
     const PARTY_CHALLENGER: u8 = 1;
@@ -120,7 +125,12 @@ module sena::disputes {
     /// (`keyless.setup`), and `chain_id` the same chain (the node reports it
     /// as `transaction_chain_id`), or L1 would judge honest transactions
     /// invalid.
+    ///
+    /// Only the chain's own account may create it, at the chain's address.
+    /// A registry anyone could create for any chain, with their own chain id
+    /// or keyless setup, would let them reject honest assertions.
     public entry fun initialize(admin: &signer, chain: address, keyless_setup: u8, chain_id: u64) {
+        assert!(signer::address_of(admin) == chain, E_UNBOUND_REGISTRY);
         assert!(!exists<Registry>(signer::address_of(admin)), E_ALREADY_INITIALIZED);
         keyless::assert_known_setup(keyless_setup);
         keyless_jobs::create(admin);
@@ -178,7 +188,7 @@ module sena::disputes {
         assertion: vector<u8>,
     ) acquires Registry {
         let who = signer::address_of(challenger);
-        let chain_addr = borrow_global<Registry>(registry_addr).chain;
+        let chain_addr = bound_chain(registry_addr);
         let (proposer, pre_root, post_root, _, _, _, trace_length, status) =
             assertions::dispute_view(chain_addr, assertion);
         assert!(status == assertions::status_challenged(), E_NOT_CHALLENGED);
@@ -194,7 +204,14 @@ module sena::disputes {
         let turn = if (trace_length == 1) { PARTY_CHALLENGER } else { PARTY_DEFENDER };
 
         let registry = borrow_global_mut<Registry>(registry_addr);
-        table::add(&mut registry.disputes, dispute_id(assertion, who), Dispute {
+        // A challenger who lost a game may challenge again with a new bond;
+        // the finished game must not block the new one.
+        let id = dispute_id(assertion, who);
+        if (table::contains(&registry.disputes, id)) {
+            assert!(table::borrow(&registry.disputes, id).stage == STAGE_RESOLVED, E_RESOLVED);
+            table::remove(&mut registry.disputes, id);
+        };
+        table::add(&mut registry.disputes, id, Dispute {
             assertion,
             defender: proposer,
             challenger: who,
@@ -269,6 +286,12 @@ module sena::disputes {
             // The challenger produces the One-Step Proof, so the turn is theirs
             // regardless of who moved last.
             d.turn = PARTY_CHALLENGER;
+            // And so is the deadline. Keeping the one `pass_turn` set from the
+            // defender's clock would let a defender who drained its own clock
+            // leave the challenger no time at all.
+            let budget = d.challenger_clock;
+            let allowance = if (MOVE_TIMEOUT < budget) { MOVE_TIMEOUT } else { budget };
+            d.deadline = d.last_move_at + allowance;
         };
     }
 
@@ -431,14 +454,14 @@ module sena::disputes {
         let (base_fee, fee_recipient) = assertions::fee_header(chain_addr, assertion);
         let chain_id = borrow_global<Registry>(registry_addr).chain_id;
         if (!compiler::is_keyless(tx_bytes)) {
-            return compiler::compile(tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id)
+            return compiler::compile(tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id, chain_addr)
         };
         let (done, verdict) = keyless_jobs::verdict(
             registry_addr, keyless_jobs::job_id(tx_bytes, batch_time, keyless_setup)
         );
         assert!(done, E_KEYLESS_NOT_VERIFIED);
         compiler::compile_with_keyless_verdict(
-            tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id, verdict
+            tx_bytes, batch_time, base_fee, fee_recipient, keyless_setup, chain_id, verdict, chain_addr
         )
     }
 
@@ -471,7 +494,16 @@ module sena::disputes {
         (ok, vector::length(&program))
     }
 
-    fun apply_structural_win(registry_addr: address, chain_addr: address, assertion: vector<u8>, who: address) {
+    /// The chain a registry adjudicates, refusing any registry that is not
+    /// the chain's own. Every path that applies an outcome goes through here.
+    fun bound_chain(registry_addr: address): address acquires Registry {
+        let chain = borrow_global<Registry>(registry_addr).chain;
+        assert!(chain == registry_addr, E_UNBOUND_REGISTRY);
+        chain
+    }
+
+    fun apply_structural_win(registry_addr: address, chain_addr: address, assertion: vector<u8>, who: address) acquires Registry {
+        assert!(chain_addr == bound_chain(registry_addr), E_UNBOUND_REGISTRY);
         assert!(assertions::has_open_challenge(chain_addr, assertion, who), E_NOT_CHALLENGING);
         assertions::challenger_won(chain_addr, assertion, who);
         // A bisection game the same challenger had open is now moot.
@@ -584,6 +616,7 @@ module sena::disputes {
             (registry.chain, d.assertion, d.challenger)
         };
 
+        assert!(chain == registry_addr, E_UNBOUND_REGISTRY);
         let (_, _, _, _, _, _, _, status) = assertions::dispute_view(chain, assertion);
         if (status == assertions::status_rejected()) { return };
 
@@ -614,6 +647,30 @@ module sena::disputes {
             if (d.turn == PARTY_DEFENDER) { PARTY_CHALLENGER } else { PARTY_DEFENDER }
         };
         resolve_internal(registry_addr, id, winner);
+    }
+
+    /// Dismisses a challenge that has had no live game for `MOVE_TIMEOUT`.
+    ///
+    /// Only the challenger can open a game, so without this a challenger who
+    /// never opens one -- or who lost a game and challenged again -- would
+    /// freeze the assertion and everything after it. The challenger forfeits
+    /// the bond as for any lost dispute. Permissionless, like `claim_timeout`.
+    public entry fun dismiss_stale_challenge(
+        _caller: &signer,
+        registry_addr: address,
+        assertion: vector<u8>,
+        challenger: address,
+    ) acquires Registry {
+        let chain = bound_chain(registry_addr);
+        assert!(assertions::has_open_challenge(chain, assertion, challenger), E_NOT_CHALLENGING);
+        let id = dispute_id(assertion, challenger);
+        let registry = borrow_global<Registry>(registry_addr);
+        if (table::contains(&registry.disputes, id)) {
+            assert!(table::borrow(&registry.disputes, id).stage == STAGE_RESOLVED, E_CHALLENGE_NOT_STALE);
+        };
+        let opened = assertions::challenge_opened_at(chain, assertion, challenger);
+        assert!(timestamp::now_seconds() > opened + MOVE_TIMEOUT, E_CHALLENGE_NOT_STALE);
+        assertions::defender_won(chain, assertion, challenger);
     }
 
     #[view]

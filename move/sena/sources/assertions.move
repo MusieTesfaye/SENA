@@ -7,7 +7,8 @@
 ///
 /// There is no entry point to finalize a challenged assertion, dismiss a
 /// challenge, or set the window below its floor -- not a guarded one, an absent
-/// one. REQ-FRAUD-015 and REQ-GOV-007 survive a compromised governance council
+/// one. (A challenge left without a game is dismissed only through
+/// `sena::disputes`, as an adjudicated timeout.) REQ-FRAUD-015 and REQ-GOV-007 survive a compromised governance council
 /// only if the capability does not exist to be abused.
 module sena::assertions {
     // Dispute outcomes may only be applied by the dispute module. Without this
@@ -16,6 +17,7 @@ module sena::assertions {
     // to stop.
     friend sena::disputes;
 
+    use std::bcs;
     use std::signer;
     use std::vector;
     use aptos_std::table::{Self, Table};
@@ -59,6 +61,16 @@ module sena::assertions {
     const E_TIMESTAMP_REGRESSES: u64 = 64;
     /// The batch timestamp is ahead of L1 time.
     const E_TIMESTAMP_IN_FUTURE: u64 = 65;
+    /// The signer is not permitted to post assertions on this chain.
+    const E_NOT_PERMITTED_PROPOSER: u64 = 68;
+    /// The assertion does not extend the latest finalized assertion: a
+    /// sibling already finalized, so this branch can never be canonical.
+    const E_NOT_CANONICAL: u64 = 69;
+
+    /// Where escrow and custody objects are sent so no key owns them. Nobody
+    /// holds this address's key; the module still pays out through its
+    /// `ExtendRef`, which works whoever owns the object.
+    const BURN_ADDRESS: address = @0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
     /// The batch is older than the chain allows a batch to be when posted.
     const E_BATCH_TOO_OLD: u64 = 66;
     /// The batch data is malformed: mismatched lengths, start positions that
@@ -135,6 +147,19 @@ module sena::assertions {
         posted_at: u64,
         status: u8,
         open_challenges: u64,
+    }
+
+    /// Who may post assertions. Kept at the escrow object's address (which
+    /// the module can sign for) so adding it needs no change to `Chain`.
+    /// Absent: only the chain's admin may post.
+    struct Proposers has key {
+        list: vector<address>,
+    }
+
+    /// When each challenge was opened, keyed by assertion id ++ challenger,
+    /// so a challenge left without a game can be timed out.
+    struct ChallengeTimes has key {
+        at: Table<vector<u8>, u64>,
     }
 
     struct Chain has key {
@@ -240,7 +265,11 @@ module sena::assertions {
 
         // Escrow lives in its own object rather than the admin's primary store,
         // so the admin's own holdings can never be spent as somebody's bond.
-        let constructor = object::create_object(signer::address_of(admin));
+        // Owned by no one from the start: an owner could otherwise withdraw
+        // every bond through the framework's own transfer functions. (Created
+        // owned rather than transferred after, so it works for assets whose
+        // stores cannot be transferred.)
+        let constructor = object::create_object(BURN_ADDRESS);
         let escrow_extend = object::generate_extend_ref(&constructor);
         let escrow = fungible_asset::create_store(&constructor, bond_metadata);
 
@@ -258,6 +287,69 @@ module sena::assertions {
             treasury,
             max_batch_age,
         });
+    }
+
+    /// Hands an object to no one: transfers off, owner the burn address.
+    /// (Initialisation now creates its objects owned by the burn address;
+    /// this stays for package compatibility. It fails for objects whose
+    /// stores are untransferable.)
+    public fun disown(constructor: &object::ConstructorRef) {
+        let transfer = object::generate_transfer_ref(constructor);
+        object::disable_ungated_transfer(&transfer);
+        object::transfer_with_ref(object::generate_linear_transfer_ref(&transfer), BURN_ADDRESS);
+    }
+
+    public fun burn_address(): address { BURN_ADDRESS }
+
+    fun escrow_addr(chain: &Chain): address { object::object_address(&chain.escrow) }
+
+    /// Sets who may post assertions. Only the chain's admin may.
+    ///
+    /// Posting is not permissionless: an assertion from anyone could fork the
+    /// chain or take over the operator's next id, and the honest verifier
+    /// follows a single lineage.
+    public entry fun set_proposers(admin: &signer, chain_addr: address, list: vector<address>) acquires Chain, Proposers {
+        let chain = borrow_global<Chain>(chain_addr);
+        assert!(signer::address_of(admin) == chain.admin, E_NOT_ADMIN);
+        let at = escrow_addr(chain);
+        if (exists<Proposers>(at)) {
+            borrow_global_mut<Proposers>(at).list = list;
+        } else {
+            move_to(&object::generate_signer_for_extending(&chain.escrow_extend), Proposers { list });
+        }
+    }
+
+    fun may_propose(chain: &Chain, who: address): bool acquires Proposers {
+        let at = escrow_addr(chain);
+        if (exists<Proposers>(at)) {
+            vector::contains(&borrow_global<Proposers>(at).list, &who)
+        } else {
+            who == chain.admin
+        }
+    }
+
+    #[view]
+    /// Who may post assertions (the admin alone when no list was set).
+    public fun proposers(chain_addr: address): vector<address> acquires Chain, Proposers {
+        let chain = borrow_global<Chain>(chain_addr);
+        let at = escrow_addr(chain);
+        if (exists<Proposers>(at)) { borrow_global<Proposers>(at).list } else { vector::singleton(chain.admin) }
+    }
+
+    fun challenge_key(id: vector<u8>, who: address): vector<u8> {
+        let k = id;
+        vector::append(&mut k, bcs::to_bytes(&who));
+        k
+    }
+
+    #[view]
+    /// When `who`'s challenge on `id` was opened; 0 if not recorded.
+    public fun challenge_opened_at(chain_addr: address, id: vector<u8>, who: address): u64 acquires Chain, ChallengeTimes {
+        let at = escrow_addr(borrow_global<Chain>(chain_addr));
+        if (!exists<ChallengeTimes>(at)) { return 0 };
+        let times = &borrow_global<ChallengeTimes>(at).at;
+        let k = challenge_key(id, who);
+        if (table::contains(times, k)) { *table::borrow(times, k) } else { 0 }
     }
 
     /// Moves a bond from `payer` into escrow.
@@ -311,12 +403,13 @@ module sena::assertions {
         tx_starts: vector<u64>,
         trace_length: u64,
         bond: u128,
-    ) acquires Chain {
+    ) acquires Chain, Proposers {
         let tx_count = vector::length(&tx_bytes);
         assert!(vector::length(&fee_recipient) == 32, E_BAD_BATCH_DATA);
         check_batch_shape(&tx_starts, tx_count, trace_length, &pre_state_root, &post_state_root);
         let proposer_addr = signer::address_of(proposer);
         let chain = borrow_global_mut<Chain>(chain_addr);
+        assert!(may_propose(chain, proposer_addr), E_NOT_PERMITTED_PROPOSER);
         assert!(table::contains(&chain.assertions, parent), E_UNKNOWN_PARENT);
 
         let parent_record = table::borrow(&chain.assertions, parent);
@@ -408,7 +501,7 @@ module sena::assertions {
         chain_addr: address,
         id: vector<u8>,
         bond: u128,
-    ) acquires Chain {
+    ) acquires Chain, ChallengeTimes {
         let who = signer::address_of(challenger);
         let chain = borrow_global_mut<Chain>(chain_addr);
         assert!(table::contains(&chain.assertions, id), E_UNKNOWN_ASSERTION);
@@ -445,6 +538,13 @@ module sena::assertions {
             table::borrow_mut(&mut chain.challenges, id),
             Challenge { challenger: who, bond },
         );
+
+        let at = escrow_addr(chain);
+        if (!exists<ChallengeTimes>(at)) {
+            move_to(&object::generate_signer_for_extending(&chain.escrow_extend),
+                ChallengeTimes { at: table::new<vector<u8>, u64>() });
+        };
+        table::upsert(&mut borrow_global_mut<ChallengeTimes>(at).at, challenge_key(id, who), timestamp::now_seconds());
     }
 
     /// Removes a challenge, returning the bond it carried.
@@ -580,6 +680,10 @@ module sena::assertions {
             table::borrow(&chain.assertions, parent).status == STATUS_FINALIZED,
             E_PARENT_NOT_FINAL
         );
+        // One lineage finalizes. Without this a second child of a finalized
+        // parent could finalize too, and the bridge would pay withdrawals
+        // from both branches.
+        assert!(parent == chain.latest_finalized, E_NOT_CANONICAL);
 
         let elapsed = timestamp::now_seconds() - posted_at;
         assert!(elapsed >= chain.challenge_window, E_WINDOW_OPEN);
@@ -717,5 +821,11 @@ module sena::assertions {
     /// and challenge bonds; a divergence means value leaked.
     public fun escrow_balance(chain_addr: address): u64 acquires Chain {
         fungible_asset::balance(borrow_global<Chain>(chain_addr).escrow)
+    }
+
+    #[view]
+    /// The bond escrow's store address, to check who owns it.
+    public fun escrow_store(chain_addr: address): address acquires Chain {
+        escrow_addr(borrow_global<Chain>(chain_addr))
     }
 }

@@ -64,9 +64,17 @@ pub struct VerifierNode {
     keyless: Option<Arc<KeylessConfig>>,
     /// The chain id transactions must carry; the verifier's own, from genesis.
     chain_id: u64,
+    /// The L1 deposit log as this verifier has read it. Blocks crediting a
+    /// deposit it has not read do not execute.
+    deposits: std::collections::BTreeMap<u64, sena_stf::DepositRecord>,
 }
 
 impl VerifierNode {
+    /// Records L1 deposit `id` as read from L1.
+    pub fn record_deposit(&mut self, id: u64, record: sena_stf::DepositRecord) {
+        self.deposits.insert(id, record);
+    }
+
     /// Creates a verifier starting from `genesis_state`, with the network's
     /// keyless parameters (`None` if the network has keyless disabled).
     #[must_use]
@@ -81,6 +89,7 @@ impl VerifierNode {
             last_trace: None,
             keyless,
             chain_id: sena_stf::TEST_CHAIN_ID,
+            deposits: std::collections::BTreeMap::new(),
         }
     }
 
@@ -100,7 +109,7 @@ impl VerifierNode {
         let pre_state = self.state.clone();
         let mut next = self.state.clone();
 
-        let ctx = block.context(self.keyless.as_deref(), self.chain_id);
+        let ctx = block.context(self.keyless.as_deref(), self.chain_id, Some(&self.deposits));
         let trace = match execute_batch(&mut next, &ctx, &block.transactions) {
             Ok(trace) => trace,
             Err(BatchError::Compile { index, source }) => {

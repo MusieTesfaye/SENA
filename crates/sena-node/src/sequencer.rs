@@ -6,10 +6,11 @@ use std::sync::Arc;
 use sena_primitives::{AssetId, Hash256, L2Address};
 use sena_state::MerkleTrie;
 use sena_stf::batch::{self, BatchTree};
+use sena_stf::execute::decode_deposit_cursor;
 use sena_stf::gas::{DEFAULT_BASE_FEE_FLOOR, DEFAULT_GAS_TARGET};
 use sena_stf::{
-    execute_batch, keys, BatchContext, BatchError, ExecutionTrace, FeeMarket, KeylessConfig,
-    Transaction, FEE_VAULT,
+    execute_batch, keys, BatchContext, BatchError, DepositLog, DepositRecord, ExecutionTrace,
+    FeeMarket, KeylessConfig, Payload, Transaction, DEPOSIT_SENDER, FEE_VAULT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,48 @@ pub const ADMISSION_EXPIRY_MARGIN_SECS: u64 = 60;
 /// can never be asserted, so blocks are cut to fit, with room left for the
 /// post's other arguments and per-element encoding overhead.
 pub const MAX_BATCH_BYTES: usize = 48 * 1024;
+
+/// The most L1 deposits one batch credits. The rest wait for the next batch.
+pub const MAX_DEPOSITS_PER_BATCH: usize = 64;
+
+/// Why an L1 deposit could not be recorded.
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum DepositLogError {
+    /// Deposit ids count from one.
+    #[error("deposit ids count from one")]
+    ZeroId,
+    /// A different record was already learned for this id. L1's log is
+    /// append-only, so this means one of the two readings of it is wrong.
+    #[error("deposit {0} was already recorded differently")]
+    Conflict(u64),
+}
+
+/// The L1 deposits a block's own deposit transactions claim.
+///
+/// Only for re-executing blocks this node produced and checked against L1
+/// when it produced them; a verifier must read the log from L1 instead.
+#[must_use]
+pub fn deposits_claimed_by(transactions: &[Transaction]) -> BTreeMap<u64, DepositRecord> {
+    transactions
+        .iter()
+        .filter_map(|tx| match tx.payload {
+            Payload::Deposit {
+                id,
+                recipient,
+                asset,
+                amount,
+            } => Some((
+                id,
+                DepositRecord {
+                    recipient,
+                    asset,
+                    amount,
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Seconds since the Unix epoch, from the system clock.
 ///
@@ -98,6 +141,7 @@ impl Block {
         &self,
         keyless: Option<&'a KeylessConfig>,
         chain_id: u64,
+        deposits: Option<&'a dyn DepositLog>,
     ) -> BatchContext<'a> {
         BatchContext {
             timestamp: self.timestamp,
@@ -105,6 +149,7 @@ impl Block {
             base_fee: self.base_fee,
             fee_recipient: self.fee_recipient,
             chain_id,
+            deposits,
         }
     }
 }
@@ -184,6 +229,8 @@ pub struct Sequencer {
     chain_id: u64,
     /// The salt identifiers are hashed under, reported to wallets.
     network_salt: Vec<u8>,
+    /// The L1 deposit log as far as this node has read it, by deposit id.
+    deposit_log: BTreeMap<u64, DepositRecord>,
 }
 
 impl Sequencer {
@@ -216,6 +263,7 @@ impl Sequencer {
             fee_assets: Vec::new(),
             chain_id: sena_stf::TEST_CHAIN_ID,
             network_salt: Vec::new(),
+            deposit_log: BTreeMap::new(),
         }
     }
 
@@ -243,6 +291,70 @@ impl Sequencer {
     #[must_use]
     pub const fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// Records L1 deposit `id`, read from `sena::deposits`, for crediting in
+    /// a later block. Recording the same deposit again is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DepositLogError`] for id zero, or a record that contradicts
+    /// one already learned for the same id.
+    pub fn record_deposit(
+        &mut self,
+        id: u64,
+        record: DepositRecord,
+    ) -> Result<(), DepositLogError> {
+        if id == 0 {
+            return Err(DepositLogError::ZeroId);
+        }
+        match self.deposit_log.get(&id) {
+            Some(existing) if *existing != record => Err(DepositLogError::Conflict(id)),
+            Some(_) => Ok(()),
+            None => {
+                self.deposit_log.insert(id, record);
+                Ok(())
+            }
+        }
+    }
+
+    /// The id of the last L1 deposit credited on the L2; zero for none.
+    #[must_use]
+    pub fn deposits_credited(&self) -> u64 {
+        decode_deposit_cursor(self.state.get(&keys::deposit_cursor())).unwrap_or(0)
+    }
+
+    /// The next deposit id this node needs to read from L1.
+    #[must_use]
+    pub fn next_deposit_to_read(&self) -> u64 {
+        self.deposit_log
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .max(self.deposits_credited())
+            + 1
+    }
+
+    /// The deposit transactions the next block credits: the recorded deposits
+    /// after the last one credited, in order, stopping at the first gap.
+    fn pending_deposits(&self) -> Vec<Transaction> {
+        let mut out = Vec::new();
+        let mut id = self.deposits_credited() + 1;
+        while out.len() < MAX_DEPOSITS_PER_BATCH {
+            let Some(r) = self.deposit_log.get(&id) else {
+                break;
+            };
+            out.push(Transaction::deposit(
+                self.chain_id,
+                id,
+                r.recipient,
+                r.asset,
+                r.amount,
+            ));
+            id += 1;
+        }
+        out
     }
 
     /// The fee assets to list to wallets.
@@ -294,6 +406,7 @@ impl Sequencer {
             base_fee: market.base_fee_at(timestamp).unwrap_or(market.base_fee),
             fee_recipient: self.fee_recipient,
             chain_id: self.chain_id,
+            deposits: Some(&self.deposit_log),
         }
     }
 
@@ -342,12 +455,19 @@ impl Sequencer {
         for (i, batch) in batches.iter().enumerate() {
             let height = i as u64 + 1;
             let pre_state_root = seq.state.root();
+            // These blocks were checked against L1's deposit log when this
+            // node produced them; the root check below catches any change.
+            let claimed = deposits_claimed_by(&batch.transactions);
+            for (id, record) in &claimed {
+                seq.deposit_log.insert(*id, *record);
+            }
             let ctx = BatchContext {
                 timestamp: batch.timestamp,
                 keyless: seq.keyless.as_deref(),
                 base_fee: batch.base_fee,
                 fee_recipient: batch.fee_recipient,
                 chain_id,
+                deposits: Some(&claimed),
             };
             let mut next = seq.state.clone();
             let trace = execute_batch(&mut next, &ctx, &batch.transactions)
@@ -430,9 +550,18 @@ impl Sequencer {
     ///
     /// Returns [`RejectReason`] if the mempool refuses it.
     pub fn submit(&mut self, transaction: Transaction) -> Result<Hash256, RejectReason> {
+        // Deposits come from L1 through `record_deposit`, never from users.
+        if matches!(transaction.payload, Payload::Deposit { .. })
+            || transaction.sender == DEPOSIT_SENDER
+        {
+            return Err(RejectReason::WouldNotExecute {
+                reason: "deposits are credited from L1, not submitted".to_string(),
+            });
+        }
         let keyless = self.keyless.clone();
         let ctx = BatchContext {
             keyless: keyless.as_deref(),
+            deposits: None,
             ..self.batch_context(
                 self.next_timestamp()
                     .saturating_add(ADMISSION_EXPIRY_MARGIN_SECS),
@@ -466,9 +595,19 @@ impl Sequencer {
                     window.window_limit() / 1_000 * u64::from(*permille)
                 })
         };
-        let transactions = self
-            .mempool
-            .take_batch_fitting(limit, MAX_BATCH_BYTES, budget, caps);
+        // L1 deposits go first, ahead of anything users sent. They pay no
+        // fee and use no window gas, but they take batch bytes.
+        let deposits = self.pending_deposits();
+        let deposit_bytes: usize = deposits.iter().map(|t| t.encode().len()).sum();
+        let queued = self.mempool.take_batch_fitting(
+            limit,
+            MAX_BATCH_BYTES.saturating_sub(deposit_bytes),
+            budget,
+            caps,
+        );
+        let deposit_count = deposits.len();
+        let mut transactions = deposits;
+        transactions.extend(queued);
         if transactions.is_empty() {
             return Ok(None);
         }
@@ -485,11 +624,16 @@ impl Sequencer {
         // Including it would make the whole batch invalid, so it is dropped
         // and the rest retried. Any other failure is an admission bug and is
         // reported rather than papered over.
-        let mut transactions = transactions;
         let (next, trace) = loop {
             let mut next = self.state.clone();
             match execute_batch(&mut next, &ctx, &transactions) {
                 Ok(trace) => break (next, trace),
+                // A deposit that fails was built from this node's own reading
+                // of L1, so that reading is wrong; dropping it would only
+                // move the problem to the next block.
+                Err(error @ BatchError::Compile { index, .. }) if index < deposit_count => {
+                    return Err(error.into());
+                }
                 Err(BatchError::Compile { index, .. }) => {
                     transactions.remove(index);
                     if transactions.is_empty() {

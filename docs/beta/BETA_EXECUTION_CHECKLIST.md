@@ -30,7 +30,7 @@ finding.
 ## 2. Build reproducibility and conformance
 
 - [x] `Complete` — Pin the Rust toolchain and build image. → [`rust-toolchain.toml`](../../rust-toolchain.toml)
-- [x] `Complete` — Pin Aptos CLI and Aptos framework inputs. → CLI pinned to `7.9.0`; framework pinned to commit `46d871fa1feb61ffafb73353a0755e8cc3aaed9d` in [`Move.toml`](../../move/sena/Move.toml). CI fails if the pin is ever a branch.
+- [x] `Complete` — Pin Aptos CLI and Aptos framework inputs. → CLI pinned to `9.6.0`; framework pinned to commit `07490157d3250932a385010878a3c5ae7c1338bb` (was `7.9.0` / `46d871fa`) in [`Move.toml`](../../move/sena/Move.toml). CI fails if the pin is ever a branch.
 - [ ] `Not started` — Make clean builds reproducible.
 - [ ] `Blocked` — Record and verify the STF binary hash. → depends on D-01 sign-off and the execution target. The Move **package** hash is recorded by [`move.yml`](../../.github/workflows/move.yml) once compilation succeeds.
 - [x] `Complete` — Add Rust-to-Move conformance tests for state roots and proof encodings. → [`move_conformance.rs`](../../crates/sena-stf/tests/move_conformance.rs) — checks constants agree; does **not** compile Move

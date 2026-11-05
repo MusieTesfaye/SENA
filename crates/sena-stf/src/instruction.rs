@@ -192,6 +192,69 @@ pub enum Instruction {
         #[serde(with = "bytes_32")]
         jwk_hash: [u8; 32],
     },
+    /// Write the record of a withdrawal to L1: `amount` of `asset`, already
+    /// debited from `account`, payable on L1 to `to`.
+    ///
+    /// The slot is the account's and nonce's own, so it must be empty; the
+    /// record is never rewritten, and `sena::bridge::claim` pays it once.
+    RecordWithdrawal {
+        /// The L2 account that withdrew.
+        account: L2Address,
+        /// The nonce of the transaction that withdrew.
+        nonce: u64,
+        /// The Aptos address paid on L1.
+        #[serde(with = "bytes_32")]
+        to: [u8; 32],
+        /// The asset withdrawn.
+        asset: AssetId,
+        /// The amount withdrawn.
+        amount: u128,
+    },
+    /// Open an escrow: write `record` (open) into `sender`'s transaction
+    /// `nonce`'s slot, which must be empty. The amount was debited before.
+    CreateEscrow {
+        /// The sending account.
+        sender: L2Address,
+        /// The sending transaction's nonce.
+        nonce: u64,
+        /// What is held, and for whom.
+        record: crate::social::Escrow,
+    },
+    /// Check that `issuer` attests `identifier` to `account` and has not
+    /// revoked it. Read-only, like [`Instruction::VerifyGasAsset`].
+    VerifyAttestation {
+        /// The hashed identifier.
+        identifier: HashedIdentifier,
+        /// The issuer.
+        issuer: L2Address,
+        /// The account it must name.
+        account: L2Address,
+    },
+    /// Release an open escrow exactly as `record` describes it: to a claimant
+    /// before `expires_at`, or back to its sender (`refund`) from then on.
+    ReleaseEscrow {
+        /// The account that opened it.
+        sender: L2Address,
+        /// The nonce of the transaction that opened it.
+        nonce: u64,
+        /// The record as the releasing transaction claims it is.
+        record: crate::social::Escrow,
+        /// The batch time the release is judged at.
+        now: u64,
+        /// Whether this is the sender taking it back.
+        refund: bool,
+    },
+    /// Advance the deposit cursor from `id - 1` to `id`.
+    ///
+    /// The step that makes an L1 deposit credit exactly once: the cursor holds
+    /// the id of the last deposit credited (absent means none), so deposit
+    /// `id` can only follow `id - 1`. That the deposit exists on L1 with the
+    /// recipient, asset and amount credited after it is checked when the
+    /// deposit transaction compiles, against the L1 deposit log.
+    ConsumeDeposit {
+        /// The L1 deposit's sequence number, counting from one.
+        id: u64,
+    },
     /// Accept or retire a JWK for an issuer (REQ-AUTH-003).
     SetJwk {
         /// Poseidon hash of the issuer.
@@ -360,6 +423,57 @@ impl Instruction {
             Self::DisableGasAsset { asset } => {
                 w.u8(15).u32(asset.get());
             }
+            Self::ConsumeDeposit { id } => {
+                w.u8(16).u64(*id);
+            }
+            Self::CreateEscrow {
+                sender,
+                nonce,
+                record,
+            } => {
+                w.u8(18)
+                    .bytes32(sender.as_bytes())
+                    .u64(*nonce)
+                    .bytes(&record.encode());
+            }
+            Self::VerifyAttestation {
+                identifier,
+                issuer,
+                account,
+            } => {
+                w.u8(19)
+                    .bytes32(identifier.as_hash().as_bytes())
+                    .bytes32(issuer.as_bytes())
+                    .bytes32(account.as_bytes());
+            }
+            Self::ReleaseEscrow {
+                sender,
+                nonce,
+                record,
+                now,
+                refund,
+            } => {
+                w.u8(20)
+                    .bytes32(sender.as_bytes())
+                    .u64(*nonce)
+                    .bytes(&record.encode())
+                    .u64(*now)
+                    .bool(*refund);
+            }
+            Self::RecordWithdrawal {
+                account,
+                nonce,
+                to,
+                asset,
+                amount,
+            } => {
+                w.u8(17)
+                    .bytes32(account.as_bytes())
+                    .u64(*nonce)
+                    .bytes32(to)
+                    .u32(asset.get())
+                    .u128(*amount);
+            }
         }
         w.finish()
     }
@@ -390,7 +504,12 @@ impl Instruction {
             }
             | Self::RevokeAttestation {
                 identifier, issuer, ..
+            }
+            | Self::VerifyAttestation {
+                identifier, issuer, ..
             } => keys::attestation(identifier, issuer),
+            Self::CreateEscrow { sender, nonce, .. }
+            | Self::ReleaseEscrow { sender, nonce, .. } => keys::escrow(sender, *nonce),
             Self::VerifyGasAsset { asset, .. } | Self::DisableGasAsset { asset } => {
                 keys::asset(asset.get())
             }
@@ -398,6 +517,8 @@ impl Instruction {
             Self::VerifyFeeSplit { .. } | Self::SetFeeSplit { .. } => keys::fee_split(),
             Self::SetGasAsset { record } => keys::asset(record.asset.get()),
             Self::VerifyCouncil { .. } => keys::council(),
+            Self::ConsumeDeposit { .. } => keys::deposit_cursor(),
+            Self::RecordWithdrawal { account, nonce, .. } => keys::withdrawal(account, *nonce),
             Self::SetParameter { name, .. } => keys::parameter(name),
             Self::VerifyJwk { iss_hash, jwk_hash }
             | Self::SetJwk {

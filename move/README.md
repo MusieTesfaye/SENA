@@ -29,22 +29,19 @@ and gate withdrawals on finality.
 
 ## Toolchain — read this before building
 
-The CLI version matters, in both directions:
+The CLI version matters:
 
-- **Prebuilt releases from `7.14.2` onward abort with SIGILL on CPUs without
-  AVX2**, which includes every Intel Atom-lineage chip (Celeron N-series, Pentium
-  Silver). `7.9.0` and earlier run on baseline x86-64.
 - **The framework must match the compiler.** `Move.toml` pins the framework to
-  commit `46d871fa…`, the tree tagged `aptos-cli-v7.9.0`. Later framework
-  revisions use Move 2 syntax (`proof { }`, inline `spec { }`) that `7.9.0`
-  cannot parse.
+  commit `07490157…`, the tree tagged `aptos-cli-v9.6.0`.
+- **The CLI needs AVX2.** Prebuilt releases from `7.14.2` onward abort with
+  SIGILL on CPUs without it (Intel Atom-lineage chips). On such a machine, use
+  CLI `7.9.0` with the framework at `46d871fa…` (tag `aptos-cli-v7.9.0`).
 
-So: use CLI `7.9.0` with the pinned framework. [`.github/workflows/move.yml`](../.github/workflows/move.yml)
+So: use CLI `9.6.0` with the pinned framework. [`.github/workflows/move.yml`](../.github/workflows/move.yml)
 does exactly that and fails the build if `Move.toml` ever points at a branch
 instead of a commit.
 
-Moving to a newer CLI means moving the framework pin with it, and gives up the
-ability to build on machines without AVX2.
+Moving to a newer CLI means moving the framework pin with it.
 
 ## Modules
 

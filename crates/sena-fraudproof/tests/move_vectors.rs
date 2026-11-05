@@ -83,6 +83,9 @@ impl Module {
     fn u64(&mut self, name: &str, v: u64) {
         writeln!(self.0, "    public fun {name}(): u64 {{ {v} }}").unwrap();
     }
+    fn u32(&mut self, name: &str, v: u32) {
+        writeln!(self.0, "    public fun {name}(): u32 {{ {v} }}").unwrap();
+    }
     fn u64s(&mut self, name: &str, v: &[u64]) {
         let body: Vec<String> = v.iter().map(u64::to_string).collect();
         writeln!(
@@ -284,6 +287,7 @@ fn devnet_ctx(config: &KeylessConfig) -> BatchContext<'_> {
         base_fee: BASE_FEE,
         fee_recipient: sequencer(),
         chain_id: sena_stf::TEST_CHAIN_ID,
+        deposits: None,
     }
 }
 
@@ -427,6 +431,18 @@ impl CompileCase {
 fn generate() -> String {
     let devnet = KeylessConfig::aptos_devnet_insecure();
     let mainnet = KeylessConfig::aptos_mainnet();
+    // The L1 deposit log compile cases run against; the Move test builds the
+    // same log on chain from `deposit_log_*`.
+    let deposit_log: std::collections::BTreeMap<u64, sena_stf::DepositRecord> = [(
+        1,
+        sena_stf::DepositRecord {
+            recipient: addr(&key(2)),
+            asset: USDC,
+            amount: 2_500,
+        },
+    )]
+    .into_iter()
+    .collect();
     let ctx_for = |setup: u8, timestamp: u64, base_fee: u128| -> BatchContext<'_> {
         BatchContext {
             timestamp,
@@ -438,6 +454,7 @@ fn generate() -> String {
             base_fee,
             fee_recipient: sequencer(),
             chain_id: sena_stf::TEST_CHAIN_ID,
+            deposits: Some(&deposit_log),
         }
     };
 
@@ -974,6 +991,188 @@ fn generate() -> String {
         base_fee: BASE_FEE,
     });
 
+    let logged = deposit_log[&1];
+    m.bytes("deposit_log_recipient", logged.recipient.as_bytes());
+    m.u32("deposit_log_asset", logged.asset.get());
+    m.u64("deposit_log_amount", u64::try_from(logged.amount).unwrap());
+    let deposit = |id, amount| {
+        Transaction::deposit(
+            sena_stf::TEST_CHAIN_ID,
+            id,
+            logged.recipient,
+            logged.asset,
+            amount,
+        )
+    };
+    cases.push(CompileCase::at("deposit", &deposit(1, 2_500)));
+    cases.push(CompileCase::at("deposit_wrong_amount", &deposit(1, 2_501)));
+    cases.push(CompileCase::at("deposit_not_on_l1", &deposit(2, 2_500)));
+    let mut other_asset = deposit(1, 2_500);
+    other_asset.payload = Payload::Deposit {
+        id: 1,
+        recipient: logged.recipient,
+        asset: AssetId(logged.asset.get() + 1),
+        amount: 2_500,
+    };
+    cases.push(CompileCase::at("deposit_wrong_asset", &other_asset));
+    let mut other_recipient = deposit(1, 2_500);
+    other_recipient.payload = Payload::Deposit {
+        id: 1,
+        recipient: carol,
+        asset: logged.asset,
+        amount: 2_500,
+    };
+    cases.push(CompileCase::at("deposit_wrong_recipient", &other_recipient));
+    let mut with_nonce = deposit(1, 2_500);
+    with_nonce.nonce = 1;
+    cases.push(CompileCase::at("deposit_not_canonical", &with_nonce));
+    let mut paid = deposit(1, 2_500);
+    paid.gas_limit = 1;
+    cases.push(CompileCase::at("deposit_with_fee_terms", &paid));
+    // A user's own signed transaction carrying a deposit payload.
+    cases.push(CompileCase::at(
+        "deposit_signed_by_user",
+        &sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::Deposit {
+                    id: 1,
+                    recipient: logged.recipient,
+                    asset: logged.asset,
+                    amount: 2_500,
+                },
+            ),
+        ),
+    ));
+    let mut transfer_from_deposit_sender = deposit(1, 2_500);
+    transfer_from_deposit_sender.payload = Payload::Transfer {
+        to: bob,
+        asset: USDC,
+        amount: 1,
+    };
+    cases.push(CompileCase::at(
+        "transfer_from_deposit_sender",
+        &transfer_from_deposit_sender,
+    ));
+
+    let withdraw = |amount| {
+        sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::Withdraw {
+                    to: [0xA7; 32],
+                    asset: USDC,
+                    amount,
+                },
+            ),
+        )
+    };
+    cases.push(CompileCase::at("withdraw", &withdraw(1_000)));
+
+    // Escrow: send to an identifier, claim it, take it back.
+    let record = sena_stf::Escrow {
+        identifier,
+        issuer: addr(&issuer),
+        asset: USDC,
+        amount: 4_000,
+        expires_at: TIMESTAMP + 1_000,
+        released: false,
+    };
+    let escrow_send = |expires_at| {
+        sign_ed25519(
+            &alice,
+            base(
+                addr(&alice),
+                0,
+                Payload::EscrowSend {
+                    identifier,
+                    issuer: addr(&issuer),
+                    asset: USDC,
+                    amount: 4_000,
+                    expires_at,
+                },
+            ),
+        )
+    };
+    cases.push(CompileCase::at(
+        "escrow_send",
+        &escrow_send(TIMESTAMP + 1_000),
+    ));
+    cases.push(CompileCase::at(
+        "escrow_send_already_expired",
+        &escrow_send(TIMESTAMP),
+    ));
+    let release = |by: &SigningKey, refund: bool, from: L2Address, record: sena_stf::Escrow| {
+        let payload = if refund {
+            Payload::EscrowRefund {
+                sender: from,
+                nonce: 0,
+                record,
+            }
+        } else {
+            Payload::EscrowClaim {
+                sender: from,
+                nonce: 0,
+                record,
+            }
+        };
+        sign_ed25519(by, base(addr(by), 0, payload))
+    };
+    cases.push(CompileCase::at(
+        "escrow_claim",
+        &release(&key(2), false, addr(&alice), record),
+    ));
+    cases.push(CompileCase::at(
+        "escrow_refund",
+        &release(&alice, true, addr(&alice), record),
+    ));
+    cases.push(CompileCase::at(
+        "escrow_refund_of_another",
+        &release(&key(2), true, addr(&alice), record),
+    ));
+    cases.push(CompileCase::at(
+        "escrow_claim_of_released",
+        &release(
+            &key(2),
+            false,
+            addr(&alice),
+            sena_stf::Escrow {
+                released: true,
+                ..record
+            },
+        ),
+    ));
+    cases.push(CompileCase::at("withdraw_nothing", &withdraw(0)));
+
+    // A state holding one withdrawal record, for `bridge::claim`.
+    let mut wtrie = genesis();
+    let record = withdrawal_record();
+    sena_stf::apply(&mut wtrie, &record).unwrap();
+    let Instruction::RecordWithdrawal { account, nonce, .. } = record else {
+        unreachable!()
+    };
+    let wslot = record.slot();
+    let wproof = wtrie.prove(&wslot);
+    let Terminal::Leaf {
+        key: wkey,
+        value_hash: wvh,
+    } = wproof.terminal
+    else {
+        panic!("a recorded withdrawal is a leaf")
+    };
+    m.hash("withdrawal_root", &wtrie.root());
+    m.bytes("withdrawal_sender", account.as_bytes());
+    m.u64("withdrawal_nonce", nonce);
+    m.bytes("withdrawal_record", wtrie.get(&wslot).unwrap());
+    m.hashes("withdrawal_siblings", &wproof.siblings);
+    m.hash("withdrawal_terminal_key", &wkey);
+    m.hash("withdrawal_terminal_value_hash", &wvh);
+    m.hash("withdrawal_slot", &wslot);
+
     m.u64("compile_case_count", cases.len() as u64);
     m.u64(
         "council_case",
@@ -1053,6 +1252,17 @@ fn generate() -> String {
     out
 }
 
+/// The withdrawal the transition cases and the bridge test use.
+fn withdrawal_record() -> Instruction {
+    Instruction::RecordWithdrawal {
+        account: addr(&key(1)),
+        nonce: 3,
+        to: [0xA7; 32],
+        asset: USDC,
+        amount: 1_234,
+    }
+}
+
 /// One step's semantics against concrete slot contents.
 struct TransitionCase {
     name: &'static str,
@@ -1121,6 +1331,31 @@ fn emit_transitions(m: &mut Module, split: &FeeSplit) {
         issuer,
         account,
         issued_on,
+    };
+    let escrow = |released| sena_stf::Escrow {
+        identifier: attested,
+        issuer,
+        asset: USDC,
+        amount: 4_000,
+        expires_at: 1_000,
+        released,
+    };
+    let create_escrow = || Instruction::CreateEscrow {
+        sender: account,
+        nonce: 2,
+        record: escrow(false),
+    };
+    let verify_attestation = |account| Instruction::VerifyAttestation {
+        identifier: attested,
+        issuer,
+        account,
+    };
+    let release_escrow = |now, refund, record| Instruction::ReleaseEscrow {
+        sender: account,
+        nonce: 2,
+        record,
+        now,
+        refund,
     };
     let revoke_attestation = |by| Instruction::RevokeAttestation {
         identifier: attested,
@@ -1345,6 +1580,123 @@ fn emit_transitions(m: &mut Module, split: &FeeSplit) {
             instruction: revoke_attestation(issuer),
             current: Some(attestation(100, true)),
         },
+        TransitionCase {
+            name: "create_escrow",
+            instruction: create_escrow(),
+            current: None,
+        },
+        TransitionCase {
+            name: "create_escrow_over_one",
+            instruction: create_escrow(),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "verify_attestation",
+            instruction: verify_attestation(account),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "verify_attestation_revoked",
+            instruction: verify_attestation(account),
+            current: Some(attestation(100, true)),
+        },
+        TransitionCase {
+            name: "verify_attestation_other_account",
+            instruction: verify_attestation(L2Address::from_bytes([0x77; 32])),
+            current: Some(attestation(100, false)),
+        },
+        TransitionCase {
+            name: "verify_attestation_absent",
+            instruction: verify_attestation(account),
+            current: None,
+        },
+        TransitionCase {
+            name: "claim_before_expiry",
+            instruction: release_escrow(999, false, escrow(false)),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "claim_at_expiry",
+            instruction: release_escrow(1_000, false, escrow(false)),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "refund_at_expiry",
+            instruction: release_escrow(1_000, true, escrow(false)),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "refund_before_expiry",
+            instruction: release_escrow(999, true, escrow(false)),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "release_released",
+            instruction: release_escrow(999, false, escrow(false)),
+            current: Some(escrow(true).encode()),
+        },
+        TransitionCase {
+            name: "release_inflated",
+            instruction: release_escrow(
+                999,
+                false,
+                sena_stf::Escrow {
+                    amount: 9_999,
+                    ..escrow(false)
+                },
+            ),
+            current: Some(escrow(false).encode()),
+        },
+        TransitionCase {
+            name: "release_absent",
+            instruction: release_escrow(999, false, escrow(false)),
+            current: None,
+        },
+        TransitionCase {
+            name: "record_withdrawal",
+            instruction: withdrawal_record(),
+            current: None,
+        },
+        TransitionCase {
+            name: "record_withdrawal_twice",
+            instruction: withdrawal_record(),
+            current: Some(vec![0; 52]),
+        },
+        TransitionCase {
+            name: "first_deposit",
+            instruction: Instruction::ConsumeDeposit { id: 1 },
+            current: None,
+        },
+        TransitionCase {
+            name: "next_deposit",
+            instruction: Instruction::ConsumeDeposit { id: 2 },
+            current: Some(1u64.to_be_bytes().to_vec()),
+        },
+        TransitionCase {
+            name: "deposit_credited_twice",
+            instruction: Instruction::ConsumeDeposit { id: 2 },
+            current: Some(2u64.to_be_bytes().to_vec()),
+        },
+        TransitionCase {
+            name: "deposit_skipped",
+            instruction: Instruction::ConsumeDeposit { id: 3 },
+            current: Some(1u64.to_be_bytes().to_vec()),
+        },
+        TransitionCase {
+            name: "deposit_before_first",
+            instruction: Instruction::ConsumeDeposit { id: 0 },
+            current: None,
+        },
+        TransitionCase {
+            name: "deposit_cursor_malformed",
+            instruction: Instruction::ConsumeDeposit { id: 2 },
+            current: Some(vec![0, 0, 0, 0, 0, 0, 1]),
+        },
+        TransitionCase {
+            name: "deposit_cursor_at_max",
+            instruction: Instruction::ConsumeDeposit { id: 0 },
+            current: Some(u64::MAX.to_be_bytes().to_vec()),
+        },
     ];
     m.u64("transition_case_count", cases.len() as u64);
     for (i, case) in cases.iter().enumerate() {
@@ -1401,7 +1753,10 @@ fn move_vectors_are_current() {
         std::fs::write(&path, &generated).unwrap();
         return;
     }
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    // A Windows checkout (core.autocrlf) turns LF into CRLF; that is not staleness.
+    let current = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert!(
         current == generated,
         "move/sena/tests/vectors.move is stale; regenerate with \

@@ -84,6 +84,16 @@ enum Command {
         /// a reverse proxy that sets it. Never on a node clients reach directly.
         #[arg(long)]
         trust_forwarded_for: bool,
+        /// Credit L1 deposits read from this Aptos fullnode REST endpoint,
+        /// e.g. `http://127.0.0.1:8080/v1`. Needs `--deposits-contract`.
+        #[arg(long, requires = "deposits_contract")]
+        deposits_from: Option<String>,
+        /// The address the SENA package and its chain live at on L1.
+        #[arg(long, requires = "deposits_from")]
+        deposits_contract: Option<String>,
+        /// Seconds between reads of the L1 deposit log.
+        #[arg(long, default_value_t = 15)]
+        deposits_poll_secs: u64,
     },
     /// Re-execute a chain independently and report whether its assertions hold.
     Verify {
@@ -123,6 +133,28 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         tip: u128,
     },
+    /// Sign and submit a withdrawal to Aptos L1: burn the amount on SENA and
+    /// record that `--to` may claim it from the bridge once final.
+    Withdraw {
+        /// RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Sender's secret key, hex-encoded.
+        #[arg(long)]
+        secret: String,
+        /// The Aptos address paid on L1.
+        #[arg(long)]
+        to: String,
+        /// Amount to withdraw.
+        #[arg(long)]
+        amount: u128,
+        /// Sender's next nonce.
+        #[arg(long)]
+        nonce: u64,
+        /// Asset to withdraw; the fee is paid in it too.
+        #[arg(long, default_value_t = 1)]
+        asset: u32,
+    },
     /// Query a node.
     Query {
         /// RPC endpoint.
@@ -153,6 +185,25 @@ enum Command {
     /// Keep the chain's accepted keyless JWKs in step with a provider's
     /// rotations, by council-signed `SetJwk` updates. For a test network
     /// whose council is this one key (threshold 1).
+    /// Rename a fee asset (its symbol), as the council: a governance update
+    /// that keeps the asset's rate, intrinsic gas and enabled flag.
+    RenameAsset {
+        /// L2 RPC endpoint.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// JSON file with the council member's `secret` (hex).
+        #[arg(long)]
+        key_file: String,
+        /// The asset to rename.
+        #[arg(long)]
+        asset: u32,
+        /// Its new symbol.
+        #[arg(long)]
+        symbol: String,
+        /// Asset the council pays the fee in.
+        #[arg(long, default_value_t = 1)]
+        fee_asset: u32,
+    },
     JwkSync {
         /// L2 RPC endpoint.
         #[arg(long, default_value = "http://127.0.0.1:8545")]
@@ -264,6 +315,16 @@ enum Query {
         #[arg(long)]
         height: Option<u64>,
     },
+    /// The proof `bridge::claim` needs for a withdrawal.
+    Withdrawal {
+        /// The account that withdrew.
+        sender: String,
+        /// The nonce of its withdrawing transaction.
+        nonce: u64,
+        /// Prove against this state root (a finalized assertion's); current if absent.
+        #[arg(long)]
+        state_root: Option<String>,
+    },
 }
 
 fn main() {
@@ -285,6 +346,9 @@ fn main() {
             fee_recipient,
             cors_origin,
             trust_forwarded_for,
+            deposits_from,
+            deposits_contract,
+            deposits_poll_secs,
         } => serve(
             &data_dir,
             run_for,
@@ -296,6 +360,13 @@ fn main() {
                 rate_limit_per_minute: rate_limit,
                 cors_origins: cors_origin,
                 trust_forwarded_for,
+                deposits_from: deposits_from
+                    .zip(deposits_contract)
+                    .map(|(rest_url, contract)| sena_node::deposits::RestReader {
+                        rest_url,
+                        contract,
+                    }),
+                deposits_poll_secs,
                 ..ServerConfig::default()
             },
         ),
@@ -323,6 +394,27 @@ fn main() {
                 asset,
                 fee_asset: fee_asset.unwrap_or(asset),
                 tip,
+                withdraw: false,
+            },
+        ),
+        Command::Withdraw {
+            rpc,
+            secret,
+            to,
+            amount,
+            nonce,
+            asset,
+        } => send(
+            &rpc,
+            &secret,
+            &Transfer {
+                to,
+                amount,
+                nonce,
+                asset,
+                fee_asset: asset,
+                tip: 0,
+                withdraw: true,
             },
         ),
         Command::Query { rpc, what } => query(&rpc, &what),
@@ -333,6 +425,13 @@ fn main() {
             bond,
             state,
         } => relay(rpc, rpc_token, &aptos, bond, state),
+        Command::RenameAsset {
+            rpc,
+            key_file,
+            asset,
+            symbol,
+            fee_asset,
+        } => rename_asset(&rpc, &key_file, asset, symbol, fee_asset),
         Command::JwkSync {
             rpc,
             key_file,
@@ -576,6 +675,12 @@ fn relay(
                 eprintln!("assertion for block {h} was rejected on L1; halting");
                 std::process::exit(2);
             }
+            // Someone else holds our next assertion: building on it would
+            // leave it undefended.
+            Err(e @ sena_node::relayer::RelayError::NotOurs(..)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
             other => other,
         },
         |r| *r == sena_node::relayer::StepReport::default(),
@@ -616,6 +721,54 @@ fn watch(
         || watcher.step(),
         |r| *r == sena_node::WatchReport::default(),
     )
+}
+
+fn council_key(key_file: &str) -> Result<SigningKey, String> {
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(key_file).map_err(|e| format!("reading {key_file}: {e}"))?,
+    )
+    .map_err(|e| format!("{key_file} is not JSON: {e}"))?;
+    let secret: [u8; 32] = file["secret"]
+        .as_str()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{key_file} needs a 32-byte hex \"secret\""))?;
+    Ok(SigningKey::from_bytes(&secret))
+}
+
+fn rename_asset(
+    rpc: &str,
+    key_file: &str,
+    asset: u32,
+    symbol: String,
+    fee_asset: u32,
+) -> Result<(), String> {
+    let assets = call(rpc, &serde_json::json!({ "method": "sena_getFeeAssets" }))?;
+    let current = assets["assets"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["asset"] == asset))
+        .ok_or_else(|| format!("asset {asset} is not a fee asset"))?;
+    let rate: u128 = current["rate"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("unexpected asset record: {current}"))?;
+    let record = sena_stf::WhitelistedAsset {
+        asset: sena_primitives::AssetId(asset),
+        symbol: symbol.clone(),
+        rate,
+        intrinsic_gas: current["intrinsic_gas"]
+            .as_u64()
+            .ok_or("no intrinsic gas")?,
+        enabled: current["enabled"].as_bool().ok_or("no enabled flag")?,
+    };
+    sena_node::jwk_sync::govern(
+        rpc,
+        &council_key(key_file)?,
+        fee_asset,
+        sena_stf::GovernanceUpdate::SetGasAsset { record },
+    )?;
+    println!("asset {asset} is now {symbol}");
+    Ok(())
 }
 
 fn jwk_sync(
@@ -722,6 +875,20 @@ struct Transfer {
     asset: u32,
     fee_asset: u32,
     tip: u128,
+    /// `to` is an Aptos address and the payload a withdrawal to it.
+    withdraw: bool,
+}
+
+/// An Aptos address's 32 bytes, from `0x`-hex of up to 64 digits.
+fn aptos_address(text: &str) -> Result<[u8; 32], String> {
+    let h = text.trim().trim_start_matches("0x");
+    if h.is_empty() || h.len() > 64 {
+        return Err(format!("not an Aptos address: {text}"));
+    }
+    let raw =
+        hex::decode(format!("{h:0>64}")).map_err(|_| format!("not an Aptos address: {text}"))?;
+    raw.try_into()
+        .map_err(|_| format!("not an Aptos address: {text}"))
 }
 
 fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
@@ -732,6 +899,7 @@ fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
         asset,
         fee_asset,
         tip,
+        withdraw,
     } = *t;
     let raw = hex::decode(secret.trim()).map_err(|_| "secret is not hex".to_owned())?;
     let bytes: [u8; 32] = raw
@@ -739,7 +907,19 @@ fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
         .map_err(|_| "secret must be 32 bytes".to_owned())?;
     let key = SigningKey::from_bytes(&bytes);
 
-    let recipient = L2Address::from_hex(to.trim()).map_err(|e| format!("bad recipient: {e}"))?;
+    let payload = if withdraw {
+        sena_stf::Payload::Withdraw {
+            to: aptos_address(to)?,
+            asset: sena_primitives::AssetId(asset),
+            amount,
+        }
+    } else {
+        sena_stf::Payload::Transfer {
+            to: L2Address::from_hex(to.trim()).map_err(|e| format!("bad recipient: {e}"))?,
+            asset: sena_primitives::AssetId(asset),
+            amount,
+        }
+    };
 
     // The asset's rate and intrinsic gas, and the base fee, as the node quotes
     // them. All three are checked in the trace, so a wrong quote is refused
@@ -762,11 +942,7 @@ fn send(rpc: &str, secret: &str, t: &Transfer) -> Result<(), String> {
         gas_limit: 0,
         max_fee_per_gas: quote.max_fee_per_gas,
         max_priority_fee_per_gas: tip,
-        payload: sena_stf::Payload::Transfer {
-            to: recipient,
-            asset: sena_primitives::AssetId(asset),
-            amount,
-        },
+        payload,
         authenticator: sena_stf::Authenticator::Ed25519 {
             public_key: key.verifying_key().to_bytes(),
             signature: [0; 64],
@@ -824,6 +1000,19 @@ fn query(rpc: &str, what: &Query) -> Result<(), String> {
                 params["height"] = serde_json::json!(h);
             }
             serde_json::json!({ "method": "sena_getAccountProof", "params": params })
+        }
+        Query::Withdrawal {
+            sender,
+            nonce,
+            state_root,
+        } => {
+            let parsed =
+                L2Address::from_hex(sender.trim()).map_err(|e| format!("bad address: {e}"))?;
+            let mut params = serde_json::json!({ "sender": parsed, "nonce": nonce });
+            if let Some(root) = state_root {
+                params["state_root"] = serde_json::json!(root.trim_start_matches("0x"));
+            }
+            serde_json::json!({ "method": "sena_getWithdrawalProof", "params": params })
         }
     };
     let response = call(rpc, &body)?;

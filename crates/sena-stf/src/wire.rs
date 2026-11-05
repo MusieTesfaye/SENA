@@ -48,6 +48,11 @@ mod tag {
     pub const REVOKE_ATTESTATION: u8 = 2;
     pub const GOVERNANCE: u8 = 3;
     pub const DISTRIBUTE_FEES: u8 = 4;
+    pub const DEPOSIT: u8 = 5;
+    pub const WITHDRAW: u8 = 6;
+    pub const ESCROW_SEND: u8 = 7;
+    pub const ESCROW_CLAIM: u8 = 8;
+    pub const ESCROW_REFUND: u8 = 9;
     pub const SET_GAS_ASSET: u8 = 0;
     pub const SET_PARAMETER: u8 = 1;
     pub const SET_JWK: u8 = 2;
@@ -230,6 +235,67 @@ pub(crate) fn write_payload(w: &mut Writer, payload: &Payload) {
             w.u128(*amount);
             w.bytes(&split.encode());
         }
+        Payload::EscrowSend { .. } | Payload::EscrowClaim { .. } | Payload::EscrowRefund { .. } => {
+            write_escrow(w, payload);
+        }
+        Payload::Withdraw { to, asset, amount } => {
+            w.u8(tag::WITHDRAW);
+            w.bytes32(to);
+            w.u32(asset.get());
+            w.u128(*amount);
+        }
+        Payload::Deposit {
+            id,
+            recipient,
+            asset,
+            amount,
+        } => {
+            w.u8(tag::DEPOSIT);
+            w.u64(*id);
+            w.bytes32(recipient.as_bytes());
+            w.u32(asset.get());
+            w.u128(*amount);
+        }
+    }
+}
+
+/// The escrow payloads' encodings.
+fn write_escrow(w: &mut Writer, payload: &Payload) {
+    match payload {
+        Payload::EscrowSend {
+            identifier,
+            issuer,
+            asset,
+            amount,
+            expires_at,
+        } => {
+            w.u8(tag::ESCROW_SEND);
+            w.bytes32(identifier.as_hash().as_bytes());
+            w.bytes32(issuer.as_bytes());
+            w.u32(asset.get());
+            w.u128(*amount);
+            w.u64(*expires_at);
+        }
+        Payload::EscrowClaim {
+            sender,
+            nonce,
+            record,
+        }
+        | Payload::EscrowRefund {
+            sender,
+            nonce,
+            record,
+        } => {
+            w.u8(if matches!(payload, Payload::EscrowClaim { .. }) {
+                tag::ESCROW_CLAIM
+            } else {
+                tag::ESCROW_REFUND
+            });
+            w.bytes32(sender.as_bytes());
+            w.u64(*nonce);
+            w.bytes(&record.encode());
+        }
+        _ => unreachable!("only escrow payloads are routed here"),
     }
 }
 
@@ -279,6 +345,43 @@ fn read_payload(r: &mut Reader<'_>) -> Result<Payload, WireError> {
             asset: AssetId(r.u32()?),
             amount: r.u128()?,
             split: read_split(r, tag::DISTRIBUTE_FEES)?,
+        },
+        tag::ESCROW_SEND => Payload::EscrowSend {
+            identifier: HashedIdentifier(Hash256(r.bytes32()?)),
+            issuer: L2Address::from_bytes(r.bytes32()?),
+            asset: AssetId(r.u32()?),
+            amount: r.u128()?,
+            expires_at: r.u64()?,
+        },
+        t @ (tag::ESCROW_CLAIM | tag::ESCROW_REFUND) => {
+            let sender = L2Address::from_bytes(r.bytes32()?);
+            let nonce = r.u64()?;
+            let record = crate::social::Escrow::decode(&r.bytes()?)
+                .map_err(|_| DecodeError::UnknownVariant(t))?;
+            if t == tag::ESCROW_CLAIM {
+                Payload::EscrowClaim {
+                    sender,
+                    nonce,
+                    record,
+                }
+            } else {
+                Payload::EscrowRefund {
+                    sender,
+                    nonce,
+                    record,
+                }
+            }
+        }
+        tag::WITHDRAW => Payload::Withdraw {
+            to: r.bytes32()?,
+            asset: AssetId(r.u32()?),
+            amount: r.u128()?,
+        },
+        tag::DEPOSIT => Payload::Deposit {
+            id: r.u64()?,
+            recipient: L2Address::from_bytes(r.bytes32()?),
+            asset: AssetId(r.u32()?),
+            amount: r.u128()?,
         },
         other => return Err(DecodeError::UnknownVariant(other).into()),
     })

@@ -214,9 +214,10 @@ pub struct SignIn<'a> {
 /// Builds the keyless authenticator for a sign-in, with the ephemeral
 /// signature left zero (see [`sign`]).
 ///
-/// `public_inputs_hash`, if the prover returned one, must be the hash this
-/// function computes; otherwise the proof is for other inputs and would be
-/// refused on chain.
+/// `public_inputs_hash`, if the prover returned one, holds its possible
+/// readings (see [`ProverResponse`]); one of them must be the hash this
+/// function computes, or the proof is for other inputs and would be refused
+/// on chain.
 ///
 /// # Errors
 ///
@@ -226,7 +227,7 @@ pub fn assemble(
     jwt: &Jwt,
     sign_in: &SignIn<'_>,
     proof: [u8; 128],
-    public_inputs_hash: Option<[u8; 32]>,
+    public_inputs_hash: Option<&[[u8; 32]]>,
 ) -> Result<KeylessSignature, ClientError> {
     if jwt.claim("nonce")? != sign_in.session.nonce() {
         return Err(ClientError::WrongNonce);
@@ -250,8 +251,9 @@ pub fn assemble(
         proof,
     };
     keyless::parse_proof(&sig.proof)?;
-    if let Some(expected) = public_inputs_hash {
-        if keyless::fr_to_bytes(&keyless::public_inputs_hash(&sig)?) != expected {
+    if let Some(readings) = public_inputs_hash {
+        let computed = keyless::fr_to_bytes(&keyless::public_inputs_hash(&sig)?);
+        if !readings.contains(&computed) {
             return Err(ClientError::PublicInputsMismatch);
         }
     }
@@ -356,8 +358,12 @@ pub fn parse_pepper_response(v: &Value) -> Result<[u8; limits::PEPPER_BYTES], Cl
 pub struct ProverResponse {
     /// A ‖ B ‖ C, compressed.
     pub proof: [u8; 128],
-    /// The public-inputs hash, 32 little-endian bytes.
-    pub public_inputs_hash: [u8; 32],
+    /// The public-inputs hash, as 32 little-endian bytes, in each reading the
+    /// prover's text allows: a decimal or hex number, or (for exactly 32 hex
+    /// bytes) those bytes as they are. [`assemble`] accepts the proof only if
+    /// one of them is the hash it computes, so tolerating several notations
+    /// loosens nothing.
+    pub public_inputs_hash: Vec<[u8; 32]>,
 }
 
 /// The request the proving service (`POST <prover>/v0/prove`) takes, which
@@ -381,6 +387,31 @@ fn field_name(extra_field: &str) -> &str {
         .split('"')
         .next()
         .unwrap_or(extra_field)
+}
+
+/// The ways `text` can denote a field element: a decimal number; a hex
+/// number (with or without `0x`, leading zeros optional); or, when it is
+/// exactly 64 hex digits, little-endian bytes. `None` if it is none of these.
+fn public_inputs_hash_readings(text: &str) -> Option<Vec<[u8; 32]>> {
+    let t = text.trim();
+    let mut out = Vec::new();
+    if !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()) {
+        if let Ok(fr) = t.parse() {
+            out.push(keyless::fr_to_bytes(&fr));
+        }
+    }
+    let hx = t.strip_prefix("0x").unwrap_or(t);
+    if !hx.is_empty() && hx.len() <= 64 && hx.bytes().all(|c| c.is_ascii_hexdigit()) {
+        let be: [u8; 32] = hex::decode(format!("{hx:0>64}")).ok()?.try_into().ok()?;
+        // A big-endian number's little-endian bytes are its bytes reversed.
+        let mut le = be;
+        le.reverse();
+        out.push(le);
+        if hx.len() == 64 {
+            out.push(be);
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Parses the prover's answer: `{proof: {a, b, c}, public_inputs_hash, ...}`
@@ -410,14 +441,8 @@ pub fn parse_prover_response(v: &Value) -> Result<ProverResponse, ClientError> {
     let h = v["public_inputs_hash"]
         .as_str()
         .ok_or_else(|| bad("no public_inputs_hash"))?;
-    let public_inputs_hash = if let Some(hx) = h.strip_prefix("0x") {
-        hex::decode(hx)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| bad("bad public_inputs_hash"))?
-    } else {
-        keyless::fr_to_bytes(&h.parse().map_err(|()| bad("bad public_inputs_hash"))?)
-    };
+    let public_inputs_hash = public_inputs_hash_readings(h)
+        .ok_or_else(|| bad(&format!("unreadable public_inputs_hash {h:?}")))?;
     Ok(ProverResponse {
         proof,
         public_inputs_hash,
@@ -478,7 +503,7 @@ mod tests {
         let parsed = Jwt::parse(&jwt(&s)).unwrap();
         let expected = aptos_sample::signature();
         let pih = keyless::fr_to_bytes(&keyless::public_inputs_hash(&expected).unwrap());
-        let sig = assemble(&parsed, &sign_in(&s), proof(), Some(pih)).unwrap();
+        let sig = assemble(&parsed, &sign_in(&s), proof(), Some(&[pih])).unwrap();
         assert_eq!(sig, expected);
         assert_eq!(
             address_of(&parsed, &aptos_sample::pepper(), "sub").unwrap(),
@@ -541,7 +566,7 @@ mod tests {
         let pih =
             keyless::fr_to_bytes(&keyless::public_inputs_hash(&aptos_sample::signature()).unwrap());
         assert_eq!(
-            assemble(&parsed, &wrong, proof(), Some(pih)),
+            assemble(&parsed, &wrong, proof(), Some(&[pih])),
             Err(ClientError::PublicInputsMismatch)
         );
     }
@@ -556,7 +581,34 @@ mod tests {
         });
         let r = parse_prover_response(&v).unwrap();
         assert_eq!(r.proof, proof());
-        assert_eq!(r.public_inputs_hash[0], 0x39); // 12345 = 0x3039, little-endian
+        assert_eq!(r.public_inputs_hash[0][0], 0x39); // 12345 = 0x3039, little-endian
+                                                      // As Aptos's prover writes it: a big-endian hex number, leading
+                                                      // zeros dropped. It reads as the same field element.
+        let hexed = json!({"proof": v["proof"].clone(), "public_inputs_hash": "0x3039"});
+        assert!(parse_prover_response(&hexed)
+            .unwrap()
+            .public_inputs_hash
+            .contains(&r.public_inputs_hash[0]));
+        // The sample's real hash, in every notation, still assembles.
+        let s = session();
+        let parsed = Jwt::parse(&jwt(&s)).unwrap();
+        let fr = keyless::public_inputs_hash(&aptos_sample::signature()).unwrap();
+        let le = keyless::fr_to_bytes(&fr);
+        let mut be = le;
+        be.reverse();
+        for text in [
+            fr.to_string(),
+            format!("0x{}", hex::encode(be)),
+            format!("0x{}", hex::encode(be).trim_start_matches('0')),
+            format!("0x{}", hex::encode(le)),
+        ] {
+            let readings = public_inputs_hash_readings(&text).unwrap();
+            assert!(
+                assemble(&parsed, &sign_in(&s), proof(), Some(&readings)).is_ok(),
+                "{text}"
+            );
+        }
+        assert!(public_inputs_hash_readings("0xnothex").is_none());
         assert!(parse_prover_response(&json!({"message": "rate limited"})).is_err());
         assert_eq!(field_name(aptos_sample::EXTRA_FIELD), "family_name");
     }

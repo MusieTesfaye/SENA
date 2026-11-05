@@ -98,6 +98,7 @@ impl DaBlob {
         starting_state: &mut MerkleTrie,
         keyless: Option<&KeylessConfig>,
         chain_id: u64,
+        deposits: Option<&dyn sena_stf::DepositLog>,
     ) -> Result<Hash256, String> {
         if !self.verify_integrity() {
             return Err("DA blob commitment does not match its contents".to_string());
@@ -116,6 +117,7 @@ impl DaBlob {
             base_fee: self.base_fee,
             fee_recipient: self.fee_recipient,
             chain_id,
+            deposits,
         };
         let trace = execute_batch(starting_state, &ctx, &self.transactions)
             .map_err(|e| format!("batch execution failed: {e}"))?;
@@ -305,7 +307,7 @@ mod tests {
         // Independent replay from starting state
         let mut verifier_state = starting_state.clone();
         let executed_root = da_blob
-            .verify_execution(&mut verifier_state, None, sena_stf::TEST_CHAIN_ID)
+            .verify_execution(&mut verifier_state, None, sena_stf::TEST_CHAIN_ID, None)
             .unwrap();
         assert_eq!(executed_root, post_root);
 
@@ -319,7 +321,7 @@ mod tests {
         tampered.batch_commitment = Hash256::ZERO;
         assert!(!tampered.verify_integrity());
         assert!(tampered
-            .verify_execution(&mut verifier_state, None, sena_stf::TEST_CHAIN_ID)
+            .verify_execution(&mut verifier_state, None, sena_stf::TEST_CHAIN_ID, None)
             .is_err());
     }
 }

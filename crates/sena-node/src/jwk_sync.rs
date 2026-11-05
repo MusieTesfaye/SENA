@@ -100,96 +100,7 @@ impl JwkSyncConfig {
 
     /// Signs `update` as the council and submits it; waits for its block.
     fn govern(&self, update: GovernanceUpdate) -> Result<(), String> {
-        let me = hex::encode(self.key.verifying_key().to_bytes());
-        let council = call(
-            &self.rpc,
-            &serde_json::json!({ "method": "sena_getCouncil" }),
-        )?;
-        let members = council["members"]
-            .as_array()
-            .ok_or_else(|| format!("sena_getCouncil: {council}"))?;
-        let index = members
-            .iter()
-            .position(|m| m.as_str() == Some(me.as_str()))
-            .ok_or("this key is not a council member")?;
-        if council["threshold"] != 1 {
-            return Err(format!(
-                "the council needs {} signatures; jwk-sync signs alone",
-                council["threshold"]
-            ));
-        }
-        let epoch = council["epoch"].as_u64().ok_or("no council epoch")?;
-
-        let info = call(
-            &self.rpc,
-            &serde_json::json!({ "method": "sena_getChainInfo" }),
-        )?;
-        let chain_id = info["transaction_chain_id"]
-            .as_u64()
-            .ok_or_else(|| format!("no chain id: {info}"))?;
-        let quote = call(
-            &self.rpc,
-            &serde_json::json!({ "method": "sena_gasPrice", "params": { "asset": self.fee_asset } }),
-        )?;
-        let sender = L2Address::from_bytes(self.key.verifying_key().to_bytes());
-        let account = call(
-            &self.rpc,
-            &serde_json::json!({ "method": "sena_getAccount", "params": { "address": sender.to_string() } }),
-        )?;
-
-        let digest = update.signing_digest(chain_id, epoch);
-        let signature = CouncilSignature {
-            index: u32::try_from(index).map_err(|e| e.to_string())?,
-            signature: self.key.sign(digest.as_bytes()).to_bytes(),
-        };
-        let mut tx = Transaction {
-            chain_id,
-            sender,
-            nonce: account["nonce"]
-                .as_u64()
-                .ok_or_else(|| format!("no nonce: {account}"))?,
-            fee_asset: AssetId(self.fee_asset),
-            fee_rate: num(&quote, "rate")?,
-            fee_intrinsic_gas: u64::try_from(num(&quote, "intrinsic_gas")?)
-                .map_err(|e| e.to_string())?,
-            gas_limit: 0,
-            max_fee_per_gas: num(&quote, "suggested_max_fee_per_gas")?,
-            max_priority_fee_per_gas: 0,
-            payload: Payload::Governance {
-                epoch,
-                update,
-                signatures: vec![signature],
-            },
-            authenticator: Authenticator::Ed25519 {
-                public_key: self.key.verifying_key().to_bytes(),
-                signature: [0; 64],
-            },
-        };
-        tx.gas_limit = sena_stf::gas_required(&tx).map_err(|e| e.to_string())?;
-        tx.authenticator = Authenticator::Ed25519 {
-            public_key: self.key.verifying_key().to_bytes(),
-            signature: self.key.sign(tx.signing_digest().as_bytes()).to_bytes(),
-        };
-        let hash = tx.hash();
-        let body = serde_json::to_value(crate::Request::SubmitTransaction(Box::new(tx)))
-            .map_err(|e| e.to_string())?;
-        let r = call(&self.rpc, &body)?;
-        if r["result"] != "submitted" {
-            return Err(format!("the node refused the update: {r}"));
-        }
-        for _ in 0..120 {
-            let c = call(
-                &self.rpc,
-                &serde_json::json!({ "method": "sena_getConfirmation", "params": { "hash": hash.to_string() } }),
-            )?;
-            match c["status"].as_str() {
-                Some("soft_confirmed" | "finalized") => return Ok(()),
-                _ => std::thread::sleep(Duration::from_millis(500)),
-            }
-        }
-        Err(format!(
-            "transaction {hash} was not included within a minute"
-        ))
+        govern(&self.rpc, &self.key, self.fee_asset, update)
     }
 
     fn set(&self, n: &str, active: bool) -> Result<(), String> {
@@ -259,4 +170,103 @@ impl JwkSyncConfig {
         }
         Ok(report)
     }
+}
+
+/// Signs `update` as a one-member council with `key`, which also sends and
+/// pays for the transaction in `fee_asset`; waits for its block.
+///
+/// # Errors
+///
+/// Returns a description if the key is not the council, or the node refuses
+/// or does not include the update.
+pub fn govern(
+    rpc: &str,
+    key: &SigningKey,
+    fee_asset: u32,
+    update: GovernanceUpdate,
+) -> Result<(), String> {
+    let me = hex::encode(key.verifying_key().to_bytes());
+    let council = call(rpc, &serde_json::json!({ "method": "sena_getCouncil" }))?;
+    let members = council["members"]
+        .as_array()
+        .ok_or_else(|| format!("sena_getCouncil: {council}"))?;
+    let index = members
+        .iter()
+        .position(|m| m.as_str() == Some(me.as_str()))
+        .ok_or("this key is not a council member")?;
+    if council["threshold"] != 1 {
+        return Err(format!(
+            "the council needs {} signatures; this tool signs alone",
+            council["threshold"]
+        ));
+    }
+    let epoch = council["epoch"].as_u64().ok_or("no council epoch")?;
+
+    let info = call(rpc, &serde_json::json!({ "method": "sena_getChainInfo" }))?;
+    let chain_id = info["transaction_chain_id"]
+        .as_u64()
+        .ok_or_else(|| format!("no chain id: {info}"))?;
+    let quote = call(
+        rpc,
+        &serde_json::json!({ "method": "sena_gasPrice", "params": { "asset": fee_asset } }),
+    )?;
+    let sender = L2Address::from_bytes(key.verifying_key().to_bytes());
+    let account = call(
+        rpc,
+        &serde_json::json!({ "method": "sena_getAccount", "params": { "address": sender.to_string() } }),
+    )?;
+
+    let digest = update.signing_digest(chain_id, epoch);
+    let signature = CouncilSignature {
+        index: u32::try_from(index).map_err(|e| e.to_string())?,
+        signature: key.sign(digest.as_bytes()).to_bytes(),
+    };
+    let mut tx = Transaction {
+        chain_id,
+        sender,
+        nonce: account["nonce"]
+            .as_u64()
+            .ok_or_else(|| format!("no nonce: {account}"))?,
+        fee_asset: AssetId(fee_asset),
+        fee_rate: num(&quote, "rate")?,
+        fee_intrinsic_gas: u64::try_from(num(&quote, "intrinsic_gas")?)
+            .map_err(|e| e.to_string())?,
+        gas_limit: 0,
+        max_fee_per_gas: num(&quote, "suggested_max_fee_per_gas")?,
+        max_priority_fee_per_gas: 0,
+        payload: Payload::Governance {
+            epoch,
+            update,
+            signatures: vec![signature],
+        },
+        authenticator: Authenticator::Ed25519 {
+            public_key: key.verifying_key().to_bytes(),
+            signature: [0; 64],
+        },
+    };
+    tx.gas_limit = sena_stf::gas_required(&tx).map_err(|e| e.to_string())?;
+    tx.authenticator = Authenticator::Ed25519 {
+        public_key: key.verifying_key().to_bytes(),
+        signature: key.sign(tx.signing_digest().as_bytes()).to_bytes(),
+    };
+    let hash = tx.hash();
+    let body = serde_json::to_value(crate::Request::SubmitTransaction(Box::new(tx)))
+        .map_err(|e| e.to_string())?;
+    let r = call(rpc, &body)?;
+    if r["result"] != "submitted" {
+        return Err(format!("the node refused the update: {r}"));
+    }
+    for _ in 0..120 {
+        let c = call(
+            rpc,
+            &serde_json::json!({ "method": "sena_getConfirmation", "params": { "hash": hash.to_string() } }),
+        )?;
+        match c["status"].as_str() {
+            Some("soft_confirmed" | "finalized") => return Ok(()),
+            _ => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+    Err(format!(
+        "transaction {hash} was not included within a minute"
+    ))
 }

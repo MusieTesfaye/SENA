@@ -78,6 +78,71 @@ pub enum Payload {
         /// The split the sender believes is in force; checked in the trace.
         split: FeeSplit,
     },
+    /// Withdraw to Aptos L1: burn `amount` of `asset` here and record that
+    /// `to` may claim it from the bridge once the block has finalized.
+    Withdraw {
+        /// The Aptos account paid on L1, as its 32 address bytes.
+        #[serde(with = "bytes_32")]
+        to: [u8; 32],
+        /// The asset withdrawn; its bridge pays the claim.
+        asset: AssetId,
+        /// The amount withdrawn.
+        #[serde(with = "u128_string")]
+        amount: u128,
+    },
+    /// Pay `amount` of `asset` to whoever `issuer` attests `identifier` to,
+    /// before they have an account or have linked it (Celo's `Escrow`). From
+    /// `expires_at` on it can only go back to the sender.
+    EscrowSend {
+        /// The recipient's hashed identifier.
+        identifier: HashedIdentifier,
+        /// The issuer whose attestation the sender trusts.
+        issuer: L2Address,
+        /// The asset sent.
+        asset: AssetId,
+        /// The amount sent.
+        #[serde(with = "u128_string")]
+        amount: u128,
+        /// Unix seconds (batch time) from which it is refundable only.
+        expires_at: u64,
+    },
+    /// Claim an escrow opened by `sender`'s transaction `nonce`, as the
+    /// account its issuer attests the identifier to.
+    EscrowClaim {
+        /// Who opened it.
+        sender: L2Address,
+        /// The nonce of the transaction that opened it.
+        nonce: u64,
+        /// The escrow as it stands (checked in the trace).
+        record: crate::social::Escrow,
+    },
+    /// Take back an expired escrow this transaction's sender opened.
+    EscrowRefund {
+        /// Who opened it: must be this transaction's sender.
+        sender: L2Address,
+        /// The nonce of the transaction that opened it.
+        nonce: u64,
+        /// The escrow as it stands (checked in the trace).
+        record: crate::social::Escrow,
+    },
+    /// Credit an Aptos L1 deposit on the L2 (a system transaction).
+    ///
+    /// Nobody signs it: what makes it valid is that the L1 deposit log holds
+    /// deposit `id` with exactly this recipient, asset and amount, which both
+    /// the node and `sena::compiler` check when it compiles, and that it is
+    /// the next deposit, which [`crate::Instruction::ConsumeDeposit`] checks
+    /// in the trace. Built only by [`Transaction::deposit`].
+    Deposit {
+        /// The L1 deposit's sequence number, counting from one.
+        id: u64,
+        /// The L2 account the depositor named.
+        recipient: L2Address,
+        /// The L2 asset the bridge custodies.
+        asset: AssetId,
+        /// The amount deposited.
+        #[serde(with = "u128_string")]
+        amount: u128,
+    },
 }
 
 /// How a transaction proves it was authorised.
@@ -159,6 +224,44 @@ impl Payload {
 }
 
 impl Transaction {
+    /// The one canonical transaction crediting L1 deposit `id` on chain
+    /// `chain_id`.
+    ///
+    /// Every field but the payload is fixed (sender
+    /// [`DEPOSIT_SENDER`](crate::execute::DEPOSIT_SENDER), zero nonce and fee
+    /// terms, an all-zero Ed25519 authenticator), so a deposit has exactly one
+    /// encoding and one hash.
+    #[must_use]
+    pub const fn deposit(
+        chain_id: u64,
+        id: u64,
+        recipient: L2Address,
+        asset: AssetId,
+        amount: u128,
+    ) -> Self {
+        Self {
+            chain_id,
+            sender: crate::execute::DEPOSIT_SENDER,
+            nonce: 0,
+            fee_asset: AssetId(0),
+            fee_rate: 0,
+            fee_intrinsic_gas: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            payload: Payload::Deposit {
+                id,
+                recipient,
+                asset,
+                amount,
+            },
+            authenticator: Authenticator::Ed25519 {
+                public_key: [0; 32],
+                signature: [0; 64],
+            },
+        }
+    }
+
     /// Returns the digest that authenticators sign.
     ///
     /// The authenticator is excluded, since it commits to this value. Every

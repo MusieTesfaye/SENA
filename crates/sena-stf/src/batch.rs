@@ -211,6 +211,6 @@ mod tests {
         let l = leaves(1);
         let tree = BatchTree::build(&l);
         assert_eq!(tree.root(), leaf_hash(0, l[0].0, &l[0].1));
-        assert!(tree.prove(0).unwrap().siblings.is_empty());
+        assert_eq!(tree.prove(0).unwrap().siblings, Vec::new());
     }
 }

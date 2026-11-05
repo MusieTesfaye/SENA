@@ -50,6 +50,11 @@ module sena::osp {
     const OP_SET_FEE_SPLIT: u8 = 13;
     const OP_SET_FEE_MARKET: u8 = 14;
     const OP_DISABLE_GAS_ASSET: u8 = 15;
+    const OP_CONSUME_DEPOSIT: u8 = 16;
+    const OP_RECORD_WITHDRAWAL: u8 = 17;
+    const OP_CREATE_ESCROW: u8 = 18;
+    const OP_VERIFY_ATTESTATION: u8 = 19;
+    const OP_RELEASE_ESCROW: u8 = 20;
 
     // `social::Attestation` discriminants.
     const TAG_ATTESTED: u8 = 0;
@@ -67,6 +72,9 @@ module sena::osp {
     const REGION_JWK: vector<u8> = b"SENA:v1:state:jwk";
     const REGION_FEE_MARKET: vector<u8> = b"SENA:v1:state:fee-market";
     const REGION_FEE_SPLIT: vector<u8> = b"SENA:v1:state:fee-split";
+    const REGION_DEPOSIT_CURSOR: vector<u8> = b"SENA:v1:state:deposit-cursor";
+    const REGION_WITHDRAWAL: vector<u8> = b"SENA:v1:state:withdrawal";
+    const REGION_ESCROW: vector<u8> = b"SENA:v1:state:escrow";
 
     /// Outcome of adjudication: the defender's claimed post-state is right.
     const DEFENDER_WINS: u8 = 0;
@@ -107,13 +115,17 @@ module sena::osp {
         amount: u128,
         /// ConsumeNonce: the expected nonce. VerifyCouncil: the epoch.
         /// ChargeBaseFee: the batch timestamp. SetAttestation: `issued_on`.
+        /// ConsumeDeposit: the deposit id. RecordWithdrawal: the nonce.
         nonce: u64,
         /// VerifyGasAsset/SetGasAsset: the intrinsic gas. ChargeBaseFee: the
         /// gas charged. SetFeeMarket: the target.
         gas: u64,
         /// VerifyFeeSplit/SetFeeSplit: the split's canonical bytes.
+        /// CreateEscrow/ReleaseEscrow: the escrow record's bytes (and `gas`
+        /// is the batch time, `flag` whether it is a refund).
         split: vector<u8>,
-        /// VerifyCouncil: the signed update digest.
+        /// VerifyCouncil: the signed update digest. RecordWithdrawal: the L1
+        /// recipient.
         digest: vector<u8>,
         /// VerifyCouncil: signer indices and signatures, in order.
         signer_indices: vector<u32>,
@@ -218,6 +230,93 @@ module sena::osp {
     public fun set_jwk(iss_hash: vector<u8>, jwk_hash: vector<u8>, active: bool): Instruction {
         let i = blank(OP_SET_JWK); i.iss_hash = iss_hash; i.jwk_hash = jwk_hash; i.flag = active; i
     }
+    /// `Instruction::RecordWithdrawal`.
+    public fun record_withdrawal(
+        account: vector<u8>, nonce: u64, to: vector<u8>, asset: u32, amount: u128
+    ): Instruction {
+        let i = blank(OP_RECORD_WITHDRAWAL);
+        i.account = account; i.nonce = nonce; i.digest = to; i.asset = asset; i.amount = amount;
+        i
+    }
+
+    /// `keys::withdrawal`: the slot `account`'s transaction `nonce` records
+    /// its withdrawal in.
+    public fun withdrawal_key(account: vector<u8>, nonce: u64): vector<u8> {
+        let buf = codec::begin(REGION_WITHDRAWAL);
+        codec::put_field(&mut buf, account);
+        codec::put_field_u64(&mut buf, nonce);
+        codec::commit(buf)
+    }
+
+    /// `encode_withdrawal`: recipient, asset, amount.
+    fun encode_withdrawal(to: vector<u8>, asset: u32, amount: u128): vector<u8> {
+        let out = to;
+        codec::put_u32(&mut out, asset);
+        codec::put_u128(&mut out, amount);
+        out
+    }
+
+    /// `decode_withdrawal`: `(ok, to, asset, amount)`; not ok unless the
+    /// record is exactly 52 bytes.
+    public fun decode_withdrawal(bytes: vector<u8>): (bool, vector<u8>, u32, u128) {
+        if (vector::length(&bytes) != 52) { return (false, vector::empty(), 0, 0) };
+        let r = codec::reader(bytes);
+        let to = codec::take_bytes(&mut r, 32);
+        let asset = codec::take_u32(&mut r);
+        let amount = codec::take_u128(&mut r);
+        codec::finish(&r);
+        (true, to, asset, amount)
+    }
+
+    /// `Instruction::CreateEscrow`: open `record` in `sender`'s slot `nonce`.
+    public fun create_escrow(sender: vector<u8>, nonce: u64, record: vector<u8>): Instruction {
+        let i = blank(OP_CREATE_ESCROW); i.account = sender; i.nonce = nonce; i.split = record; i
+    }
+    /// `Instruction::VerifyAttestation`.
+    public fun verify_attestation(identifier: vector<u8>, issuer: vector<u8>, account: vector<u8>): Instruction {
+        let i = blank(OP_VERIFY_ATTESTATION); i.identifier = identifier; i.issuer = issuer; i.account = account; i
+    }
+    /// `Instruction::ReleaseEscrow`.
+    public fun release_escrow(sender: vector<u8>, nonce: u64, record: vector<u8>, now: u64, refund: bool): Instruction {
+        let i = blank(OP_RELEASE_ESCROW);
+        i.account = sender; i.nonce = nonce; i.split = record; i.gas = now; i.flag = refund;
+        i
+    }
+
+    /// `social::Escrow::encode`.
+    public fun encode_escrow(
+        released: bool, identifier: vector<u8>, issuer: vector<u8>, asset: u32, amount: u128, expires_at: u64
+    ): vector<u8> {
+        let out = vector::singleton(if (released) { 1u8 } else { 0u8 });
+        vector::append(&mut out, identifier);
+        vector::append(&mut out, issuer);
+        codec::put_u32(&mut out, asset);
+        codec::put_u128(&mut out, amount);
+        codec::put_u64(&mut out, expires_at);
+        out
+    }
+
+    /// `social::Escrow::decode`: `(ok, released, identifier, issuer, asset,
+    /// amount, expires_at)`; not ok unless canonical (93 bytes, tag 0 or 1).
+    public fun decode_escrow(bytes: vector<u8>): (bool, bool, vector<u8>, vector<u8>, u32, u128, u64) {
+        if (vector::length(&bytes) != 93 || *vector::borrow(&bytes, 0) > 1) {
+            return (false, false, vector::empty(), vector::empty(), 0, 0, 0)
+        };
+        let r = codec::reader(bytes);
+        let released = codec::take_u8(&mut r) == 1;
+        let identifier = codec::take_bytes(&mut r, 32);
+        let issuer = codec::take_bytes(&mut r, 32);
+        let asset = codec::take_u32(&mut r);
+        let amount = codec::take_u128(&mut r);
+        let expires_at = codec::take_u64(&mut r);
+        codec::finish(&r);
+        (true, released, identifier, issuer, asset, amount, expires_at)
+    }
+
+    /// `Instruction::ConsumeDeposit`: advance the deposit cursor to `id`.
+    public fun consume_deposit(id: u64): Instruction {
+        let i = blank(OP_CONSUME_DEPOSIT); i.nonce = id; i
+    }
 
     public fun machine_state(state_root: vector<u8>, pc: u64): MachineState {
         MachineState { state_root, pc }
@@ -296,6 +395,28 @@ module sena::osp {
             codec::put_u64(&mut out, i.gas);
         } else if (i.op == OP_DISABLE_GAS_ASSET) {
             codec::put_u32(&mut out, i.asset);
+        } else if (i.op == OP_CONSUME_DEPOSIT) {
+            codec::put_u64(&mut out, i.nonce);
+        } else if (i.op == OP_CREATE_ESCROW) {
+            vector::append(&mut out, i.account);
+            codec::put_u64(&mut out, i.nonce);
+            codec::put_field(&mut out, i.split);
+        } else if (i.op == OP_VERIFY_ATTESTATION) {
+            vector::append(&mut out, i.identifier);
+            vector::append(&mut out, i.issuer);
+            vector::append(&mut out, i.account);
+        } else if (i.op == OP_RELEASE_ESCROW) {
+            vector::append(&mut out, i.account);
+            codec::put_u64(&mut out, i.nonce);
+            codec::put_field(&mut out, i.split);
+            codec::put_u64(&mut out, i.gas);
+            codec::put_bool(&mut out, i.flag);
+        } else if (i.op == OP_RECORD_WITHDRAWAL) {
+            vector::append(&mut out, i.account);
+            codec::put_u64(&mut out, i.nonce);
+            vector::append(&mut out, i.digest);
+            codec::put_u32(&mut out, i.asset);
+            codec::put_u128(&mut out, i.amount);
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
         };
@@ -346,7 +467,12 @@ module sena::osp {
         let op = i.op;
         if (op == OP_CONSUME_NONCE || op == OP_DEBIT || op == OP_CREDIT) {
             account_key(i.account)
-        } else if (op == OP_SET_ATTESTATION || op == OP_REVOKE_ATTESTATION) {
+        } else if (op == OP_CREATE_ESCROW || op == OP_RELEASE_ESCROW) {
+            let buf = codec::begin(REGION_ESCROW);
+            codec::put_field(&mut buf, i.account);
+            codec::put_field_u64(&mut buf, i.nonce);
+            codec::commit(buf)
+        } else if (op == OP_SET_ATTESTATION || op == OP_REVOKE_ATTESTATION || op == OP_VERIFY_ATTESTATION) {
             let buf = codec::begin(REGION_ATTESTATION);
             codec::put_field(&mut buf, i.identifier);
             codec::put_field(&mut buf, i.issuer);
@@ -368,6 +494,10 @@ module sena::osp {
             codec::commit(codec::begin(REGION_FEE_MARKET))
         } else if (op == OP_VERIFY_FEE_SPLIT || op == OP_SET_FEE_SPLIT) {
             codec::commit(codec::begin(REGION_FEE_SPLIT))
+        } else if (op == OP_CONSUME_DEPOSIT) {
+            codec::commit(codec::begin(REGION_DEPOSIT_CURSOR))
+        } else if (op == OP_RECORD_WITHDRAWAL) {
+            withdrawal_key(i.account, i.nonce)
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
         }
@@ -386,8 +516,12 @@ module sena::osp {
             23000
         } else if (op == OP_SET_GAS_ASSET || op == OP_SET_PARAMETER
             || op == OP_SET_JWK || op == OP_SET_FEE_MARKET || op == OP_SET_FEE_SPLIT
-            || op == OP_DISABLE_GAS_ASSET) {
+            || op == OP_DISABLE_GAS_ASSET || op == OP_RECORD_WITHDRAWAL || op == OP_CREATE_ESCROW) {
             20000
+        } else if (op == OP_RELEASE_ESCROW) {
+            5000
+        } else if (op == OP_VERIFY_ATTESTATION) {
+            2000
         } else if (op == OP_VERIFY_FEE_SPLIT) {
             2000
         } else {
@@ -625,6 +759,40 @@ module sena::osp {
             (true, current)
         } else if (op == OP_SET_JWK) {
             (true, vector::singleton(if (instruction.flag) { 1u8 } else { 0u8 }))
+        } else if (op == OP_CONSUME_DEPOSIT) {
+            // `decode_deposit_cursor`: absent is zero; anything but eight
+            // bytes is a malformed slot, a failing step.
+            let last = 0u64;
+            if (present) {
+                if (vector::length(&current) != 8) { return (false, vector::empty()) };
+                let r = codec::reader(current);
+                last = codec::take_u64(&mut r);
+            };
+            if (last == MAX_U64 || last + 1 != instruction.nonce) { return (false, vector::empty()) };
+            let out = vector::empty<u8>();
+            codec::put_u64(&mut out, instruction.nonce);
+            (true, out)
+        } else if (op == OP_CREATE_ESCROW) {
+            let (ok, released, _, _, _, _, _) = decode_escrow(instruction.split);
+            if (present || !ok || released) { return (false, vector::empty()) };
+            (true, instruction.split)
+        } else if (op == OP_VERIFY_ATTESTATION) {
+            if (!present) { return (false, vector::empty()) };
+            let (revoked, attested, _) = decode_attestation(current);
+            if (revoked || attested != instruction.account) { return (false, vector::empty()) };
+            (true, current)
+        } else if (op == OP_RELEASE_ESCROW) {
+            if (!present) { return (false, vector::empty()) };
+            let (ok, released, identifier, issuer, asset, amount, expires_at) = decode_escrow(current);
+            if (!ok || released || current != instruction.split) { return (false, vector::empty()) };
+            // Claimable before expiry, refundable from then on.
+            let expired = instruction.gas >= expires_at;
+            if (expired != instruction.flag) { return (false, vector::empty()) };
+            (true, encode_escrow(true, identifier, issuer, asset, amount, expires_at))
+        } else if (op == OP_RECORD_WITHDRAWAL) {
+            // Written once, into the withdrawing transaction's own slot.
+            if (present) { return (false, vector::empty()) };
+            (true, encode_withdrawal(instruction.digest, instruction.asset, instruction.amount))
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
         }
@@ -805,6 +973,28 @@ module sena::osp {
             i.gas = codec::take_u64(&mut r);
         } else if (op == OP_DISABLE_GAS_ASSET) {
             i.asset = codec::take_u32(&mut r);
+        } else if (op == OP_CONSUME_DEPOSIT) {
+            i.nonce = codec::take_u64(&mut r);
+        } else if (op == OP_CREATE_ESCROW) {
+            i.account = codec::take_bytes(&mut r, 32);
+            i.nonce = codec::take_u64(&mut r);
+            i.split = codec::take_field(&mut r);
+        } else if (op == OP_VERIFY_ATTESTATION) {
+            i.identifier = codec::take_bytes(&mut r, 32);
+            i.issuer = codec::take_bytes(&mut r, 32);
+            i.account = codec::take_bytes(&mut r, 32);
+        } else if (op == OP_RELEASE_ESCROW) {
+            i.account = codec::take_bytes(&mut r, 32);
+            i.nonce = codec::take_u64(&mut r);
+            i.split = codec::take_field(&mut r);
+            i.gas = codec::take_u64(&mut r);
+            i.flag = codec::take_bool(&mut r);
+        } else if (op == OP_RECORD_WITHDRAWAL) {
+            i.account = codec::take_bytes(&mut r, 32);
+            i.nonce = codec::take_u64(&mut r);
+            i.digest = codec::take_bytes(&mut r, 32);
+            i.asset = codec::take_u32(&mut r);
+            i.amount = codec::take_u128(&mut r);
         } else {
             abort E_UNSUPPORTED_INSTRUCTION
         };

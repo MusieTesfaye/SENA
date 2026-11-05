@@ -98,6 +98,7 @@ module sena::lifecycle_test {
         account::create_account_for_test(signer::address_of(admin));
         let (mint_ref, metadata) = create_asset(admin);
         assertions::initialize(admin, GENESIS_ROOT, WINDOW, BOND, metadata, TREASURY, MAX_BATCH_AGE);
+        assertions::set_proposers(admin, signer::address_of(admin), vector[signer::address_of(admin), @0xA11CE]);
         disputes::initialize(admin, signer::address_of(admin), keyless::setup_disabled(), 0);
         account::create_account_for_test(TREASURY);
         (mint_ref, metadata)

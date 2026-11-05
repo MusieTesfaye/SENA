@@ -66,7 +66,7 @@ watcher is running.
 | Tool | Version | For |
 |---|---|---|
 | Rust | 1.85 or newer | everything |
-| Aptos CLI | **7.9.0** (CI); 9.0–9.6 also pass the Move tests | contracts, localnet, testnet |
+| Aptos CLI | **9.6.0** (CI) | contracts, localnet, testnet |
 | Python 3 | any | the dispute and lifecycle scripts |
 
 ```sh
@@ -83,9 +83,9 @@ cargo test --workspace                                        # 318 tests
 aptos move test --package-dir move/sena --named-addresses sena=0xCAFE   # 78 tests
 ```
 
-Why 7.9.0: prebuilt Aptos CLIs from 7.14.2 on abort on CPUs without AVX2,
-and `Move.toml` pins the framework to the 7.9.0 tree. Newer CLIs compile
-the package fine where they run.
+Why 9.6.0: `Move.toml` pins the framework to the 9.6.0 tree, so compiler and
+framework match. It needs a CPU with AVX2; on one without, use CLI 7.9.0 with
+the framework at `46d871fa` (see [`move/README.md`](../move/README.md)).
 
 ## 3. Run an L2
 
@@ -721,7 +721,7 @@ What testnet costs and needs that a localnet does not:
 - **About 2.35 APT to publish**, mostly storage fees; the final publish
   transaction alone uses over a million gas units. Hold at least 4 APT.
 - **`--large-packages-module-address 0x7`** on `--chunked-publish`. Aptos
-  moved the module there; CLI 7.9.0 still defaults to its old testnet address,
+  moved the module there; older CLIs (7.9.0) default to its old testnet address,
   where staging fails with `LINKER_ERROR`.
 - **A package whose public signatures changed cannot be published over the old
   one.** A new version of the contracts goes to new accounts.

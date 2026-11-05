@@ -100,7 +100,7 @@ would mean the sequencer had lied.
 
 ## 4. The Move contracts
 
-Requires Aptos CLI **7.9.0** specifically — see [`../move/README.md`](../move/README.md).
+Requires Aptos CLI **9.6.0** specifically — see [`../move/README.md`](../move/README.md).
 
 ```sh
 aptos move test --package-dir move/sena --named-addresses sena=0xCAFE
